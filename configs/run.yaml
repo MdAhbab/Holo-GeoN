@@ -30,6 +30,14 @@ lr: 0.0003
 run_ablation: true       # also train the single-track (--no-mech-track) model
 run_idr: true            # train the IDR head against the physics prior
 run_baseline: true       # ESM zero-shot ΔΔG baseline
+run_contacts: true       # geometric-track sanity check (long-range signal, Q2)
+
+# --- mechanistic track options ---
+back_translate: false    # if stability data has NO coding-DNA column, set true to
+                         # build E_mech from a usage-weighted proxy transcript
+                         # (needs ViennaRNA; it is an explicit proxy, not a real CDS)
+sweep_eps_delta: false   # also probe E_mech eps/delta threshold sensitivity (Q9)
+# true_contacts_dir:     # optional dir of <md5>.npy ground-truth maps -> precision@L in contacts stage
 
 # --- optional caps for a faster first pass (null = use everything) ---
 max_seqs: null           # cap unique sequences in precompute

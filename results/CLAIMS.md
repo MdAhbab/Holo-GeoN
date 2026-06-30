@@ -7,8 +7,9 @@ that backs it. Run `python run.py all` (or individual stages) then
 | Component | Implementation | Evidence |
 |---|---|---|
 | Dual-track graph (E_geo + E_mech) | `src/utils/graph_builder.py`, `src/backbone.py` (`DualTrackGNN`) | `tests/test_features_graph.py`; `results/ablation/` (E_mech Δr) |
-| Geometric edges from ESM-2 contacts | `src/backbone.py` (`EsmEncoder.contacts`) | embedding cache |
-| Mechanistic edges (CAI / mRNA coupling) | `build_mechanistic_edges` | `tests/test_features_graph.py` |
+| Geometric edges carry spatial signal | `src/backbone.py` (`EsmEncoder.contacts`), `scripts/contact_sanity.py` | `results/contacts/contact_sanity.json` (long-range fraction vs baseline; precision@L with structures) |
+| Mechanistic edges (CAI / mRNA coupling) | `build_mechanistic_edges` | `tests/test_features_graph.py`; `results/ablation/` |
+| Mechanistic track without a CDS (back-translation proxy) | `src/codon_tables.py` (`back_translate`), `src/features.py` | run with `--back-translate`; guide.md §2a |
 | Human CAI table | `src/codon_tables.py` | `tests/test_features_graph.py` |
 | Real mRNA folding (ViennaRNA MFE) | `src/features.py` | `tests/test_features_graph.py` |
 | Protein-only handling (validity mask) | `src/features.py` (`mech_valid`) | `tests/test_features_graph.py` |
@@ -18,7 +19,7 @@ that backs it. Run `python run.py all` (or individual stages) then
 | Pathogenicity (random + gene-disjoint + CV) | `scripts/train_pathogenicity.py` | `results/pathogenicity/` |
 | IDR head vs polymer-physics prior | `src/idr_prior.py`, `scripts/train_idr.py` | `results/idr/` |
 | ESM zero-shot ΔΔG baseline | `scripts/baselines.py` | `results/baselines/` |
-| E_mech ε / δ hyperparameters | `configs/data.yaml`, `configs/run.yaml` | configs |
+| E_mech ε / δ hyperparameters + sensitivity | `configs/data.yaml`, `train_stability.py --sweep` | `results/ablation/eps_delta_sweep.json` |
 | Checkpoints + splits saved | `runs/*/*.pt`, `data/splits_*.parquet` | run outputs |
 
 Headline numbers are reported under the **gene-/protein-disjoint** splits

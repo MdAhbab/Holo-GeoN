@@ -132,9 +132,10 @@ class EmbeddingStore:
 # Graph assembly (dual-track)
 # ---------------------------------------------------------------------------
 def build_graph(seq: str, emb: torch.Tensor, contacts: torch.Tensor,
-                dna: str | None, cfg: dict) -> dict:
+                dna: str | None, cfg: dict, back_translate: bool = False) -> dict:
     L = emb.shape[0]
-    mech = mechanistic_features(seq[:L], dna, max_length=L)               # (L, 4)
+    mech = mechanistic_features(seq[:L], dna, max_length=L,
+                                back_translate_fallback=back_translate)   # (L, 4)
     edge_geo = G.build_geometric_edges(contacts[:L, :L], threshold=cfg.get("geo_threshold", 0.5))
     if edge_geo.numel() == 0:
         edge_geo = G.simple_linear_graph(L)                              # never leave it edgeless
@@ -183,10 +184,11 @@ class StabilityPairDataset(Dataset):
 
     def __getitem__(self, i):
         r = self.df.iloc[i]
+        bt = self.cfg.get("back_translate", False)
         emb_w, cm_w, sw = self.store.get(r["wt_seq"])
         emb_m, cm_m, sm = self.store.get(r["mt_seq"])
-        g_wt = build_graph(sw, emb_w, cm_w, r.get("wt_dna"), self.cfg)
-        g_mt = build_graph(sm, emb_m, cm_m, r.get("mt_dna"), self.cfg)
+        g_wt = build_graph(sw, emb_w, cm_w, r.get("wt_dna"), self.cfg, back_translate=bt)
+        g_mt = build_graph(sm, emb_m, cm_m, r.get("mt_dna"), self.cfg, back_translate=bt)
         return g_wt, g_mt, torch.tensor(float(r["target"]), dtype=torch.float32)
 
 

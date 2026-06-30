@@ -22,7 +22,7 @@ from __future__ import annotations
 import math
 import torch
 
-from src.codon_tables import get_cai_weights, GENETIC_CODE
+from src.codon_tables import get_cai_weights, GENETIC_CODE, back_translate
 
 # ---------------------------------------------------------------------------
 # Optional ViennaRNA — real RNA folding. Falls back to a GC proxy if missing.
@@ -144,16 +144,26 @@ def mechanistic_features(
     dna_seq: str | None,
     max_length: int,
     organism: str = "human",
+    back_translate_fallback: bool = False,
 ) -> torch.Tensor:
     """
     Returns (max_length, 4) float32: [mRNA_fold, CAI, charge, mech_valid].
 
     If ``dna_seq`` is None (protein-only input, e.g. ClinVar), mRNA and CAI are
     zeroed and mech_valid is 0; charge is always computed.
+
+    If ``back_translate_fallback`` is True and no DNA is given, a usage-weighted
+    proxy transcript is generated (codon_tables.back_translate) so the
+    mechanistic track is defined even without an experimental CDS. This is an
+    explicit codon-usage proxy, not a real transcript — it lets the dual-track
+    E_mech be demonstrated when only protein sequences are available.
     """
     feat = torch.zeros((max_length, N_MECH_CHANNELS), dtype=torch.float32)
     charge = charge_per_residue(protein_seq, max_length)
     L = min(len(protein_seq), max_length)
+
+    if not dna_seq and back_translate_fallback and L > 0:
+        dna_seq = back_translate(protein_seq[:max_length], organism)
 
     if dna_seq:
         mrna = mrna_fold_per_residue(dna_seq, max_length)

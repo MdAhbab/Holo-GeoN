@@ -13,10 +13,11 @@ results/
 ├── CLAIMS.md            # component -> code -> evidence map
 ├── SUMMARY.md           # auto-generated headline metrics table (after a run)
 ├── stability/           # ΔΔG: Pearson r, MAE, RMSE, antisymmetry violation
-├── ablation/            # dual-track vs single-track  -> the E_mech effect
+├── ablation/            # dual-track vs single-track + eps/delta sweep -> the E_mech effect
 ├── pathogenicity/       # AUROC: random vs gene-disjoint, + GroupKFold CV, ROC
 ├── baselines/           # ESM zero-shot ΔΔG on the same test split
 ├── idr/                 # Rg MAE vs the polymer-physics prior
+├── contacts/            # ESM E_geo long-range signal vs sequence-proximity baseline
 ├── splits/              # leakage_report.txt (no train/test group overlap)
 └── figures/             # generated plots (ROC, etc.)
 ```

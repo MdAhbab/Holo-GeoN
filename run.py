@@ -17,10 +17,11 @@ Individual stages
 -----------------
     python run.py precompute
     python run.py splits
-    python run.py stability        [--no-ablation]
+    python run.py stability        [--no-ablation] [--sweep-eps-delta] [--back-translate]
     python run.py pathogenicity
     python run.py idr
     python run.py baseline
+    python run.py contacts              # geometric-track sanity (Q2)
     python run.py evaluate
     python run.py test                  # run unit tests
 
@@ -33,6 +34,8 @@ Common overrides (work on any stage)
     --epochs N            (sets all epochs)  | --epochs-stability N etc.
     --batch N             | --split-method mmseqs|group --identity 0.30
     --max-seqs N --max-rows N --out-root runs/
+    --back-translate      (proxy transcript when stability data has no coding DNA)
+    --sweep-eps-delta     (probe E_mech threshold sensitivity)
 """
 import os
 import sys
@@ -61,6 +64,9 @@ DEFAULTS = {
     "run_ablation": True,
     "run_idr": True,
     "run_baseline": True,
+    "run_contacts": True,
+    "back_translate": False,
+    "sweep_eps_delta": False,
     "max_seqs": None,
     "max_rows": None,
 }
@@ -107,6 +113,10 @@ def effective_config(args):
         cfg["run_ablation"] = False
     if args.no_idr:
         cfg["run_idr"] = False
+    if args.back_translate:
+        cfg["back_translate"] = True
+    if args.sweep_eps_delta:
+        cfg["sweep_eps_delta"] = True
     return cfg
 
 
@@ -183,7 +193,10 @@ def stage_stability(args, cfg):
               "--lr", cfg["lr"], "--device", cfg["device"]]
     if cfg["max_rows"]:
         common += ["--max-rows", cfg["max_rows"]]
-    py("scripts.train_stability", *common, "--out", out)
+    if cfg.get("back_translate"):
+        common += ["--back-translate"]
+    main_extra = ["--sweep"] if cfg.get("sweep_eps_delta") else []
+    py("scripts.train_stability", *common, *main_extra, "--out", out)
     if cfg["run_ablation"]:
         py("scripts.train_stability", *common, "--no-mech-track",
            "--out", out + "_nomech")
@@ -212,6 +225,14 @@ def stage_baseline(args, cfg):
     sm, _ = _splits_paths(cfg)
     py("scripts.baselines", "--splits", sm, "--esm-model", cfg["esm_model"],
        "--split", "test", "--device", cfg["device"])
+
+
+def stage_contacts(args, cfg):
+    a = ["--cache", cfg["cache"], "--max-seqs", 300]
+    tcd = cfg.get("true_contacts_dir")
+    if tcd:
+        a += ["--true-contacts-dir", tcd]
+    py("scripts.contact_sanity", *a)
 
 
 def stage_evaluate(args, cfg):
@@ -245,6 +266,8 @@ def stage_all(args, cfg):
         stage_idr(args, cfg)
     if cfg["run_baseline"]:
         stage_baseline(args, cfg)
+    if cfg.get("run_contacts", True):
+        stage_contacts(args, cfg)
     stage_evaluate(args, cfg)
     stage_results(args, cfg)
     print("\n[done] Pipeline complete. See results/SUMMARY.md and results/CLAIMS.md.")
@@ -254,8 +277,8 @@ STAGES = {
     "setup": stage_setup, "smoke": stage_smoke, "test": stage_test,
     "precompute": stage_precompute, "splits": stage_splits,
     "stability": stage_stability, "pathogenicity": stage_pathogenicity,
-    "idr": stage_idr, "baseline": stage_baseline, "evaluate": stage_evaluate,
-    "results": stage_results, "all": stage_all,
+    "idr": stage_idr, "baseline": stage_baseline, "contacts": stage_contacts,
+    "evaluate": stage_evaluate, "results": stage_results, "all": stage_all,
 }
 
 
@@ -287,6 +310,10 @@ def main():
     ap.add_argument("--max-rows", type=int, default=None)
     ap.add_argument("--no-ablation", action="store_true")
     ap.add_argument("--no-idr", action="store_true")
+    ap.add_argument("--back-translate", action="store_true",
+                    help="usage-weighted proxy transcript when stability data has no coding DNA")
+    ap.add_argument("--sweep-eps-delta", action="store_true",
+                    help="probe E_mech eps/delta sensitivity in the stability stage (Q9)")
     args = ap.parse_args()
 
     cfg = effective_config(args)

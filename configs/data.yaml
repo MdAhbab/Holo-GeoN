@@ -14,6 +14,8 @@ megascale_ddg_pairs:
   # target:  ddG
   # wt_dna:  wt_cds        # set if a coding-DNA column exists -> enables real CAI/mRNA + E_mech
   # mt_dna:  mt_cds
+  # No coding-DNA column? Run with `--back-translate` (run.py / configs/run.yaml) to
+  # build E_mech from a usage-weighted proxy transcript instead. See guide.md 2a.
 
 clinvar_protein_pairs:
   # wt_seq:  ref_protein

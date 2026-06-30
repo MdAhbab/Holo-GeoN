@@ -6,10 +6,11 @@ runs/*/*.json (+ split parquet) and writes:
 
     results/SUMMARY.md                      consolidated metric table
     results/stability/                      ΔΔG metrics (strict split)
-    results/ablation/                       dual-track vs single-track (E_mech delta)
+    results/ablation/                       dual-track vs single-track + eps/delta sweep
     results/pathogenicity/                  random vs gene-disjoint AUROC + CV
     results/baselines/                      ESM zero-shot ΔΔG
     results/idr/                            physics-prior Rg MAE
+    results/contacts/                       geometric-track sanity (long-range signal)
     results/splits/leakage_report.txt       leakage check + group counts
 
 It also writes the component -> evidence map referenced by results/CLAIMS.md.
@@ -19,7 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RESULTS = os.path.join(ROOT, "results")
-SUBDIRS = ["stability", "ablation", "pathogenicity", "baselines", "idr", "splits", "figures"]
+SUBDIRS = ["stability", "ablation", "pathogenicity", "baselines", "idr",
+           "splits", "contacts", "figures"]
 
 
 def jload(p):
@@ -63,8 +65,11 @@ def main():
     path = jload(os.path.join(runs, "pathogenicity", "pathogenicity_metrics.json"))
     idr = jload(os.path.join(runs, "idr", "idr_metrics.json"))
     base = jload(os.path.join(runs, "baseline_esm_zeroshot.json"))
+    sweep = jload(os.path.join(runs, "stability", "eps_delta_sweep.json"))
+    contacts = jload(os.path.join(RESULTS, "contacts", "contact_sanity.json"))
 
     copy(os.path.join(runs, "stability", "stability_metrics.json"), "stability")
+    copy(os.path.join(runs, "stability", "eps_delta_sweep.json"), "ablation")
     copy(os.path.join(runs, "stability_nomech", "stability_metrics.json"), "ablation", "stability_nomech_metrics.json")
     copy(os.path.join(runs, "pathogenicity", "pathogenicity_metrics.json"), "pathogenicity")
     copy(os.path.join(runs, "idr", "idr_metrics.json"), "idr")
@@ -102,6 +107,16 @@ def main():
         L += [f"| Baseline | ESM zero-shot \\|r\\| | {base.get('abs_pearson_r', float('nan')):.3f} | same stability test split |"]
     if idr:
         L += [f"| IDR | Rg MAE vs physics prior | {idr.get('rg_mae_vs_prior', float('nan')):.2f} Å | disclosed prior (not experimental) |"]
+    if contacts and contacts.get("esm_contacts"):
+        ec = contacts["esm_contacts"]["long_range_fraction_topL"]
+        lc = contacts["linear_baseline"]["long_range_fraction_topL"]
+        L += [f"| Contacts (Q2) | Long-range fraction (top-L) | {ec:.3f} vs {lc:.3f} | ESM E_geo vs linear baseline |"]
+        if contacts.get("precision_vs_structure"):
+            pv = contacts["precision_vs_structure"]
+            L += [f"| Contacts (Q2) | Precision@L/5 | {pv['esm_precision_at_L5']:.3f} vs {pv['linear_precision_at_L5']:.3f} | ESM vs linear (with structures) |"]
+    if sweep and sweep.get("points"):
+        pts = ", ".join(f"{p['eps']}:{p['pearson_r']:.3f}" for p in sweep["points"])
+        L += [f"| Ablation (Q9) | eps/delta sweep (r) | {pts} | E_mech threshold sensitivity |"]
 
     with open(os.path.join(RESULTS, "SUMMARY.md"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(L) + "\n")

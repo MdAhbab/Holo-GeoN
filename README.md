@@ -47,7 +47,7 @@ python run.py smoke          # short sanity check (no data required)
 python run.py all            # precompute -> splits -> train -> evaluate -> results
 ```
 
-Individual stages: `python run.py {precompute,splits,stability,pathogenicity,idr,baseline,evaluate,results}`.
+Individual stages: `python run.py {precompute,splits,stability,pathogenicity,idr,baseline,contacts,evaluate,results}`.
 
 ## Configuration
 
@@ -62,7 +62,11 @@ The pipeline reports ΔΔG accuracy (Pearson r, MAE, RMSE) and thermodynamic
 consistency (mean antisymmetry violation) on sequence-disjoint test splits;
 pathogenicity AUROC under both random and gene-disjoint splits with GroupKFold
 cross-validation; and an ESM zero-shot ΔΔG baseline on the same test split.
-Outputs are collected under [`results/`](results/).
+The dual-track vs single-track gap (`--no-mech-track`) isolates the contribution
+of the mechanistic edges, and an optional `--sweep-eps-delta` probes their
+threshold sensitivity. A `contacts` stage checks that the geometric edges carry
+long-range (spatial) signal beyond sequence adjacency. Outputs are collected
+under [`results/`](results/).
 
 ## Repository layout
 
@@ -81,7 +85,10 @@ guide.md               full setup + run instructions and time budget
 - CAI is computed against a fixed human reference codon-usage table (a normalised
   codon-bias proxy). Local mRNA folding energy is the ViennaRNA minimum free
   energy. For protein-only inputs (no coding sequence) these channels are masked
-  off, so E_mech is built only where the features are defined.
+  off, so E_mech is built only where the features are defined. When a coding
+  sequence is unavailable but the mechanistic track is still wanted, an optional
+  usage-weighted back-translation (`--back-translate`) supplies a deterministic
+  proxy transcript; it is treated as a codon-usage proxy, not an experimental CDS.
 - The IDR head is trained against a sequence-dependent polymer-physics target
   (Flory scaling); experimental ensemble datasets can be substituted as labels.
 - Train/test splits are clustered at 30% sequence identity (MMseqs2), with whole
