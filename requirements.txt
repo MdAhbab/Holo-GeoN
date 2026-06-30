@@ -1,0 +1,31 @@
+# HoloGNN — Python dependencies
+# Install order matters: install a CUDA build of torch FIRST (see guide.md),
+# then torch_geometric, then the rest.
+
+# Core (install the CUDA wheel that matches the GPU/driver; see guide.md)
+torch>=2.2
+
+# Graph neural network layers (GATv2Conv)
+torch_geometric>=2.5
+
+# Protein language model + tokeniser
+transformers>=4.40
+
+# Real mRNA secondary-structure folding (minimum free energy)
+ViennaRNA>=2.6
+
+# Config + data / metrics / plotting
+pyyaml>=6.0
+pandas>=2.0
+pyarrow>=14.0          # parquet
+numpy>=1.24
+scikit-learn>=1.3
+matplotlib>=3.7
+tqdm>=4.65
+
+# Optional (faster ESM contact head / alt loader); not required:
+# fair-esm>=2.0
+
+# NOTE: MMseqs2 is a BINARY, not a pip package. Install separately for strict
+# splits:   conda install -c bioconda mmseqs2     (or download a static build).
+# Without it, make_splits.py falls back to protein-disjoint grouping.

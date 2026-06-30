@@ -1,0 +1,36 @@
+# --- Datasets (already on the training machine; never committed) ---
+data/
+CLEANED_DATA/
+*.parquet
+*.csv
+*.tsv
+*.vcf
+*.fasta
+*.fastq
+*.sptxt
+*.gz
+*.zip
+*.npy
+*.sig
+
+# --- Precomputed ESM cache + training outputs + weights ---
+cache/
+runs/
+*.pt
+*.pth
+*.ckpt
+.mmseqs_tmp/
+
+# --- Python ---
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+

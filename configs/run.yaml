@@ -1,0 +1,36 @@
+# configs/run.yaml — one place to control the whole pipeline.
+# Edit paths / epochs here, then:  python run.py all --config configs/run.yaml
+# Any value here can also be overridden on the command line (CLI wins).
+
+# --- shared ---
+esm_model: facebook/esm2_t30_150M_UR50D   # fast (640-d). Use t33_650M for 1280-d.
+cache: cache/emb_150M                      # embedding cache dir (must match esm_model)
+device: cuda                               # cuda | cpu
+max_length: 256
+out_root: runs
+
+# --- data sources (the preprocessed parquet files on this machine) ---
+stability_data: data/megascale_ddg_pairs.parquet
+clinvar_data:   data/clinvar_protein_pairs.parquet
+clinvar_ddg:    data/clinvar_protein_pairs.parquet.ddg_w49.npy   # optional
+
+# --- splitting ---
+split_method: mmseqs     # mmseqs (strict 30% identity) | group (parent/gene fallback)
+identity: 0.30
+
+# --- training ---
+epochs_stability: 8
+epochs_pathogenicity: 6
+epochs_idr: 5
+batch_stability: 16
+batch_pathogenicity: 32
+lr: 0.0003
+
+# --- toggles ---
+run_ablation: true       # also train the single-track (--no-mech-track) model
+run_idr: true            # train the IDR head against the physics prior
+run_baseline: true       # ESM zero-shot ΔΔG baseline
+
+# --- optional caps for a faster first pass (null = use everything) ---
+max_seqs: null           # cap unique sequences in precompute
+max_rows: null           # cap rows per split in training

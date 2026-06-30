@@ -1,0 +1,31 @@
+# configs/data.yaml
+# ------------------------------------------------------------------
+# Column-name overrides for the preprocessed parquet files.
+# Run `python -m scripts.inspect_data --data <file>` first; if the auto-detected
+# mapping shows None for a column you need, set the real name here. Leave a key
+# out (or null) to keep auto-detection.
+#
+# These keys mirror src/data.py _CANDIDATES.
+# ------------------------------------------------------------------
+
+megascale_ddg_pairs:
+  # wt_seq:  wildtype_sequence
+  # mt_seq:  mutant_sequence
+  # target:  ddG
+  # wt_dna:  wt_cds        # set if a coding-DNA column exists -> enables real CAI/mRNA + E_mech
+  # mt_dna:  mt_cds
+
+clinvar_protein_pairs:
+  # wt_seq:  ref_protein
+  # mt_seq:  alt_protein
+  # label:   clinical_significance
+  # gene:    gene_symbol
+
+# ------------------------------------------------------------------
+# Graph / feature hyperparameters (E_mech edge thresholds eps/delta)
+# ------------------------------------------------------------------
+graph:
+  geo_threshold: 0.5      # ESM contact-probability cutoff for E_geo
+  eps: 0.10               # |CAI_i - CAI_j| threshold for E_mech
+  delta: 0.10             # |mRNA_i - mRNA_j| threshold for E_mech
+  mech_max_degree: 8      # cap on mechanistic neighbours per residue
