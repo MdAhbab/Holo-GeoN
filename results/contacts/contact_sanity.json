@@ -1,0 +1,13 @@
+{
+  "n_sequences": 300,
+  "min_separation": 6,
+  "esm_contacts": {
+    "long_range_fraction_topL": 0.2519499730064023,
+    "medium_range_fraction_topL": 0.27954592587488036,
+    "symmetry_error": 7.824304181641706e-10
+  },
+  "linear_baseline": {
+    "long_range_fraction_topL": 0.0
+  },
+  "interpretation": "ESM top-L contacts contain long-range (|i-j|>=24) pairs that the sequence-proximity baseline cannot produce (its long-range fraction is ~0); this is the non-local/spatial signal feeding E_geo."
+}

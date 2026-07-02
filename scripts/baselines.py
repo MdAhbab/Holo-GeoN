@@ -55,26 +55,54 @@ def main():
         df = df.iloc[: args.max_rows]
     df = df.reset_index(drop=True)
 
+    # Incremental checkpoint: scoring 11k+ rows one at a time is slow, so save
+    # progress periodically and resume from the last row after an interruption.
+    ckpt = args.out + ".partial.npz"
+    start_i = 0
     scores, ddgs = [], []
+    if os.path.exists(ckpt):
+        try:
+            z = np.load(ckpt)
+            scores = z["scores"].tolist(); ddgs = z["ddgs"].tolist(); start_i = int(z["next_i"])
+            print(f"[resume] baseline: from row {start_i}/{len(df)} ({len(scores)} scored)")
+        except Exception as e:
+            print(f"[resume] baseline: checkpoint load failed ({e}); starting fresh")
+            start_i = 0; scores, ddgs = [], []
+
+    def save_ckpt(next_i):
+        try:
+            tmp = ckpt + ".tmp.npz"  # keep a .npz suffix so np.savez doesn't rename it
+            np.savez(tmp, scores=np.array(scores), ddgs=np.array(ddgs), next_i=next_i)
+            os.replace(tmp, ckpt)  # atomic
+        except Exception as e:
+            print(f"[ckpt] baseline save failed: {e}")
+
     with torch.no_grad():
-        for _, r in tqdm(df.iterrows(), total=len(df), desc="esm zero-shot"):
+        for i in tqdm(range(start_i, len(df)), total=len(df) - start_i, desc="esm zero-shot"):
+            r = df.iloc[i]
             wt, mt = str(r["wt_seq"]), str(r["mt_seq"])
             pos = mutated_position(wt, mt)
-            if pos is None:
-                continue
-            enc = tok(wt, return_tensors="pt", truncation=True, max_length=1024).to(args.device)
-            logits = mlm(**enc).logits[0]                      # (L+2, V)
-            lp = torch.log_softmax(logits[pos + 1], dim=-1)    # +1 for CLS
-            wt_id = tok.convert_tokens_to_ids(wt[pos])
-            mt_id = tok.convert_tokens_to_ids(mt[pos])
-            scores.append(float(lp[mt_id] - lp[wt_id]))
-            ddgs.append(float(r["target"]))
+            if pos is not None:
+                enc = tok(wt, return_tensors="pt", truncation=True, max_length=1024).to(args.device)
+                logits = mlm(**enc).logits[0]                      # (L+2, V)
+                lp = torch.log_softmax(logits[pos + 1], dim=-1)    # +1 for CLS
+                wt_id = tok.convert_tokens_to_ids(wt[pos])
+                mt_id = tok.convert_tokens_to_ids(mt[pos])
+                scores.append(float(lp[mt_id] - lp[wt_id]))
+                ddgs.append(float(r["target"]))
+            if (i + 1) % 1000 == 0:
+                save_ckpt(i + 1)
 
     s = np.array(scores); d = np.array(ddgs)
     r = float(np.corrcoef(s, d)[0, 1]) if len(s) > 1 else float("nan")
     out = {"baseline": "esm_zeroshot_wt_marginal", "esm_model": args.esm_model,
            "n": int(len(s)), "pearson_r": r, "abs_pearson_r": abs(r)}
     json.dump(out, open(args.out, "w"), indent=2)
+    try:  # done — drop the partial checkpoint
+        if os.path.exists(ckpt):
+            os.remove(ckpt)
+    except Exception:
+        pass
     print(out)
 
 

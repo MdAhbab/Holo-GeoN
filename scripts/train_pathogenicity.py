@@ -26,31 +26,50 @@ from sklearn.metrics import roc_auc_score, roc_curve, average_precision_score
 from sklearn.model_selection import GroupKFold
 from tqdm import tqdm
 
-from src.data import load_pathogenicity_pairs, VariantDataset, EmbeddingStore, collate_variants
+from src.data import (load_pathogenicity_pairs, VariantDataset, WindowedVariantDataset,
+                      add_window_column, EmbeddingStore, collate_variants)
 from src.full_model import HoloGNN
 from src.backbone import ESM_DIMS, DEFAULT_ESM
 from src import splits as S
+
+# Dataset class used to build variant graphs; swapped to WindowedVariantDataset
+# (mutation-centered windows) in main() when --window is set.
+_VARIANT_DS = VariantDataset
 
 
 def move(g, dev):
     return {k: v.to(dev) for k, v in g.items()}
 
 
-def train_eval(train_df, test_df, store, cfg, esm_dim, args):
+def train_eval(train_df, test_df, store, cfg, esm_dim, args, tag="run"):
     dev = args.device
-    tr = DataLoader(VariantDataset(train_df, store, cfg), batch_size=args.batch,
+    tr = DataLoader(_VARIANT_DS(train_df, store, cfg), batch_size=args.batch,
                     shuffle=True, collate_fn=collate_variants)
-    te = DataLoader(VariantDataset(test_df, store, cfg), batch_size=args.batch,
+    te = DataLoader(_VARIANT_DS(test_df, store, cfg), batch_size=args.batch,
                     shuffle=False, collate_fn=collate_variants)
     model = HoloGNN(esm_dim=esm_dim, use_mech_track=not args.no_mech_track, use_idr=False).to(dev)
     crit = torch.nn.BCEWithLogitsLoss()
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    for ep in range(args.epochs):
+    # per-epoch checkpoint so a crash mid sub-run resumes WITHIN this sub-run
+    start_ep = 0
+    ckpt = os.path.join(args.out, f"last_{tag}.pt")
+    if os.path.exists(ckpt):
+        try:
+            st = torch.load(ckpt, map_location=dev)
+            model.load_state_dict(st["model"]); opt.load_state_dict(st["opt"]); start_ep = int(st["epoch"])
+            print(f"    [resume] pathogenicity[{tag}]: from epoch {start_ep}/{args.epochs}")
+        except Exception as e:
+            print(f"    [resume] pathogenicity[{tag}]: load failed ({e}); training fresh"); start_ep = 0
+    for ep in range(start_ep, args.epochs):
         model.train()
         for g, y, _ in tr:
             logit = model.pathogenicity(move(g, dev)).squeeze(-1)
             loss = crit(logit, y.to(dev))
             opt.zero_grad(); loss.backward(); opt.step()
+        try:  # guarded; must never break training
+            torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "epoch": ep + 1}, ckpt)
+        except Exception as e:
+            print(f"    [ckpt] pathogenicity[{tag}] save failed at ep{ep+1} ({e})")
     model.eval()
     scores, ys = [], []
     with torch.no_grad():
@@ -61,6 +80,11 @@ def train_eval(train_df, test_df, store, cfg, esm_dim, args):
     auroc = float(roc_auc_score(y, s)) if len(set(y.tolist())) > 1 else float("nan")
     auprc = float(average_precision_score(y, s)) if len(set(y.tolist())) > 1 else float("nan")
     fpr, tpr, _ = roc_curve(y, s) if len(set(y.tolist())) > 1 else (np.array([]),)*3
+    try:  # sub-run finished successfully — drop its per-epoch checkpoint
+        if os.path.exists(ckpt):
+            os.remove(ckpt)
+    except Exception:
+        pass
     return {"auroc": auroc, "auprc": auprc, "n_test": int(len(y)),
             "pos_frac_test": float(np.mean(y))}, (fpr.tolist(), tpr.tolist())
 
@@ -76,6 +100,10 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--no-mech-track", action="store_true")
     ap.add_argument("--cv-folds", type=int, default=5)
+    ap.add_argument("--window", type=int, default=0,
+                    help="mutation-centered window size (0 = off / head-truncated full seq)")
+    ap.add_argument("--window-cache", default=None,
+                    help="window embedding cache dir (from scripts.precompute_variant_windows); required with --window")
     ap.add_argument("--max-rows", type=int, default=None)
     ap.add_argument("--out", default="runs/pathogenicity")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -83,38 +111,87 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     df = load_pathogenicity_pairs(args.data, ddg_npy=args.ddg, max_rows=args.max_rows)
-    store = EmbeddingStore(args.cache)
+
+    global _VARIANT_DS
+    if args.window and args.window_cache:
+        # Mutation-centered windows: build each graph from a window around the
+        # variant so the mutation is visible even in long proteins (fixes the
+        # ~64% of ClinVar variants truncated away by a fixed 256-residue head).
+        _VARIANT_DS = WindowedVariantDataset
+        store = EmbeddingStore(args.window_cache)
+        df = add_window_column(df, window=args.window)
+        key_col = "win_seq"
+        print(f"[window] mutation-centered windows enabled (W={args.window}); cache={args.window_cache}")
+    else:
+        store = EmbeddingStore(args.cache)
+        key_col = "mt_seq"
+    # Drop variants whose embedding was never cached (proteins >5000 aa that
+    # precompute skips, or windows not yet precomputed) — the dataset would
+    # otherwise crash on a missing .pt.
+    before = len(df)
+    df = df[df[key_col].map(store.has)].reset_index(drop=True)
+    if len(df) < before:
+        print(f"[filter] dropped {before - len(df)} / {before} variants with no cached embedding; {len(df)} remain")
     cfg = {"geo_threshold": 0.5, "eps": 0.10, "delta": 0.10, "mech_max_degree": 8}
     esm_dim = ESM_DIMS[args.esm_model]
     print(f"variants={len(df)} | pos_frac={df.label.mean():.3f} | genes={df.group.nunique()}")
 
-    results = {}
+    # Resumable partial state: survives an interruption between sub-runs so a
+    # re-run continues at the next unfinished split/fold instead of from scratch.
+    partial = os.path.join(args.out, "pathogenicity_partial.json")
+    state = {}
+    if os.path.exists(partial):
+        try:
+            state = json.load(open(partial))
+            print(f"[resume] partial pathogenicity state: done={list(state.get('results', {}).keys())} "
+                  f"cv_folds_done={len(state.get('cv_aurocs', []))}")
+        except Exception as e:
+            print(f"[resume] partial load failed ({e}); starting fresh"); state = {}
+    results = state.get("results", {})
+    roc_gene = tuple(state["roc_gene"]) if state.get("roc_gene") else None
+    cv_aurocs = list(state.get("cv_aurocs", []))
+
+    def save_partial():
+        try:
+            json.dump({"results": results, "roc_gene": list(roc_gene) if roc_gene else None,
+                       "cv_aurocs": cv_aurocs}, open(partial, "w"), indent=2)
+        except Exception as e:
+            print(f"[ckpt] partial save failed: {e}")
 
     # --- random split ---
-    rnd = df.sample(frac=1.0, random_state=0).reset_index(drop=True)
-    n_tr = int(0.8 * len(rnd))
-    m_rand, roc_rand = train_eval(rnd.iloc[:n_tr], rnd.iloc[n_tr:], store, cfg, esm_dim, args)
-    results["random_split"] = m_rand
-    print(f"RANDOM split   AUROC={m_rand['auroc']:.3f}  AUPRC={m_rand['auprc']:.3f}")
+    if "random_split" not in results:
+        rnd = df.sample(frac=1.0, random_state=0).reset_index(drop=True)
+        n_tr = int(0.8 * len(rnd))
+        m_rand, _ = train_eval(rnd.iloc[:n_tr], rnd.iloc[n_tr:], store, cfg, esm_dim, args, tag="random")
+        results["random_split"] = m_rand; save_partial()
+        print(f"RANDOM split   AUROC={m_rand['auroc']:.3f}  AUPRC={m_rand['auprc']:.3f}")
+    else:
+        print(f"[skip] random_split (done): AUROC={results['random_split']['auroc']:.3f}")
 
     # --- gene-disjoint split ---
-    row_split = S.row_splits_from_groups(df.group.tolist(), ratios=(0.8, 0.0, 0.2), seed=42)
-    df2 = df.copy(); df2["split"] = row_split
-    m_gene, roc_gene = train_eval(df2[df2.split == "train"], df2[df2.split == "test"],
-                                  store, cfg, esm_dim, args)
-    results["gene_disjoint_split"] = m_gene
-    print(f"GENE-DISJOINT  AUROC={m_gene['auroc']:.3f}  AUPRC={m_gene['auprc']:.3f}")
+    if "gene_disjoint_split" not in results or roc_gene is None:
+        row_split = S.row_splits_from_groups(df.group.tolist(), ratios=(0.8, 0.0, 0.2), seed=42)
+        df2 = df.copy(); df2["split"] = row_split
+        m_gene, roc_gene = train_eval(df2[df2.split == "train"], df2[df2.split == "test"],
+                                      store, cfg, esm_dim, args, tag="gene")
+        results["gene_disjoint_split"] = m_gene; save_partial()
+        print(f"GENE-DISJOINT  AUROC={m_gene['auroc']:.3f}  AUPRC={m_gene['auprc']:.3f}")
+    else:
+        print(f"[skip] gene_disjoint_split (done): AUROC={results['gene_disjoint_split']['auroc']:.3f}")
 
-    # --- GroupKFold CV (by gene) for a confidence interval ---
+    # --- GroupKFold CV (by gene) for a confidence interval; resumable fold-by-fold ---
     if args.cv_folds > 1 and df.group.nunique() >= args.cv_folds:
         gkf = GroupKFold(n_splits=args.cv_folds)
-        aurocs = []
-        for k, (tri, tei) in enumerate(gkf.split(df, df.label, groups=df.group)):
-            m, _ = train_eval(df.iloc[tri], df.iloc[tei], store, cfg, esm_dim, args)
-            aurocs.append(m["auroc"]); print(f"  fold {k+1}: AUROC={m['auroc']:.3f}")
+        folds = list(gkf.split(df, df.label, groups=df.group))
+        for k, (tri, tei) in enumerate(folds):
+            if k < len(cv_aurocs):
+                print(f"  [skip] fold {k+1}: AUROC={cv_aurocs[k]:.3f}"); continue
+            m, _ = train_eval(df.iloc[tri], df.iloc[tei], store, cfg, esm_dim, args, tag=f"cv{k}")
+            cv_aurocs.append(m["auroc"]); save_partial()
+            print(f"  fold {k+1}: AUROC={m['auroc']:.3f}")
         results["gene_disjoint_cv"] = {
-            "folds": aurocs, "mean": float(np.nanmean(aurocs)), "std": float(np.nanstd(aurocs))}
-        print(f"GENE-DISJOINT CV AUROC = {np.nanmean(aurocs):.3f} ± {np.nanstd(aurocs):.3f}")
+            "folds": cv_aurocs, "mean": float(np.nanmean(cv_aurocs)), "std": float(np.nanstd(cv_aurocs))}
+        print(f"GENE-DISJOINT CV AUROC = {np.nanmean(cv_aurocs):.3f} ± {np.nanstd(cv_aurocs):.3f}")
 
     json.dump({"results": results, "roc_gene_disjoint": roc_gene, "config": vars(args)},
               open(os.path.join(args.out, "pathogenicity_metrics.json"), "w"), indent=2)

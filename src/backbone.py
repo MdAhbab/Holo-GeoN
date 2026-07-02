@@ -55,7 +55,11 @@ class EsmEncoder(nn.Module):
         from transformers import AutoTokenizer, EsmModel
         self.name = esm_model_name
         self.tokenizer = AutoTokenizer.from_pretrained(esm_model_name)
-        self.esm = EsmModel.from_pretrained(esm_model_name, add_pooling_layer=False)
+        # eager attention is required: ESM's predict_contacts() / output_attentions
+        # need real attention maps, which the default `sdpa` impl does not emit
+        # (transformers >=5 selects sdpa by default).
+        self.esm = EsmModel.from_pretrained(esm_model_name, add_pooling_layer=False,
+                                            attn_implementation="eager")
         self.esm.eval()
         for p in self.esm.parameters():
             p.requires_grad = False

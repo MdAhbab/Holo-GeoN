@@ -76,7 +76,18 @@ def main():
             y = torch.tensor(targets[sel], dtype=torch.float32)
             yield g, y
 
-    for ep in range(1, args.epochs + 1):
+    start_ep = 1; mae = float("nan")
+    ckpt = os.path.join(args.out, "last.pt")
+    if os.path.exists(ckpt):  # resume from a per-epoch checkpoint after an interruption
+        try:
+            st = torch.load(ckpt, map_location=dev)
+            model.load_state_dict(st["model"]); opt.load_state_dict(st["opt"])
+            start_ep = int(st["epoch"]) + 1; mae = float(st.get("mae", float("nan")))
+            print(f"  [resume] idr: continuing from epoch {st['epoch']} (Rg MAE={mae:.2f} Å)")
+        except Exception as e:
+            print(f"  [resume] idr: checkpoint load failed ({e}); training fresh")
+            start_ep = 1
+    for ep in range(start_ep, args.epochs + 1):
         model.train(); rng.shuffle(tr_idx); tot = 0.0
         for g, y in tqdm(list(batches(tr_idx)), desc=f"epoch {ep}/{args.epochs}"):
             g = {k: v.to(dev) for k, v in g.items()}
@@ -93,6 +104,11 @@ def main():
         p = np.concatenate(preds); t = np.concatenate(gts)
         mae = float(np.mean(np.abs(p - t)))
         print(f"  ep{ep}: nll/batch={tot/max(len(tr_idx)//args.batch,1):.3f} | Rg MAE vs prior={mae:.2f} Å")
+        try:  # per-epoch resume checkpoint (guarded)
+            torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
+                        "epoch": ep, "mae": mae}, ckpt)
+        except Exception as e:
+            print(f"  [ckpt] idr: save failed at ep{ep} ({e})")
 
     torch.save(model.state_dict(), os.path.join(args.out, "idr_best.pt"))
     json.dump({"rg_mae_vs_prior": mae, "note": "target = disclosed polymer-physics prior, not experimental",

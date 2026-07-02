@@ -59,10 +59,13 @@ def main():
             emb = enc.embed(s, max_length=args.max_length)        # (L, d)
             cm = enc.contacts(s, max_length=args.max_length)      # (L, L)
             L = min(emb.shape[0], cm.shape[0])
+            dst = os.path.join(args.cache, seq_key(s) + ".pt")
+            tmp = dst + ".tmp"
             torch.save(
                 {"emb": emb[:L].half(), "contacts": cm[:L, :L].half(), "seq": s[:L]},
-                os.path.join(args.cache, seq_key(s) + ".pt"),
+                tmp,
             )
+            os.replace(tmp, dst)  # atomic rename: a crash never leaves a half-written .pt
         except Exception as e:  # keep going; report at end
             print(f"  ! failed ({type(e).__name__}) len={len(s)}: {e}")
     print(f"Done. Cache: {args.cache}")

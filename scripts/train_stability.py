@@ -70,7 +70,23 @@ def train_eval(tr, te, store, edge_cfg, esm_dim, use_mech, epochs, batch, lr,
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
     best = None
-    for ep in range(1, epochs + 1):
+    start_ep = 1
+    ckpt = None
+    if save_to:
+        os.makedirs(save_to, exist_ok=True)
+        ckpt = os.path.join(save_to, "last.pt")
+    # resume from a per-epoch checkpoint if one survives a previous (interrupted) run
+    if ckpt and os.path.exists(ckpt):
+        try:
+            st = torch.load(ckpt, map_location=device)
+            model.load_state_dict(st["model"]); opt.load_state_dict(st["opt"])
+            start_ep = int(st["epoch"]) + 1; best = st.get("best")
+            rb = f" (best r={best['pearson_r']:.4f})" if best else ""
+            print(f"  [resume] {desc}: continuing from epoch {st['epoch']}{rb}")
+        except Exception as e:
+            print(f"  [resume] {desc}: checkpoint load failed ({e}); training fresh")
+            start_ep = 1; best = None
+    for ep in range(start_ep, epochs + 1):
         model.train(); running = 0.0
         for g_wt, g_mt, y in tqdm(train_ld, desc=f"{desc} ep {ep}/{epochs}"):
             f, r = model.stability(move(g_wt, device), move(g_mt, device))
@@ -86,6 +102,12 @@ def train_eval(tr, te, store, edge_cfg, esm_dim, use_mech, epochs, batch, lr,
             if save_to:
                 os.makedirs(save_to, exist_ok=True)
                 torch.save(model.state_dict(), os.path.join(save_to, "stability_best.pt"))
+        if ckpt:  # per-epoch resume checkpoint (guarded; must never break training)
+            try:
+                torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
+                            "epoch": ep, "best": best}, ckpt)
+            except Exception as e:
+                print(f"  [ckpt] {desc}: save failed at ep{ep} ({e})")
     return best
 
 

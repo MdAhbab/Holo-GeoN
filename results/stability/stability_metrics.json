@@ -1,0 +1,30 @@
+{
+  "best": {
+    "pearson_r": 0.526761582982665,
+    "mae": 0.7253988981246948,
+    "rmse": 1.168953537940979,
+    "mean_antisymmetry_violation": 0.029306555166840553,
+    "n_test": 11268,
+    "epoch": 6,
+    "train_loss": 1.4004477266694748
+  },
+  "config": {
+    "splits": "data\\splits_megascale.parquet",
+    "cache": "C:/HoloGNN_work/cache/emb_150M",
+    "esm_model": "facebook/esm2_t30_150M_UR50D",
+    "epochs": 8,
+    "batch": 16,
+    "lr": 0.0003,
+    "alpha": 1.0,
+    "eps": 0.1,
+    "delta": 0.1,
+    "no_mech_track": false,
+    "back_translate": true,
+    "sweep": false,
+    "sweep_values": "0.05,0.10,0.20",
+    "sweep_epochs": 3,
+    "max_rows": null,
+    "out": "runs\\stability",
+    "device": "cuda"
+  }
+}

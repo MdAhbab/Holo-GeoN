@@ -1,0 +1,2 @@
+splits_clinvar.parquet: no_leakage=True | splits={'train': 158057, 'val': 20703, 'test': 19041} | unique_groups=14933 | rows=197801
+splits_megascale.parquet: no_leakage=True | splits={'train': 87026, 'test': 11268, 'val': 10607} | unique_groups=424 | rows=108901

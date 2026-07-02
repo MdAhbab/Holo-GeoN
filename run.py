@@ -60,6 +60,7 @@ DEFAULTS = {
     "epochs_idr": 5,
     "batch_stability": 16,
     "batch_pathogenicity": 32,
+    "cv_folds": 3,
     "lr": 3e-4,
     "run_ablation": True,
     "run_idr": True,
@@ -135,6 +136,13 @@ def venv_python(venv):
     return os.path.join(venv, "bin", "python")
 
 
+def _done(path):
+    """True if a stage output file already exists (resolved relative to ROOT).
+    Lets `run.py all` resume after an interruption by skipping finished stages."""
+    p = path if os.path.isabs(path) else os.path.join(ROOT, path)
+    return os.path.exists(p)
+
+
 # ---------------------------------------------------------------------------
 # stages
 # ---------------------------------------------------------------------------
@@ -179,6 +187,9 @@ def _splits_paths(cfg):
 
 def stage_splits(args, cfg):
     sm, sc = _splits_paths(cfg)
+    if _done(sm) and _done(sc):
+        print(f"[skip] splits already exist ({sm}, {sc})")
+        return
     py("scripts.make_splits", "--data", cfg["stability_data"], "--kind", "stability",
        "--method", cfg["split_method"], "--identity", cfg["identity"], "--out", sm)
     py("scripts.make_splits", "--data", cfg["clinvar_data"], "--kind", "pathogenicity",
@@ -188,6 +199,11 @@ def stage_splits(args, cfg):
 def stage_stability(args, cfg):
     sm, _ = _splits_paths(cfg)
     out = os.path.join(cfg["out_root"], "stability")
+    main_done = _done(os.path.join(out, "stability_metrics.json"))
+    nomech_done = (not cfg["run_ablation"]) or _done(os.path.join(out + "_nomech", "stability_metrics.json"))
+    if main_done and nomech_done:
+        print("[skip] stability stage already complete")
+        return
     common = ["--splits", sm, "--cache", cfg["cache"], "--esm-model", cfg["esm_model"],
               "--epochs", cfg["epochs_stability"], "--batch", cfg["batch_stability"],
               "--lr", cfg["lr"], "--device", cfg["device"]]
@@ -204,9 +220,13 @@ def stage_stability(args, cfg):
 
 def stage_pathogenicity(args, cfg):
     out = os.path.join(cfg["out_root"], "pathogenicity")
+    if _done(os.path.join(out, "pathogenicity_metrics.json")):
+        print("[skip] pathogenicity stage already complete")
+        return
     a = ["--data", cfg["clinvar_data"], "--cache", cfg["cache"],
          "--esm-model", cfg["esm_model"], "--epochs", cfg["epochs_pathogenicity"],
          "--batch", cfg["batch_pathogenicity"], "--lr", cfg["lr"],
+         "--cv-folds", cfg.get("cv_folds", 3),
          "--device", cfg["device"], "--out", out]
     if cfg["clinvar_ddg"] and os.path.exists(os.path.join(ROOT, cfg["clinvar_ddg"])):
         a += ["--ddg", cfg["clinvar_ddg"]]
@@ -216,18 +236,27 @@ def stage_pathogenicity(args, cfg):
 
 
 def stage_idr(args, cfg):
+    if _done(os.path.join(cfg["out_root"], "idr", "idr_metrics.json")):
+        print("[skip] idr stage already complete")
+        return
     py("scripts.train_idr", "--data", cfg["clinvar_data"], "--cache", cfg["cache"],
        "--esm-model", cfg["esm_model"], "--epochs", cfg["epochs_idr"],
        "--device", cfg["device"], "--out", os.path.join(cfg["out_root"], "idr"))
 
 
 def stage_baseline(args, cfg):
+    if _done(os.path.join(cfg["out_root"], "baseline_esm_zeroshot.json")):
+        print("[skip] baseline stage already complete")
+        return
     sm, _ = _splits_paths(cfg)
     py("scripts.baselines", "--splits", sm, "--esm-model", cfg["esm_model"],
        "--split", "test", "--device", cfg["device"])
 
 
 def stage_contacts(args, cfg):
+    if _done(os.path.join("results", "contacts", "contact_sanity.json")):
+        print("[skip] contacts stage already complete")
+        return
     a = ["--cache", cfg["cache"], "--max-seqs", 300]
     tcd = cfg.get("true_contacts_dir")
     if tcd:
@@ -283,6 +312,17 @@ STAGES = {
 
 
 def main():
+    # Force UTF-8 for this process and every spawned stage. On Windows the default
+    # console codec is cp1252, which raises UnicodeEncodeError on non-ASCII prints
+    # (emoji/±/Δ/Å) when stdout is redirected to a file — that would crash a stage.
+    os.environ.setdefault("PYTHONUTF8", "1")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
     ap = argparse.ArgumentParser(description="HoloGNN single-file runner.")
     ap.add_argument("stage", choices=list(STAGES))
     ap.add_argument("--config", default="configs/run.yaml")
