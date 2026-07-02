@@ -26,15 +26,11 @@ from sklearn.metrics import roc_auc_score, roc_curve, average_precision_score
 from sklearn.model_selection import GroupKFold
 from tqdm import tqdm
 
-from src.data import (load_pathogenicity_pairs, VariantDataset, WindowedVariantDataset,
-                      add_window_column, EmbeddingStore, collate_variants)
+from src.data import (load_pathogenicity_pairs, VariantDataset,
+                      EmbeddingStore, collate_variants)
 from src.full_model import HoloGNN
 from src.backbone import ESM_DIMS, DEFAULT_ESM
 from src import splits as S
-
-# Dataset class used to build variant graphs; swapped to WindowedVariantDataset
-# (mutation-centered windows) in main() when --window is set.
-_VARIANT_DS = VariantDataset
 
 
 def move(g, dev):
@@ -43,9 +39,9 @@ def move(g, dev):
 
 def train_eval(train_df, test_df, store, cfg, esm_dim, args, tag="run"):
     dev = args.device
-    tr = DataLoader(_VARIANT_DS(train_df, store, cfg), batch_size=args.batch,
+    tr = DataLoader(VariantDataset(train_df, store, cfg), batch_size=args.batch,
                     shuffle=True, collate_fn=collate_variants)
-    te = DataLoader(_VARIANT_DS(test_df, store, cfg), batch_size=args.batch,
+    te = DataLoader(VariantDataset(test_df, store, cfg), batch_size=args.batch,
                     shuffle=False, collate_fn=collate_variants)
     model = HoloGNN(esm_dim=esm_dim, use_mech_track=not args.no_mech_track, use_idr=False).to(dev)
     crit = torch.nn.BCEWithLogitsLoss()
@@ -100,10 +96,6 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--no-mech-track", action="store_true")
     ap.add_argument("--cv-folds", type=int, default=5)
-    ap.add_argument("--window", type=int, default=0,
-                    help="mutation-centered window size (0 = off / head-truncated full seq)")
-    ap.add_argument("--window-cache", default=None,
-                    help="window embedding cache dir (from scripts.precompute_variant_windows); required with --window")
     ap.add_argument("--max-rows", type=int, default=None)
     ap.add_argument("--out", default="runs/pathogenicity")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -112,24 +104,11 @@ def main():
 
     df = load_pathogenicity_pairs(args.data, ddg_npy=args.ddg, max_rows=args.max_rows)
 
-    global _VARIANT_DS
-    if args.window and args.window_cache:
-        # Mutation-centered windows: build each graph from a window around the
-        # variant so the mutation is visible even in long proteins (fixes the
-        # ~64% of ClinVar variants truncated away by a fixed 256-residue head).
-        _VARIANT_DS = WindowedVariantDataset
-        store = EmbeddingStore(args.window_cache)
-        df = add_window_column(df, window=args.window)
-        key_col = "win_seq"
-        print(f"[window] mutation-centered windows enabled (W={args.window}); cache={args.window_cache}")
-    else:
-        store = EmbeddingStore(args.cache)
-        key_col = "mt_seq"
+    store = EmbeddingStore(args.cache)
     # Drop variants whose embedding was never cached (proteins >5000 aa that
-    # precompute skips, or windows not yet precomputed) — the dataset would
-    # otherwise crash on a missing .pt.
+    # precompute skips) — the dataset would otherwise crash on a missing .pt.
     before = len(df)
-    df = df[df[key_col].map(store.has)].reset_index(drop=True)
+    df = df[df["mt_seq"].map(store.has)].reset_index(drop=True)
     if len(df) < before:
         print(f"[filter] dropped {before - len(df)} / {before} variants with no cached embedding; {len(df)} remain")
     cfg = {"geo_threshold": 0.5, "eps": 0.10, "delta": 0.10, "mech_max_degree": 8}

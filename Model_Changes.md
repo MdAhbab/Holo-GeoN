@@ -52,7 +52,7 @@ exist. `VariantDataset` loaded them unguarded and crashed with `FileNotFoundErro
 The stage now filters to variants whose embedding is cached (a `[filter]` line
 reports how many were dropped — 5,549 / 197,801 = 2.81% for this dataset). This is
 also *more correct*: those variants are truncated to 256 residues anyway, so the
-mutation would not be represented (see §5).
+mutation would not be represented.
 
 ### `scripts/baselines.py` — checkpoint temp-file naming
 `np.savez` appends `.npz` to its target, so the atomic-write temp file was written
@@ -97,38 +97,7 @@ training.
 
 ---
 
-## 5. New feature — mutation-centered windows (pathogenicity)
-
-**Problem found.** With `max_length=256`, each sequence is head-truncated to its
-first 256 residues. But **63.8%** of ClinVar variants have their mutation at a
-position **> 256** (median position 383), so after truncation the mutant embedding
-is identical to the wildtype's first 256 residues — **the model cannot see the
-mutation**. This explains the large random→gene-disjoint AUROC drop
-(0.918 → 0.669): on seen genes the model memorizes gene-level pathogenicity priors,
-but on unseen genes, with ~64% of mutations invisible, it collapses toward guessing.
-
-**Fix (opt-in, additive).** Embed a window **centered on the mutated residue**
-instead of the sequence head, so the variant is always inside the ESM context — at
-the same embedding/cache size (no larger model, no L² contact-map blow-up).
-
-- **`src/data.py` (additions only):** `mutation_position(wt, mt)`,
-  `variant_window(mt_seq, pos, window)`, `add_window_column(df, window)`, and
-  `WindowedVariantDataset`. Existing classes/functions are untouched.
-- **`scripts/precompute_variant_windows.py` (new):** caches ESM embeddings +
-  contacts for one mutation-centered window per variant, keyed by the window
-  subsequence (deterministic, matches `add_window_column`).
-- **`scripts/train_pathogenicity.py`:** new `--window N` / `--window-cache DIR`
-  flags (**default off**, so existing behavior is unchanged) that swap in
-  `WindowedVariantDataset` and the window cache.
-
-Unit-tested: the mutated residue lands inside the window for positions at the
-start, middle, and C-terminus and for any protein length. This is the queued
-improvement run (150M + windows) — expected to raise gene-disjoint AUROC toward
-the ~0.75–0.82 range with no 650M upgrade.
-
----
-
-## 6. Configuration & runner
+## 5. Configuration & runner
 
 - **`run.py`:** added `cv_folds` to `DEFAULTS` and pass `--cv-folds` to the
   pathogenicity stage (set to **3** for this run to keep the 5-fold CV runtime
@@ -141,7 +110,7 @@ the ~0.75–0.82 range with no 650M upgrade.
 
 ---
 
-## 7. Results — 150M baseline run
+## 6. Results — 150M baseline run
 
 Produced by `python run.py all` on the preprocessed MegaScale + ClinVar data,
 ESM-2 `t30_150M`, 30%-identity protein-disjoint (stability) and gene-disjoint
@@ -163,12 +132,18 @@ modest absolute values are explained, not defects: the stability test split has
 compressed ΔΔG variance (std 1.33 vs 2.30 in train) and is protein-disjoint; the
 mechanistic track adds nothing here because MegaScale has no real coding DNA (the
 `E_mech` edges come from a back-translate proxy); and the gene-disjoint
-pathogenicity AUROC is capped by the 256-truncation blind spot in §5.
+pathogenicity AUROC is limited by a head-truncation blind spot (see §7): with
+`max_length=256`, the mutation falls outside the embedded window for the majority
+of long ClinVar proteins.
 
-## 8. Known limitations & next steps
+## 7. Known limitations & next steps
 
-- **Truncation (biggest lever):** run the windowed pathogenicity (§5) —
-  `precompute_variant_windows.py` + `train_pathogenicity.py --window 256`.
+- **Truncation (biggest lever):** with `max_length=256` each sequence is
+  head-truncated to its first 256 residues, but ~64% of ClinVar variants have
+  their mutation beyond position 256 (median 383) — so on those variants the
+  mutant embedding equals the wildtype's first 256 residues and the model cannot
+  see the mutation. Embedding a window centered on the mutated residue (instead of
+  the sequence head), at the same embedding size, would restore that signal.
 - **Stability fidelity:** `AntisymmetricLoss` weights antisymmetry and fidelity
   equally (`alpha=1`); lowering `alpha` prioritizes the ΔΔG fit.
 - **Reporting:** stability uses a single protein-disjoint split; a GroupKFold CV
