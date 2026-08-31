@@ -50,6 +50,9 @@ def main() -> None:
                     help="total residues across unique parent proteins, for the "
                          "cache estimate (e.g. 20k proteins x 600 residues)")
     ap.add_argument("--vram-gb", type=float, default=16.0)
+    ap.add_argument("--sequence-nodes", type=int, default=None,
+                    help="nodes in a whole-sequence graph (default: the config's "
+                         "max_sequence_nodes) - the IDR/MFI/proteomics path")
     args = ap.parse_args()
 
     cfg = load_config(args.config, overrides={
@@ -58,6 +61,8 @@ def main() -> None:
     })
     device = torch.device(args.device)
     esm_dim = ESM_DIMS.get(cfg.esm_model, 1280)
+    if args.sequence_nodes is None:
+        args.sequence_nodes = int(cfg.get("max_sequence_nodes", 2048))
 
     print("=" * 70)
     print("Holo-GeoN budget")
@@ -112,17 +117,64 @@ def main() -> None:
     # graph, and each of these two terms alone exceeded the 0.78 GB it produced.
     e_geo = int(batch["edge_geo"].shape[1] * scale)
     e_mech = int(batch["edge_mech"].shape[1] * scale)
-    # GATv2Conv keeps a per-edge message tensor (E, heads, out_channels) for
-    # backward, in each of 4 convolutions (2 layers x 2 streams).
-    gat_bytes = 4 * (e_geo + e_mech) / 2 * kwargs["gat_heads"] * cfg.hidden * 4
-    # The associative scan allocates a_prev/x_prev and rewrites a_c/x_c at each
-    # of ceil(log2 L) steps, all retained by autograd.
+
+    def gat_term(n_edges: int) -> float:
+        """
+        Bytes of per-edge GATv2 message tensors retained for backward.
+
+        ``(E, heads, out_channels)`` fp32, in each of 4 convolutions (2 layers
+        x 2 streams). Round-2 review, R2-02: this term carried a spurious
+        ``/ 2``, halving it to 1.23 GB where the tensors actually kept are
+        2.46 GB - matching round 1's independent 2.38 GB estimate. The edge
+        lists here are already DIRECTED (both orientations are materialised by
+        the graph builder), so there is no double count to divide out.
+        """
+        return 4.0 * n_edges * kwargs["gat_heads"] * cfg.hidden * 4
+
+    def scan_term(nodes_per_batch: int, width: int) -> float:
+        """
+        Bytes of associative-scan buffers retained by autograd.
+
+        a_prev/x_prev are allocated and a_c/x_c rewritten at each of
+        ceil(log2 width) steps, all held for backward.
+        """
+        if not cfg.use_ssm:
+            return 0.0
+        steps = max(1, math.ceil(math.log2(max(width, 2))))
+        return steps * 4.0 * nodes_per_batch * esm_dim * 4
+
+    gat_bytes = gat_term(e_geo + e_mech)
     scan_steps = max(1, math.ceil(math.log2(max(cfg.window, 2))))
-    scan_bytes = scan_steps * 4 * node_bytes * scale if cfg.use_ssm else 0.0
+    scan_bytes = scan_term(cfg.batch_size * cfg.window, cfg.window)
 
     print(f"GATv2 edge tensors : {gat_bytes / GB:.2f} GB (4 convs, "
-          f"{e_geo + e_mech:,} edges, {kwargs['gat_heads']} heads)")
+          f"{e_geo + e_mech:,} directed edges, {kwargs['gat_heads']} heads)")
     print(f"SSM scan buffers   : {scan_bytes / GB:.2f} GB ({scan_steps} steps)")
+    print()
+
+    # --- the whole-sequence path (R2-02) -----------------------------------
+    # IDR / MFI / proteomics graphs span the entire protein, not a window. They
+    # were not modelled here at all, and at one shared batch_size they cost 8x
+    # the batch above - past the target card, part-way through epoch 1.
+    seq_nodes = int(args.sequence_nodes)
+    budget_nodes = int(cfg.get("sequence_node_budget") or cfg.batch_size * cfg.window)
+    edges_per_node = (e_geo + e_mech) / max(cfg.batch_size * cfg.window, 1)
+    print(f"--- one whole-sequence batch (max_sequence_nodes={seq_nodes}) ---")
+    for label, nodes in (
+        (f"UNCAPPED at batch_size {cfg.batch_size}", cfg.batch_size * seq_nodes),
+        (f"node budget {budget_nodes:,}", budget_nodes),
+    ):
+        g = gat_term(int(edges_per_node * nodes))
+        sc = scan_term(nodes, seq_nodes)
+        nb = nodes * esm_dim * 4
+        total = (g + sc + nb + counts["total"] * 16) / GB
+        samples = max(1, nodes // seq_nodes)
+        print(f"{label:<28}: {samples:>3} sample(s)/batch, "
+              f"{nodes:>7,} padded nodes -> LOWER BOUND {total:6.2f} GB"
+              + ("  <-- exceeds the card" if total > args.vram_gb else ""))
+    print("  (the node-budget row is what src/data.py NodeBudgetBatchSampler")
+    print("   enforces; the uncapped row is what a shared batch_size costs.)")
+    print()
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()

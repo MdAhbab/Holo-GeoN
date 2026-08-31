@@ -15,11 +15,16 @@ Two decisions worth stating.
 whose output is supervised against real structural contacts, rather than from
 raw attention. Whether that actually carries non-local signal on your data is
 measured, not asserted: run ``scripts/contact_sanity.py`` after precompute and
-read ``results/contacts/contact_sanity.json``. It reports the long-range
-fraction (|i-j| >= 24) among top-L predicted pairs against a sequence-proximity
-baseline whose long-range fraction is 0 by construction. That gap is the whole
-reason for building a graph instead of a chain, and it is the first thing to
-check if the geometric stream underperforms.
+read ``results/contacts/contact_sanity.json``.
+
+Read it carefully. Its default mode reports the long-range fraction (|i-j| >= 24)
+among top-L predicted pairs, against a sequence-proximity baseline whose
+long-range fraction is 0 by construction AND against a random-edge control.
+Round-2 review, R2-13: with only the proximity baseline, uniformly random edges
+scored 0.880 against a baseline defined to score 0.000, so that comparison could
+not tell the contact head from noise. Only ``--true-contacts-dir`` - precision@L
+against real C-beta contact maps - can show the edges are correct rather than
+merely non-local, and that is the number to cite for the graph.
 
 **Sparse, full-length storage.** A dense ``L x L`` map costs O(L^2) on disk and
 is thrown away immediately after thresholding; storing the top-k neighbours per
@@ -38,6 +43,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -117,6 +123,38 @@ def sparse_topk_contacts(
     return torch.stack([u_lo, u_hi], dim=0), best
 
 
+def chunk_context_score(length: int, start: int, end: int) -> torch.Tensor:
+    """
+    Per-residue score for "how good is this chunk for this residue", over
+    ``[start, end)`` of a protein of ``length`` residues.
+
+    For residue ``i`` the score is the fraction of its **real** neighbouring
+    context that the chunk retains, taking the worse of the two sides::
+
+        kept_left  = (i - start) / i                  (1.0 when i is the N terminus)
+        kept_right = (end - 1 - i) / (length - 1 - i) (1.0 when i is the C terminus)
+        score      = min(kept_left, kept_right)
+
+    A residue is therefore assigned to the chunk that discards the least of what
+    actually surrounds it. The naive alternative - distance from the nearest
+    chunk boundary - is blind to context the chunk never covered, which is how a
+    short tail chunk could win a residue away from a chunk holding eight times
+    more of its neighbourhood (R1-26).
+
+    Reaching a true sequence terminus is not truncation, so that side scores a
+    full 1.0 rather than being penalised for context that does not exist.
+    """
+    idx = torch.arange(start, end, dtype=torch.float32)
+    avail_left = idx
+    avail_right = (length - 1) - idx
+    kept_left = idx - start
+    kept_right = (end - 1) - idx
+    ones = torch.ones_like(idx)
+    ratio_left = torch.where(avail_left > 0, kept_left / avail_left.clamp(min=1.0), ones)
+    ratio_right = torch.where(avail_right > 0, kept_right / avail_right.clamp(min=1.0), ones)
+    return torch.minimum(ratio_left, ratio_right)
+
+
 # ---------------------------------------------------------------------------
 # Encoder
 # ---------------------------------------------------------------------------
@@ -187,8 +225,9 @@ class EsmEncoder(nn.Module):
 
         For proteins longer than the encoder's context the sequence is split
         into overlapping chunks. Each residue's embedding is taken from the
-        chunk where it sits furthest from a boundary, so representations always
-        come from the most context available. Contacts are extracted per chunk,
+        chunk that retains the largest fraction of its real surrounding context
+        (:func:`chunk_context_score`), so a residue is never moved to a chunk
+        that knows less about it. Contacts are extracted per chunk,
         which means **contacts spanning more than one chunk are not recovered**
         — a real limitation for proteins beyond ~1 kresidue, and the reason
         window selection happens around the mutation rather than at the N
@@ -204,27 +243,29 @@ class EsmEncoder(nn.Module):
             edges, probs = sparse_topk_contacts(cm, top_k, min_sep)
         else:
             emb = torch.zeros((L, self.dim), dtype=torch.float32)
-            # Selection score per residue: distance from the nearest chunk
-            # boundary, capped at half the chunk length.
+            # Selection score per residue: the FRACTION of its real context that
+            # this chunk preserves, taking the worse of the two sides. See
+            # :func:`chunk_context_score`.
             #
-            # Round-1 review, R1-26: using boundary distance alone, a residue in
-            # the overlap could be taken from a SHORT tail chunk simply because
-            # it sat nearer that chunk's middle - 128 residues per boundary, for
-            # every protein over the context limit, drawn from a fragment with
-            # strictly less context than the full-length chunk that also covered
-            # them. Capping at chunk_length/2 makes a short chunk unable to
-            # outscore a long one, so a residue never moves to less context.
-            best_margin = torch.full((L,), -1.0)
+            # Round-2 review, R2 (R1-26 re-opened): the round-1 fix added
+            # ``clamp(margin, max=n/2)`` to a boundary-distance score. That clamp
+            # is a provable no-op - the largest attainable margin in a chunk of
+            # n residues is (n-1)/2, which is already below the bound - so
+            # selection was unchanged and 128 residues per boundary still took
+            # their embedding from a strictly shorter chunk. The reviewer's
+            # example: at L=1023 residue 894 scored 128 in the 257-residue tail
+            # chunk against 127 in the 1022-residue chunk, and won on the tail.
+            # Boundary distance is the wrong quantity: it treats the 894
+            # residues of left context the tail chunk THROWS AWAY as free.
+            # Scoring retained context instead makes that trade explicit.
+            best_score = torch.full((L,), -1.0)
             all_edges, all_probs = [], []
             for start, end in spans:
                 c_emb, c_cm = self._forward_chunk(seq[start:end])
-                n = end - start
-                pos = torch.arange(n)
-                margin = torch.minimum(pos, torch.tensor(n - 1) - pos).float()
-                margin = torch.clamp(margin, max=n / 2.0)
-                take = margin > best_margin[start:end]
+                score = chunk_context_score(L, start, end)
+                take = score > best_score[start:end]
                 emb[start:end][take] = c_emb[take]
-                best_margin[start:end][take] = margin[take]
+                best_score[start:end][take] = score[take]
 
                 e, p = sparse_topk_contacts(c_cm, top_k, min_sep, offset=start)
                 if e.numel():
@@ -286,10 +327,32 @@ class EsmEncoder(nn.Module):
 # Cache
 # ---------------------------------------------------------------------------
 class EncodingStore:
-    """Read/write access to the precomputed encoder cache."""
+    """
+    Read/write access to the precomputed encoder cache.
 
-    def __init__(self, cache_dir: str):
+    An optional in-memory LRU sits in front of :meth:`get`. A mutation dataset
+    calls it once per ROW while the cache is keyed by PARENT, so on MegaScale the
+    same file is re-read from disk and re-deserialised on the order of 100 times
+    per epoch per protein. Round-2 review, R1-17: the round-1 commit claimed
+    "built graphs cached" and no cache of any kind existed - a repo-wide grep
+    found no ``lru_cache`` in ``src/`` or ``scripts/``. This is the cache that
+    was worth having; graph construction itself is 2.81 ms and was already
+    made cheap by the vectorised ``_cap_degree``, which is the half of that
+    commit that was real.
+
+    It is **off by default**, because it trades a bounded amount of RAM per
+    DataLoader worker for the saving and that trade should be made deliberately:
+    one record is roughly ``L * dim * 2`` bytes (about 1.5 MB for a 600-residue
+    protein at dim 1280), so ``cache_records=32`` costs ~50 MB per worker. Set
+    ``record_cache_size`` in the config to enable it.
+    """
+
+    def __init__(self, cache_dir: str, cache_records: int = 0):
         self.cache_dir = cache_dir
+        self.cache_records = int(cache_records)
+        self._memo: "OrderedDict[str, dict]" = OrderedDict()
+        self.hits = 0
+        self.misses = 0
 
     def path(self, seq: str) -> str:
         return os.path.join(self.cache_dir, seq_key(seq) + ".pt")
@@ -297,9 +360,35 @@ class EncodingStore:
     def has(self, seq: str) -> bool:
         return os.path.exists(self.path(seq))
 
+    def _load(self, seq: str) -> dict:
+        return torch.load(self.path(seq), map_location="cpu", weights_only=False)
+
     def get(self, seq: str) -> dict:
-        rec = torch.load(self.path(seq), map_location="cpu", weights_only=False)
+        if self.cache_records <= 0:
+            return self._load(seq)
+        key = seq_key(seq)
+        hit = self._memo.get(key)
+        if hit is not None:
+            self.hits += 1
+            self._memo.move_to_end(key)
+            return hit
+        self.misses += 1
+        rec = self._load(seq)
+        self._memo[key] = rec
+        while len(self._memo) > self.cache_records:
+            self._memo.popitem(last=False)
         return rec
+
+    def cache_stats(self) -> dict:
+        """Hit rate of the in-memory record cache, for a run manifest."""
+        total = self.hits + self.misses
+        return {
+            "enabled": self.cache_records > 0,
+            "capacity_records": self.cache_records,
+            "hits": self.hits,
+            "misses": self.misses,
+            "hit_rate": round(self.hits / total, 4) if total else 0.0,
+        }
 
     def put(self, rec: dict) -> str:
         """Write one record atomically, so a crash never leaves a partial file."""
@@ -343,6 +432,66 @@ class EncodingStore:
         os.replace(tmp, self.manifest_path())
         return self.manifest_path()
 
+    def mech_coverage(self, seqs, sample: int | None = None) -> dict:
+        """
+        Measure the mechanistic stream's coverage **by reading the cache**.
+
+        Round-2 review, R2-01: ``cds_coverage`` was derived from the input
+        table - how many rows carried a CDS column - and written into the
+        manifest as though it described the cache. Those are different numbers
+        whenever precompute skips an already-cached parent, which is the
+        ordinary path (``--cds-source`` is optional, so the first cache is
+        usually built without one). The reviewer made the manifest report
+        ``cds_coverage: 1.0`` for a cache in which every record had
+        ``mech_valid = 0``. A number that reaches a methods section must be
+        measured on the artifact it describes, so this opens the records that
+        will actually be read and counts them.
+
+        Returns counts plus ``cds_coverage``, the fraction of cached records
+        whose mechanistic channels are actually populated. A record is counted
+        as active only when its stored ``mech`` tensor carries a set
+        ``mech_valid`` channel - not when it merely remembers a CDS string.
+
+        ``sample`` bounds how many records are opened: a 20k-parent cache would
+        otherwise cost 20k deserialisations just to describe itself. The result
+        says whether it is a sample, so the number is never read as a census.
+        """
+        from src.features import CH_VALID
+
+        seqs = list(seqs)
+        sampled = sample is not None and 0 < sample < len(seqs)
+        if sampled:
+            # Spread across the cache rather than the first N, which would
+            # over-represent whatever the input table happened to list first.
+            step = max(1, len(seqs) // sample)
+            seqs = seqs[::step][:sample]
+        present = active = has_cds_flag = unreadable = 0
+        for seq in seqs:
+            if not self.has(seq):
+                continue
+            present += 1
+            try:
+                rec = self.get(seq)
+            except Exception:
+                unreadable += 1
+                continue
+            if rec.get("has_cds"):
+                has_cds_flag += 1
+            mech = rec.get("mech")
+            if mech is not None and mech.numel() and float(mech[:, CH_VALID].max()) > 0:
+                active += 1
+        return {
+            "parents_examined": len(seqs),
+            "parents_present_in_cache": present,
+            "parents_unreadable": unreadable,
+            "cds_flagged_in_cache": has_cds_flag,
+            "cds_active": active,
+            "cds_coverage": round(active / present, 4) if present else 0.0,
+            "cds_coverage_measured_on": "cached records (mech[:, CH_VALID].max() > 0)",
+            "cds_coverage_is_a_sample": bool(sampled),
+            "cds_coverage_sample_limit": sample if sampled else None,
+        }
+
     @staticmethod
     def projected_bytes(total_residues: int, dim: int, top_k: int) -> int:
         """
@@ -358,4 +507,5 @@ class EncodingStore:
 __all__ = [
     "ESM_DIMS", "DEFAULT_ESM", "MAX_CONTEXT_RESIDUES",
     "EsmEncoder", "EncodingStore", "seq_key", "sparse_topk_contacts",
+    "chunk_context_score",
 ]

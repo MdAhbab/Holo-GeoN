@@ -99,6 +99,34 @@ DEFAULTS: dict[str, Any] = {
     "task_sampling_temperature": 0.5,
     # Cap on nodes for a whole-sequence graph (IDR / MFI / proteomics).
     "max_sequence_nodes": 2048,
+    # Whole-sequence batches are capped by padded NODE count, not sample count
+    # (R2-02). None means "the same node budget the windowed loaders spend",
+    # i.e. batch_size * window - so no task can cost more per step than the ddG
+    # task the memory budget is computed for.
+    "sequence_node_budget": None,
+    # The ONE metric per task the ablation grid compares. Pre-registered here so
+    # the comparison family is fixed before any number is seen; comparing every
+    # numeric key instead gave 80 uncorrected comparisons and a 0.999 chance of
+    # a spurious "component matters" flag under the global null (R2-06).
+    # Three-state neutral band for stability rows with no reported measurement
+    # error, in kcal/mol. A label is "neutral" when |ddG| <= n_sigma * sigma;
+    # with no `sigma` column this constant decides the class of ~21% of a
+    # realistic ddG distribution, so it is declared here and recorded in
+    # metrics.json with a sensitivity table (R2-11).
+    "three_state_sigma": 0.5,
+    # In-memory cached encoder records per DataLoader worker. 0 disables it.
+    # A mutation dataset reads one record per ROW from a cache keyed by PARENT,
+    # so the same file is deserialised many times per epoch; this trades roughly
+    # `record_cache_size * L * dim * 2` bytes per worker for those reads. Off by
+    # default because the RAM cost should be chosen, not inherited (R1-17).
+    "record_cache_size": 0,
+    "ablation_metrics": {
+        "stability": "pearson",
+        "pathogenicity": "auroc",
+        "idr": "pearson",
+        "mfi": "pearson",
+        "proteomics": "pearson",
+    },
 }
 
 

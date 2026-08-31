@@ -22,7 +22,13 @@ torch>=2.7
 torch_geometric>=2.5
 
 # Frozen protein language model + tokeniser (ESM-2).
-transformers>=4.40
+#
+# Upper bound is load-bearing, not caution. src/encoder.py extracts contacts via
+# predict_contacts(), which consumes real attention maps, and the sdpa attention
+# implementation that transformers 5 defaults to does not emit them. The encoder
+# asks for attn_implementation="eager" to compensate, but the option and its
+# semantics are exactly what a major version may change (R2-15).
+transformers>=4.40,<5
 
 # Real mRNA secondary-structure folding (minimum free energy). Without it the
 # mechanistic channels stay masked (mech_valid = 0) and E_mech is empty — the
@@ -49,3 +55,14 @@ tqdm>=4.65
 # The web interface has its own lightweight dependency set in
 # app/backend/requirements.txt; `python runapp.py` installs it into a private
 # virtualenv.
+#
+# REPRODUCIBILITY. These are floors, not a lockfile, and a floor does not pin a
+# stack. Before a reported run, freeze the exact environment on the machine that
+# will produce it:
+#
+#     pip freeze > requirements.lock.txt
+#
+# and keep it with the results. Every run also records its own package versions,
+# git commit, device and MMseqs2 presence into its manifest via
+# src/provenance.py, so an artifact can be attributed even when the lockfile is
+# missing (round-2 review, R2-15).

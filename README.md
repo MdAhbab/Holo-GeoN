@@ -23,12 +23,24 @@ ESM-2 (`t33_650M` by default) runs once per unique **parent** protein and its
 output is cached: per-residue embeddings in fp16, plus a **sparse** top-k edge
 list from ESM-2's *contact-prediction head*. The contact head is used rather
 than raw attention because its output is supervised against real structural
-contacts — `scripts/contact_sanity.py` measures the long-range fraction among
-top-L predicted pairs against a sequence-proximity baseline, which is the check
-that justifies building a graph rather than a chain.
+contacts. `scripts/contact_sanity.py` measures the long-range fraction among
+top-L predicted pairs against a sequence-proximity baseline **and a random-edge
+control**. Read it against the random control: the proximity baseline scores 0
+by construction, so beating it is arithmetic rather than evidence — uniformly
+random edges beat it too. Showing the edges are *correct* rather than merely
+non-local needs `--true-contacts-dir` and precision@L against real C-beta contact
+maps, and that is the number that justifies building a graph rather than a
+chain.
 
 The encoder never enters the training loop, so training holds only the ~20M
-trainable parameters and fits a 16 GB card with room to spare.
+trainable parameters. `scripts/budget.py` computes an analytic **lower bound**
+from real tensor shapes — 5.35 GB for the shipped ddG configuration at batch 64,
+window 256 — and refuses to print a peak without a
+`torch.cuda.max_memory_allocated()` measurement on the target card. Whole-
+sequence batches (IDR/MFI/proteomics) span the entire protein and are capped by
+node budget rather than sample count, which holds them to the same per-step cost;
+uncapped at a shared `batch_size` they would demand 48 GB. Run the script on the
+card before trusting either figure.
 
 ### Windowing
 
@@ -71,9 +83,14 @@ The parent is encoded once and the head is conditioned on residue identity. Two
 properties follow from the form itself rather than from a training penalty:
 
 - **Exact reversibility.** `ΔΔG(b→a) = −ΔΔG(a→b)` to floating point, asserted in
-  the test suite in both train and eval mode.
-- **Free deep mutational scans.** All 20 substitutions at a site share one
-  encoder pass, so a full 20 × L scan is tractable in the interface.
+  the test suite under `eval()`. Under `train()` dropout is active and two
+  independent forward passes differ by ~8e-2, which is dropout rather than a
+  broken constraint — the antisymmetry is a property of the head's form, not
+  of a particular stochastic pass.
+- **Cheap deep mutational scans.** The encoder runs **once per protein** — its
+  output does not depend on the mutation site — and all 20 substitutions at a
+  site then share one backbone pass, so a full 20 × L scan is tractable in the
+  interface.
 
 The head is heteroscedastic: it predicts `(μ, log σ²)` and trains under Gaussian
 NLL, so `μ ± 1.96σ` is a real interval — once `scripts/calibration.py` has
@@ -153,15 +170,29 @@ python -m scripts.budget --batch-size 64 --window 256
 
 ## Evaluation
 
-Every task is split with MMseqs2 identity clustering unioned with gene identity,
-whole groups to one side, with a leakage report recording the grouping, the
-per-split target spread, and every excluded row by reason.
+Every task is split with MMseqs2 identity clustering unioned with a declared
+grouping column (gene, or the parent construct a variant belongs to), whole
+groups to one side. Without MMseqs2 on PATH the clustering relation degrades to
+exact parent-sequence identity, and the report says which of the two ran.
+
+Because a group-key check can only restate how the groups were built, every
+split is then **audited** by comparing held-out sequences against training
+sequences directly (MinHash over 8-mers). A split where held-out proteins have
+near-identical training proteins is refused, with the overlap reported. That
+check is what a deep mutational scan needs: grouping by the row's own sequence
+gives every variant its own group and passes trivially while every test row sits
+one residue from a training row.
 
 Baselines run on the identical split:
 
-- **`esm_mlp`** — a supervised MLP on the same cached embeddings, no graph. This
-  is the control that matters: the gap between it and the full model is the
-  message-passing contribution. It is the first thing a reviewer asks for.
+- **`esm_mlp`** — a supervised MLP on the same cached embeddings, no graph, on
+  the same epoch budget, LR schedule, gradient clipping and early-stopping
+  patience as the model. This is the control that matters, and it is the first
+  thing a reviewer asks for. The gap between it and the full model is the
+  **joint** contribution of the graph, the site-anchored readout, the SSM, the
+  cross-attention fusion and the mechanistic channels; the ablation grid is what
+  separates them. Parameter count is deliberately not matched and is reported
+  alongside the metrics.
 - **`esm_zero_shot`** — wild-type-marginal masked-LM scoring (Meier et al., 2021).
 - **`substitution_frequency`** — the amino-acid pair alone.
 

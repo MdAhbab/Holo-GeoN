@@ -167,12 +167,6 @@ export default function IdrTab() {
                 95% interval:{' '}
                 <strong>{result.ci_low.toFixed(2)} – {result.ci_high.toFixed(2)} Å</strong>
               </div>
-              <div className="stat-chip">
-                Character:{' '}
-                <strong>
-                  {result.mu / Math.pow(result.length, 0.33) < 2.5 ? 'Globular / compact' : 'Extended / disordered'}
-                </strong>
-              </div>
             </div>
           </div>
 

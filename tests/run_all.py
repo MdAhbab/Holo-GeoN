@@ -20,13 +20,20 @@ from tests import helpers
 
 
 def main() -> int:
-    from tests import test_app, test_invariants, test_pipeline, test_round1_fixes
+    from tests import (
+        test_app,
+        test_invariants,
+        test_pipeline,
+        test_round1_fixes,
+        test_round2_fixes,
+    )
 
     modules = [
         ("invariants", test_invariants.TESTS),
         ("pipeline", test_pipeline.TESTS),
         ("web backend", test_app.TESTS),
         ("round-1 review regressions", test_round1_fixes.TESTS),
+        ("round-2 review regressions", test_round2_fixes.TESTS),
     ]
 
     errors: list[str] = []

@@ -173,7 +173,20 @@ class HoloGeoN(nn.Module):
         return self.idr_head(z, batch.get("seq_length"))
 
     def mfi(self, batch: dict, z: torch.Tensor | None = None) -> torch.Tensor:
-        z = self.context(batch) if z is None else z
+        """
+        ``(B, 1)`` mean fluorescence intensity for a whole construct.
+
+        Round-2 review, R2-08: this used ``self.context`` - the SITE-ANCHORED
+        readout - while ``idr`` and ``proteomics`` used ``global_context``. MFI
+        rows carry no mutation site, so ``build_sample_graph`` sets the anchor to
+        residue 0, and two of the three components of the context vector became
+        "the N-terminal residue's embedding" and "an attention pool over the ~14
+        nodes within 2 hops of residue 0". R1-07 removed the [0, 256) window for
+        the whole-sequence tasks and left the N-terminal anchor for this one
+        head. ``src/readout.py`` says whole-sequence tasks use
+        ``SiteAnchoredReadout.global_only``; now they all do.
+        """
+        z = self.global_context(batch) if z is None else z
         return self.mfi_head(z, batch.get("seq_length"))
 
     def proteomics(self, batch: dict, z: torch.Tensor | None = None) -> torch.Tensor:

@@ -4,7 +4,7 @@ scripts/precompute_embeddings.py
 The one heavy GPU pass: encode every unique **parent** protein once.
 
 Each cache entry holds the frozen ESM-2 per-residue embeddings, a sparse
-contact-head edge list, and the seven mechanistic channels. Everything
+contact-head edge list, and the eight mechanistic channels. Everything
 downstream reads the cache and never loads ESM-2, which is what lets the
 trainable model use large batches on a 16 GB card.
 
@@ -82,6 +82,24 @@ def collect_parents(paths: list[str], cfg) -> dict[str, str | None]:
     return parents
 
 
+#: Cached records opened to measure coverage for the manifest. A census costs
+#: one deserialisation per parent; this is enough to tell "the mechanistic
+#: stream is fed" from "it is empty", which is the question the number answers.
+MANIFEST_COVERAGE_SAMPLE = 512
+
+
+def _cached_has_cds(store: EncodingStore, seq: str) -> bool:
+    """True if the cached record for ``seq`` has populated mechanistic channels."""
+    from src.features import CH_VALID
+
+    try:
+        rec = store.get(seq)
+    except Exception:
+        return False
+    mech = rec.get("mech")
+    return bool(mech is not None and mech.numel() and float(mech[:, CH_VALID].max()) > 0)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", nargs="+", required=True)
@@ -111,7 +129,19 @@ def main() -> None:
         raise SystemExit("no parent sequences found in the given tables")
 
     store = EncodingStore(cfg.cache)
-    todo = {s: d for s, d in parents.items() if not store.has(s)}
+
+    # Round-2 review, R2-01: skipping every parent that merely HAS a cache file
+    # is what let a CDS-free cache survive a CDS-joined re-run untouched while
+    # the manifest went on to claim full coverage. A parent whose table now
+    # carries a coding sequence but whose cached record does not is re-encoded,
+    # so the cache and the table cannot disagree silently.
+    stale = [s for s, d in parents.items() if d and store.has(s) and not _cached_has_cds(store, s)]
+    todo = {s: d for s, d in parents.items()
+            if not store.has(s) or s in set(stale)}
+    if stale:
+        print(f"[precompute] {len(stale)} cached parent(s) gained a coding sequence "
+              f"since they were encoded; re-encoding them so the cache matches "
+              f"the table.")
 
     dim = ESM_DIMS.get(cfg.esm_model, 1280)
     residues = sum(len(s) for s in todo)
@@ -138,24 +168,38 @@ def main() -> None:
         Write what this cache is, so downstream artifacts can cite it.
 
         ``cds_coverage`` is the number that matters most: the mechanistic stream
-        is only fed for parents that carried a real transcript AND had ViennaRNA
-        available to fold it. If it reads 0, E_mech is self-loops only and the
+        is only fed for parents whose cached record has populated mechanistic
+        channels. If it reads 0, E_mech is self-loops only and the
         ``no_mech_stream`` ablation is measuring nothing (R1-05).
+
+        Round-2 review, R2-01: this used to divide two counts taken from the
+        INPUT TABLE (``n_with_cds / len(parents)``), which says nothing about
+        the cache and read 1.0 against a cache that was entirely mech-free. It
+        is now measured by opening the cached records - the same records
+        training will read - via :meth:`EncodingStore.mech_coverage`.
         """
-        active = n_with_cds if VIENNA_AVAILABLE else 0
+        # Bounded: describing a 20k-parent cache should not cost 20k
+        # deserialisations. The manifest records that it is a sample.
+        measured = store.mech_coverage(parents, sample=MANIFEST_COVERAGE_SAMPLE)
         store.write_manifest({
             "esm_model": cfg.esm_model,
             "dim": dim,
             "contact_top_k": cfg.contact_top_k,
             "contact_min_sep": cfg.contact_min_sep,
-            "parents_requested": len(parents),
             "parents_encoded_this_pass": encoded_ok,
             "encode_failures_this_pass": failed,
+            # Kept, and deliberately named for what it is: a property of the
+            # table, not of the cache. cds_coverage is the cache's own number.
             "parents_with_cds_column": n_with_cds,
             "vienna_available": VIENNA_AVAILABLE,
-            "cds_active": active,
-            "cds_coverage": round(active / len(parents), 4) if parents else 0.0,
+            **measured,
         })
+        if measured["cds_active"] == 0:
+            print("[precompute] NOTE: no cached record has populated mechanistic "
+                  "channels (cds_coverage=0.0). E_mech will hold self-loops only "
+                  "and the no_mech_stream ablation will measure nothing. This is "
+                  "a legitimate geometry-only configuration - it just must not be "
+                  "written up as a dual-stream run.")
 
     if not todo:
         print("[precompute] cache already complete.")

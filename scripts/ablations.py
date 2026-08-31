@@ -26,6 +26,31 @@ A negative delta is a result, not a failure. The point of running these is to
 be able to say which components earn their place; an ablation that only ever
 confirms the architecture is decoration.
 
+Statistics
+----------
+Round-2 review, R2-06: the previous criterion was
+``abs(delta_mean) > stdev(arm) + stdev(full)``, applied to *every* numeric key
+in the test metrics. It has no null model, no degrees of freedom and no
+multiplicity control, and the reviewer measured an 8.3% per-comparison
+false-positive rate at the 3 seeds this script itself recommended. With the
+5-arm grid writing 80 uncorrected comparisons, the probability of at least one
+spurious "component matters" flag under the global null was 0.999 - and the
+paper's ablation table would have been written from that flag. It also compared
+``target_std`` and ``pos_rate``, which are properties of the test split and
+identical across arms by construction.
+
+What replaces it:
+
+  * **One pre-registered metric per task** (``ablation_metrics`` in
+    ``configs/run.yaml``), not every key that happens to be numeric.
+  * **A paired test across seeds.** Arms share seeds, so the comparison is
+    paired: the per-seed difference removes the seed's own effect.
+  * **Holm-Bonferroni** over the declared family of comparisons, which controls
+    the family-wise error rate without assuming independence.
+  * **A confidence interval on the delta**, reported whether or not the test
+    rejects. "Not significant" and "no effect" are different statements and the
+    interval is what separates them.
+
 Example
 -------
 python -m scripts.ablations --stability-splits data/splits_megascale.parquet \
@@ -35,12 +60,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import statistics
 import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.config import load_config
+from src.provenance import provenance
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -60,6 +89,112 @@ ARMS: dict[str, list[str]] = {
 }
 
 
+#: Metrics that describe the DATA rather than the model. They are identical
+#: across arms by construction (same split, same rows), so a "delta" in them is
+#: either exactly 0 or a bug - never a result. R2-06 found them being written
+#: into delta_vs_full rows.
+DATA_PROPERTY_METRICS = {
+    "n", "target_std", "pos_rate", "positive_fraction", "support_per_class",
+}
+
+#: Seeds below this cannot support a paired test: with 2 the t distribution has
+#: 1 degree of freedom and the interval is uninformative. The script reports the
+#: delta and refuses to attach a p-value.
+MIN_SEEDS_FOR_TEST = 3
+
+
+def paired_stats(arm: list[float], full: list[float]) -> dict:
+    """
+    Paired comparison of one arm against the full model across shared seeds.
+
+    Arms are run at the same seeds, so seed ``s`` contributes the pair
+    ``(arm_s, full_s)`` and the per-seed difference removes whatever that seed
+    did to both. Returns the mean difference, a t-based 95% interval, and a
+    two-sided p-value - or a null p-value with a stated reason when there are
+    too few seeds to compute one.
+    """
+    n = min(len(arm), len(full))
+    diffs = [a - f for a, f in zip(arm[:n], full[:n])]
+    out: dict = {
+        "delta_mean": statistics.mean(diffs) if diffs else None,
+        "n_seeds": n,
+        "arm_mean": statistics.mean(arm) if arm else None,
+        "full_mean": statistics.mean(full) if full else None,
+        "arm_sd": statistics.stdev(arm) if len(arm) > 1 else None,
+        "full_sd": statistics.stdev(full) if len(full) > 1 else None,
+    }
+    if n < MIN_SEEDS_FOR_TEST:
+        out.update({
+            "p_value": None, "ci95_low": None, "ci95_high": None,
+            "note": f"{n} seed(s): below the {MIN_SEEDS_FOR_TEST} needed for a "
+                    f"paired test. Run more seeds before reading this row.",
+        })
+        return out
+
+    sd = statistics.stdev(diffs)
+    if sd == 0.0:
+        # Identical every seed. A p-value is undefined; say so rather than
+        # emitting 0 and letting it be read as overwhelming evidence.
+        out.update({
+            "p_value": None, "ci95_low": out["delta_mean"],
+            "ci95_high": out["delta_mean"],
+            "note": "the difference is identical at every seed, so its variance "
+                    "is 0 and no t statistic is defined",
+        })
+        return out
+
+    from scipy import stats
+
+    t_stat, p = stats.ttest_rel(arm[:n], full[:n])
+    half = stats.t.ppf(0.975, n - 1) * sd / math.sqrt(n)
+    out.update({
+        "p_value": float(p),
+        "t_statistic": float(t_stat),
+        "paired_diff_sd": sd,
+        "ci95_low": out["delta_mean"] - half,
+        "ci95_high": out["delta_mean"] + half,
+    })
+    return out
+
+
+def minimum_detectable_effect(sd_diff: float, n: int, family: int,
+                              alpha: float = 0.05, power: float = 0.80) -> float:
+    """
+    Smallest true effect this comparison could have found, at ``power``.
+
+    Without it, "not significant" is unreadable: it may mean the component
+    does not matter, or it may mean the run had no chance of showing that it
+    does. Uses a Bonferroni alpha (``alpha / family``) as the conservative
+    stand-in for Holm's worst case, so the number never flatters the design.
+    """
+    from scipy import stats
+
+    if n < 2 or sd_diff <= 0 or family < 1:
+        return float("nan")
+    t_alpha = stats.t.ppf(1.0 - alpha / (2 * family), n - 1)
+    t_beta = stats.t.ppf(power, n - 1)
+    return float((t_alpha + t_beta) * sd_diff / math.sqrt(n))
+
+
+def holm_bonferroni(p_values: dict) -> dict:
+    """
+    Holm-Bonferroni step-down adjustment over a family of comparisons.
+
+    Controls the family-wise error rate at the nominal alpha without assuming
+    the comparisons are independent - which they are not here, since every arm
+    is compared against the same full-model runs. Entries whose p-value is None
+    are not part of the family and are not counted in ``m``.
+    """
+    live = {k: v for k, v in p_values.items() if v is not None}
+    m = len(live)
+    adjusted: dict = {k: None for k in p_values}
+    running = 0.0
+    for rank, (key, p) in enumerate(sorted(live.items(), key=lambda kv: kv[1])):
+        running = max(running, min(1.0, (m - rank) * p))
+        adjusted[key] = running
+    return adjusted
+
+
 def run_arm(name: str, flags: list[str], common: list[str], out_root: str,
             seed: int) -> dict | None:
     """Train one arm at one seed unless its metrics already exist."""
@@ -68,8 +203,12 @@ def run_arm(name: str, flags: list[str], common: list[str], out_root: str,
     if os.path.exists(metrics_path):
         print(f"[ablations] {name}: already complete, reusing {metrics_path}")
     else:
+        # src/seeding.py says determinism is "on for the ablation arms, where
+        # reproducibility is the point". Round-2 review, R2-15: no caller ever
+        # set it. It is set here, so the sentence is true.
         cmd = [sys.executable, "-m", "scripts.train", *common, *flags,
-               "--out", out_dir, "--tag", f"{name}_seed{seed}", "--seed", str(seed)]
+               "--out", out_dir, "--tag", f"{name}_seed{seed}", "--seed", str(seed),
+               "--strict-determinism"]
         print(f"\n[ablations] === {name} (seed {seed}) ===\n$ {' '.join(cmd)}")
         result = subprocess.run(cmd, cwd=ROOT)
         if result.returncode != 0:
@@ -91,11 +230,15 @@ def main() -> None:
     ap.add_argument("--out", default="runs/ablations")
     ap.add_argument("--arms", nargs="+", default=list(ARMS),
                     choices=list(ARMS))
-    ap.add_argument("--seeds", type=int, nargs="+", default=[42],
-                    help="run every arm at each seed and report mean +/- sd; "
-                         "a single-seed delta is not separable from run-to-run "
-                         "noise, which round-1 measured at 0.030 test Pearson")
+    ap.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44, 45, 46],
+                    help="run every arm at each seed; deltas are paired across "
+                         "them. Round-2 review, R2-06: the default was a single "
+                         "seed, which cannot support any test - the shipped "
+                         "pipeline emitted deltas to four decimals with a null "
+                         "verdict attached")
     args = ap.parse_args()
+
+    cfg = load_config(args.config)
 
     common = ["--config", args.config,
               "--stability-splits", args.stability_splits,
@@ -123,75 +266,147 @@ def main() -> None:
                 out.append(float(v))
         return out
 
-    # Deltas against the full model, aggregated over seeds. A single-seed delta
-    # is not separable from run-to-run noise (round-1 measured 0.030 test
-    # Pearson between identical runs), so the spread travels with the number.
-    deltas: dict[str, dict] = {}
-    tasks_metrics: set = set()
-    for res in results.get("full", {}).values():
-        for task, metrics in (res.get("test") or {}).items():
-            for k, v in metrics.items():
-                if isinstance(v, (int, float)) and k not in {"n"}:
-                    tasks_metrics.add((task, k))
+    # Deltas against the full model, paired across seeds and corrected for
+    # multiplicity (R2-06). The comparison family is declared BEFORE the numbers
+    # are seen: one metric per task, from the config.
+    declared = dict(cfg.get("ablation_metrics") or {})
+    tasks_present = sorted({
+        task for res in results.get("full", {}).values()
+        for task in (res.get("test") or {})
+    })
+    family: list[tuple] = []
+    skipped_tasks: list[str] = []
+    for task in tasks_present:
+        metric = declared.get(task)
+        if not metric:
+            skipped_tasks.append(task)
+            continue
+        if metric in DATA_PROPERTY_METRICS:
+            raise SystemExit(
+                f"ablation_metrics[{task!r}] = {metric!r} is a property of the "
+                f"test split, not of the model. Every arm sees the same rows, so "
+                f"its delta is 0 by construction. Choose a model metric."
+            )
+        family.append((task, metric))
+    if skipped_tasks:
+        print(f"[ablations] no pre-registered metric for {skipped_tasks}; "
+              f"those tasks are not compared. Add them to `ablation_metrics` in "
+              f"{args.config} if they should be.")
+    if not family:
+        raise SystemExit(
+            "no comparison could be formed: `ablation_metrics` in the config "
+            "names no metric for any task present in the results."
+        )
+    print(f"[ablations] pre-registered comparison family "
+          f"({len(family)} metric(s) x {len(results) - 1} arm(s)): "
+          + ", ".join(f"{t}.{m}" for t, m in family))
 
+    deltas: dict[str, dict] = {}
+    p_values: dict[str, float | None] = {}
     for name in results:
         if name == "full":
             continue
         arm_delta: dict[str, dict] = {}
-        for task, metric in sorted(tasks_metrics):
+        for task, metric in family:
             base = series("full", task, metric)
             arm = series(name, task, metric)
             if not base or not arm:
                 continue
-            d = statistics.mean(arm) - statistics.mean(base)
-            arm_delta.setdefault(task, {})[metric] = {
-                "delta_mean": d,
-                "arm_mean": statistics.mean(arm),
-                "arm_sd": statistics.stdev(arm) if len(arm) > 1 else None,
-                "full_mean": statistics.mean(base),
-                "full_sd": statistics.stdev(base) if len(base) > 1 else None,
-                "n_seeds": len(arm),
-                "separable_from_noise": (
-                    None if len(arm) < 2 or len(base) < 2
-                    else abs(d) > (statistics.stdev(arm) + statistics.stdev(base))
-                ),
-            }
+            stats_row = paired_stats(arm, base)
+            arm_delta.setdefault(task, {})[metric] = stats_row
+            p_values[f"{name}/{task}/{metric}"] = stats_row.get("p_value")
         deltas[name] = arm_delta
 
+    # One Holm correction over the whole declared family, not per arm.
+    adjusted = holm_bonferroni(p_values)
+    n_tested = sum(1 for v in p_values.values() if v is not None)
+    for name, tasks in deltas.items():
+        for task, metrics in tasks.items():
+            for metric, row in metrics.items():
+                key = f"{name}/{task}/{metric}"
+                row["p_value_holm"] = adjusted.get(key)
+                row["family_size"] = n_tested
+                row["significant_after_holm"] = (
+                    None if adjusted.get(key) is None else adjusted[key] < 0.05
+                )
+                if row.get("paired_diff_sd") is not None and n_tested:
+                    mde = minimum_detectable_effect(
+                        row["paired_diff_sd"], row["n_seeds"], n_tested)
+                    row["minimum_detectable_effect_80pct_power"] = mde
+                    row["underpowered"] = bool(
+                        row["significant_after_holm"] is False
+                        and abs(row["delta_mean"]) < mde
+                    )
+                    if row["underpowered"]:
+                        row["note"] = (
+                            f"not significant, but this comparison could only "
+                            f"have detected an effect of {mde:.4f} or larger at "
+                            f"80% power. |delta| is {abs(row['delta_mean']):.4f}, "
+                            f"so this row is not evidence that the component "
+                            f"does not matter - it is evidence the run cannot "
+                            f"tell. Add seeds, or narrow the comparison family."
+                        )
+
     payload = {
+        "provenance": provenance(),
         "seeds": args.seeds,
         "arms": {
             name: {str(seed): res for seed, res in runs.items()} or {"status": "failed"}
             for name, runs in results.items()
         },
         "delta_vs_full": deltas,
+        "comparison_family": [f"{t}.{m}" for t, m in family],
+        "family_size_tested": n_tested,
+        "statistics": {
+            "test": "two-sided paired t-test across shared seeds",
+            "correction": "Holm-Bonferroni over the whole declared family",
+            "alpha": 0.05,
+            "min_seeds_for_test": MIN_SEEDS_FOR_TEST,
+        },
         "reading": (
-            "delta_mean is (ablated - full) on the test split, averaged over "
-            "seeds. A component earns its place when removing it makes the "
-            "metric worse. separable_from_noise compares |delta| against the "
-            "combined run-to-run spread; with one seed it is null, and a delta "
-            "smaller than the spread is not evidence either way."
+            "delta_mean is (ablated - full) on the test split, paired by seed. A "
+            "component earns its place when removing it makes the metric worse. "
+            "Read ci95_low/ci95_high first: they say how large the effect could "
+            "be. significant_after_holm is the family-wise-corrected verdict at "
+            "alpha=0.05; null means too few seeds to test, not 'no effect'. A "
+            "non-significant delta with a tight interval around zero is evidence "
+            "the component does not matter; a non-significant delta with a wide "
+            "interval is evidence of nothing and needs more seeds. "
+            "minimum_detectable_effect_80pct_power is the smallest true "
+            "effect this many seeds could have found over this family; a "
+            "non-significant delta smaller than it is marked underpowered "
+            "and says nothing either way."
         ),
     }
     out_path = os.path.join(args.out, "ablations.json")
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)
 
-    print("\n[ablations] deltas vs full (test split, mean over "
-          f"{len(args.seeds)} seed(s)):")
+    print(f"\n[ablations] deltas vs full (test split, paired over "
+          f"{len(args.seeds)} seed(s), Holm-corrected over {n_tested} "
+          f"comparison(s)):")
     for name, tasks in deltas.items():
         for task, metrics in tasks.items():
-            for metric, d in list(metrics.items())[:3]:
-                sd = d["arm_sd"]
-                spread = f" +/- {sd:.4f}" if sd is not None else ""
-                sep = {True: "separable", False: "WITHIN NOISE",
-                       None: "single seed"}[d["separable_from_noise"]]
+            for metric, d in metrics.items():
+                ci = (f"[{d['ci95_low']:+.4f}, {d['ci95_high']:+.4f}]"
+                      if d.get("ci95_low") is not None else "[no interval]")
+                verdict = {True: "SIGNIFICANT", False: "not significant",
+                           None: "not tested"}[d["significant_after_holm"]]
+                if d.get("underpowered"):
+                    verdict += ", UNDERPOWERED"
                 print(f"  {name:<22} {task:<14} {metric:<10} "
-                      f"{d['delta_mean']:+.4f}{spread}  ({sep})")
-    if len(args.seeds) < 2:
-        print("[ablations] NOTE: one seed per arm. Run with --seeds 42 43 44 "
-              "before reporting any delta - a single run cannot be told apart "
-              "from run-to-run variation.")
+                      f"{d['delta_mean']:+.4f}  95% CI {ci}  ({verdict})")
+                if d.get("underpowered"):
+                    print(f"  {'':<22} -> could only have detected "
+                          f"{d['minimum_detectable_effect_80pct_power']:.4f} or "
+                          f"larger at 80% power over {n_tested} comparison(s)")
+    if len(args.seeds) < MIN_SEEDS_FOR_TEST:
+        print(f"[ablations] NOTE: {len(args.seeds)} seed(s) per arm, below the "
+              f"{MIN_SEEDS_FOR_TEST} needed for a paired test, so every "
+              f"p-value is null. Run with --seeds 42 43 44 45 46 before "
+              f"reporting any delta - round 1 measured 0.030 test Pearson "
+              f"between identical runs, which is larger than most of these "
+              f"effects.")
     print(f"[ablations] wrote {out_path}")
 
 

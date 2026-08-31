@@ -80,7 +80,7 @@ class DualStreamGNN(nn.Module):
     """
     Args:
         esm_dim         : encoder hidden size (1280 for ESM-2 650M).
-        mech_dim        : mechanistic channels (7).
+        mech_dim        : mechanistic channels (N_MECH_CHANNELS = 8).
         hidden, out_dim : GATv2 sizes.
         heads           : GATv2 attention heads.
         use_ssm         : run the selective state-space mixer.

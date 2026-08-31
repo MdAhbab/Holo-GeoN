@@ -16,20 +16,33 @@ Everything stochastic now goes through here:
     CUDA devices), and optionally cuDNN/algorithm determinism.
   * ``loader_kwargs`` supplies the generator and ``worker_init_fn`` a DataLoader
     needs so shuffling and per-worker RNG are reproducible.
-  * ``rng_state`` / ``restore_rng_state`` snapshot every generator so a resumed
-    run continues the same trajectory rather than a fresh one (R1-18).
+  * ``rng_state`` / ``restore_rng_state`` snapshot the global generators, so a
+    resumed run continues the same trajectory for initialisation and dropout
+    (R1-18).
+  * ``reseed_loaders_for_epoch`` makes each loader's batch order a pure
+    function of ``(seed, epoch)``. Round-2 review, R2-12: a DataLoader carries
+    its OWN ``torch.Generator``, seeded once at construction and living outside
+    the checkpointed global state, so a run resumed after epoch 1 replayed
+    epoch 1's exact batch order as epoch 2 - while printing
+    ``rng_restored=True``. Deriving the order from ``(seed, epoch)`` instead of
+    from accumulated generator state makes resume exact by construction rather
+    than by bookkeeping.
 
 Determinism is not free. ``strict=True`` sets
 ``torch.use_deterministic_algorithms``, which makes some scatter/gather kernels
 fall back to slower deterministic implementations, and PyTorch requires
 ``CUBLAS_WORKSPACE_CONFIG`` to be set for deterministic cuBLAS. It is off by
-default and on for the ablation arms, where reproducibility is the point.
+default and on for the ablation arms, where comparing across seeds makes
+run-to-run noise the confound - ``scripts/ablations.py`` passes
+``--strict-determinism`` to every arm. (Round-2 review, R2-15: this paragraph
+claimed that before any caller did it.)
 """
 
 from __future__ import annotations
 
 import os
 import random
+import zlib
 from typing import Any
 
 import numpy as np
@@ -91,6 +104,49 @@ def loader_kwargs(seed: int, num_workers: int) -> dict[str, Any]:
     return kwargs
 
 
+def reseed_loaders_for_epoch(loaders, seed: int, epoch: int) -> int:
+    """
+    Make every loader's batch order a pure function of ``(seed, epoch)``.
+
+    Call at the top of each epoch. Two kinds of loader are handled:
+
+      * shuffling loaders, whose ``torch.Generator`` is re-seeded;
+      * loaders driven by a batch sampler with ``set_epoch`` (the
+        node-budget sampler), which is told the epoch directly.
+
+    Round-2 review, R2-12: without this, resume rewound the data order to
+    epoch 1 and shifted the whole schedule, under an affirmative
+    ``rng_restored=True``. Note this was only detectable because R1-01 made
+    the loader deterministic in the first place - the fix is what made the
+    omission visible.
+
+    Returns the number of loaders re-seeded, so a caller can assert that the
+    call did something rather than silently matching nothing.
+    """
+    touched = 0
+    for task in sorted(loaders):
+        splits = loaders[task]
+        for split in sorted(splits):
+            loader = splits[split]
+            # A distinct stream per (task, split) so adding a task cannot
+            # change another task's order. CRC32, not hash(): str hashing is
+            # salted per process, so hash() here would make the batch order
+            # differ between a fresh run and a resumed one - the very defect
+            # this function exists to remove.
+            stream = zlib.crc32(f"{task}/{split}".encode()) % 100_003
+            derived = (seed * 1_000_003 + epoch * 10_007 + stream) % (2 ** 31 - 1)
+            sampler = getattr(loader, "batch_sampler", None)
+            if hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch)
+                touched += 1
+                continue
+            gen = getattr(loader, "generator", None)
+            if gen is not None:
+                gen.manual_seed(derived)
+                touched += 1
+    return touched
+
+
 def rng_state() -> dict[str, Any]:
     """Snapshot every generator, for a checkpoint."""
     state = {
@@ -127,6 +183,7 @@ def restore_rng_state(state: dict[str, Any] | None) -> bool:
 
 __all__ = [
     "seed_everything",
+    "reseed_loaders_for_epoch",
     "worker_init_fn",
     "loader_kwargs",
     "rng_state",

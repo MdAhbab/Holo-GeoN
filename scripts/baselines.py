@@ -20,9 +20,23 @@ Three controls, in increasing strength:
    destabilising ddG is negative; both signed and absolute r are reported.
 3. ``esm_mlp`` — **the control that matters.** A supervised MLP on the same
    cached embeddings the model consumes: mean-pooled window plus the embedding
-   at the mutated site plus the two residue identities. Same split, same target,
-   same budget. The gap between this and the full model is the graph's
-   contribution, and it is the number the architecture has to earn.
+   at the mutated site plus the two residue identities.
+
+   Round-2 review, R2-16: "same budget" was documented and not delivered. The
+   control ran 20 epochs to the model's 60, with no LR schedule, no gradient
+   clipping and no early stopping, at 1.46M parameters against 20.6M — so the
+   gap the paper's central empirical claim rests on conflated the graph with a
+   3x training budget and a 14x capacity difference. It now takes the model's
+   epoch count, warmup+cosine schedule, gradient clipping and early-stopping
+   patience from the same config. Capacity is still not matched, and that is
+   reported rather than hidden: ``parameters`` and ``training_budget`` travel
+   with the metrics so the remaining confound is legible.
+
+   The gap between this and the full model is the contribution of everything the
+   full model adds — the graph, the site-anchored readout, the SSM, the
+   cross-attention fusion and the mechanistic channels together. Attributing it
+   to message passing alone needs ``scripts/ablations.py``, which separates
+   them.
 
 Example
 -------
@@ -33,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -49,6 +64,7 @@ from src.config import load_config
 from src.device import describe_device
 from src.encoder import EncodingStore, EsmEncoder
 from src.metrics import classification_metrics, regression_metrics
+from src.provenance import provenance
 from src.seeding import loader_kwargs, seed_everything
 from src.substitution import AA_ORDER, aa_index
 from src.encoder import MAX_CONTEXT_RESIDUES
@@ -163,7 +179,13 @@ class _EsmFeatureDataset(Dataset):
 def esm_mlp_baseline(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame,
                      store: EncodingStore, cfg, device, target: str,
                      epochs: int, batch_size: int) -> dict:
-    """Train an MLP on cached embeddings only, then score the test split."""
+    """
+    Train an MLP on cached embeddings only, then score the test split.
+
+    Given the same epoch budget, warmup+cosine LR schedule, gradient clipping
+    and early-stopping patience as ``scripts/train.py``, so the gap to the full
+    model is not a training-budget artifact (R2-16).
+    """
     sets = {
         "train": _EsmFeatureDataset(train, store, cfg.window, target),
         "val": _EsmFeatureDataset(val, store, cfg.window, target),
@@ -187,7 +209,20 @@ def esm_mlp_baseline(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame,
     classification = target == "label"
     loss_fn = (nn.BCEWithLogitsLoss() if classification else nn.MSELoss())
 
+    # The same schedule the model gets, so the comparison is about architecture.
+    total_steps = max(1, len(loaders["train"]) * epochs)
+    warmup = max(1, int(cfg.warmup_frac * total_steps))
+
+    def lr_at(step: int) -> float:
+        if step < warmup:
+            return step / warmup
+        progress = (step - warmup) / max(1, total_steps - warmup)
+        return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_at)
+
     best_state, best_score = None, -float("inf")
+    best_epoch, patience = -1, 0
     for epoch in range(1, epochs + 1):
         model.train()
         for x, y in loaders["train"]:
@@ -195,7 +230,9 @@ def esm_mlp_baseline(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame,
             opt.zero_grad(set_to_none=True)
             loss = loss_fn(model(x).reshape(-1), y)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             opt.step()
+            sched.step()
 
         model.eval()
         preds, truth = [], []
@@ -208,9 +245,15 @@ def esm_mlp_baseline(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame,
         m = classification_metrics(t, p) if classification else regression_metrics(t, p)
         score = m.get("auroc" if classification else "pearson", float("nan"))
         if np.isfinite(score) and score > best_score:
-            best_score = score
+            best_score, best_epoch, patience = score, epoch, 0
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        else:
+            patience += 1
         print(f"  [esm_mlp] epoch {epoch}/{epochs} val={score:.4f}")
+        if patience >= cfg.early_stop_patience:
+            print(f"  [esm_mlp] early stop at epoch {epoch} "
+                  f"(best {best_epoch}, val={best_score:.4f})")
+            break
 
     if best_state:
         model.load_state_dict(best_state)
@@ -225,9 +268,26 @@ def esm_mlp_baseline(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame,
     metrics = classification_metrics(t, p) if classification else regression_metrics(t, p)
     metrics["n"] = int(len(p))
     metrics["best_val_score"] = float(best_score)
+    metrics["best_epoch"] = int(best_epoch)
+    metrics["parameters"] = int(sum(q.numel() for q in model.parameters()))
+    metrics["training_budget"] = {
+        "epochs": epochs,
+        "early_stop_patience": cfg.early_stop_patience,
+        "lr_schedule": "warmup + cosine, as scripts/train.py",
+        "grad_clip": cfg.grad_clip,
+        "matched_to_model": True,
+    }
+    # Round-1 review R1-27 asked for this sentence in three places and it was
+    # changed in none. With five arms in the ablation grid, the accurate version
+    # is easy to write and the causal one was never supportable: this control
+    # differs from the full model in the graph AND the readout AND the mixer AND
+    # the fusion AND the mechanistic channels (R2-16).
     metrics["note"] = (
-        "supervised MLP on the same cached embeddings, no graph; the gap to the "
-        "full model is the message-passing contribution"
+        "supervised MLP on the same cached embeddings, no graph, matched "
+        "training budget. The gap to the full model is the joint contribution of "
+        "the graph, the site-anchored readout, the SSM, the cross-attention "
+        "fusion and the mechanistic channels; scripts/ablations.py separates "
+        "them. Capacity is NOT matched - see `parameters`."
     )
     return metrics
 
@@ -241,7 +301,10 @@ def main() -> None:
     ap.add_argument("--esm-model", default=None)
     ap.add_argument("--device", default=None)
     ap.add_argument("--out", default="runs/baselines")
-    ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--epochs", type=int, default=None,
+                    help="epoch budget for the MLP control (default: the model's "
+                         "own `epochs` from the config, so the comparison is not "
+                         "a training-budget artifact - R2-16)")
     ap.add_argument("--zero-shot-limit", type=int, default=None,
                     help="cap rows scored by the masked-LM baseline (it is slow)")
     ap.add_argument("--skip-zero-shot", action="store_true")
@@ -278,8 +341,12 @@ def main() -> None:
     results["substitution_frequency"] = substitution_frequency_baseline(train, test, target)
 
     print("[baselines] supervised ESM-only MLP ...")
+    epochs = args.epochs if args.epochs is not None else int(cfg.epochs)
+    print(f"[baselines] esm_mlp budget: {epochs} epochs, patience "
+          f"{cfg.early_stop_patience}, warmup+cosine LR, grad clip "
+          f"{cfg.grad_clip} - matched to scripts/train.py")
     results["esm_mlp"] = esm_mlp_baseline(
-        train, val, test, store, cfg, device, target, args.epochs, cfg.batch_size)
+        train, val, test, store, cfg, device, target, epochs, cfg.batch_size)
 
     if not args.skip_zero_shot:
         print("[baselines] ESM zero-shot ...")
@@ -287,8 +354,10 @@ def main() -> None:
             test, cfg, device, args.zero_shot_limit)
 
     payload = {
+        "provenance": provenance(),
         "splits": args.splits,
         "target": target,
+        "epochs": epochs,
         "esm_model": cfg.esm_model,
         "window": cfg.window,
         "baselines": results,

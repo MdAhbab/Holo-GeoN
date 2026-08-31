@@ -81,6 +81,24 @@ class SiteAnchoredReadout(nn.Module):
         # graph and ignore where the mutation is - so scripts/ablations.py can
         # measure whether anchoring recovers the ~1/L signal a global pool
         # dilutes. It is an ablation axis, not a supported configuration.
+        #
+        # Round-2 review, R2-14: the arm is NOT uniformly site-blind, and the
+        # delta means different things on the two primary datasets. The graph
+        # handed to it is still a `window`-long crop CENTRED on the mutation
+        # (src/data.py build_sample_graph), so:
+        #
+        #   * length > window  - the crop itself encodes where the mutation is,
+        #     and the arm measures "anchored readout vs unanchored readout on a
+        #     site-centred crop", not the 1/L dilution argument above;
+        #   * length <= window - the crop is the whole protein and the arm IS
+        #     fully site-blind, which is a WEAKER strawman than the v1
+        #     formulation it claims to reproduce.
+        #
+        # Most of MegaScale is domains of tens of residues, so that dataset sits
+        # almost entirely in the second case and ClinVar largely in the first.
+        # scripts/train.py measures the split per task and records it in
+        # metrics.json under data_reports[task]["window_coverage"], so the arm's
+        # meaning travels with its delta instead of being inferred.
         self.site_anchored = site_anchored
         self.neighborhood_pool = MaskedAttentionPool(dim)
         self.global_pool = MaskedAttentionPool(dim)

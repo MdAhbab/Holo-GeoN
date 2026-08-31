@@ -161,10 +161,18 @@ class ThreeStateHead(nn.Module):
     with ``flip`` reversing the class axis. Then ``logits(mt, wt) ==
     flip(logits(wt, mt))`` identically.
 
-    The neutral band is not a hardcoded constant. ``labels_from_ddg`` takes a
-    per-measurement uncertainty, so "neutral" means "indistinguishable from zero
-    given this experiment's error", which is a noise model rather than an
-    arbitrary threshold.
+    The neutral band comes from a per-measurement uncertainty where the table
+    supplies one: ``labels_from_ddg`` takes ``sigma``, so "neutral" means
+    "indistinguishable from zero given this experiment's error".
+
+    Round-2 review, R2-11: this used to read "the neutral band is not a
+    hardcoded constant", which was true of this function and false of every
+    shipped configuration - the ``sigma:`` override is commented out for each
+    dataset in ``configs/data.yaml``, so rows fall back to a single number and
+    the band IS a constant for them. That number is now the declared config key
+    ``three_state_sigma``, recorded in ``metrics.json`` alongside a sensitivity
+    table showing how the class balance moves with it. A non-positive ``sigma``
+    is treated as missing rather than used.
     """
 
     def __init__(

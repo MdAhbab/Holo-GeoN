@@ -51,6 +51,7 @@ from src.config import load_config
 from src.data import (
     LoadReport,
     MutationDataset,
+    NodeBudgetBatchSampler,
     SequenceDataset,
     collate_graphs,
     filter_to_cache,
@@ -68,7 +69,14 @@ from src.losses import (
     three_state_loss,
 )
 from src.metrics import classification_metrics, regression_metrics
-from src.seeding import loader_kwargs, restore_rng_state, rng_state, seed_everything
+from src.provenance import provenance
+from src.seeding import (
+    loader_kwargs,
+    reseed_loaders_for_epoch,
+    restore_rng_state,
+    rng_state,
+    seed_everything,
+)
 from src.model import HoloGeoN, model_kwargs_from_config
 
 # Tasks the multi-task loss knows about. A task appears in a step only when its
@@ -78,10 +86,35 @@ ALL_TASKS = ["stability", "three_state", "pathogenicity", "idr", "mfi", "proteom
 #: Consecutive non-finite primary-metric epochs tolerated before aborting.
 MAX_NAN_EPOCHS = 3
 
+#: Consecutive epochs a task may sit at a log-variance clamp bound before the
+#: run stops. Round-2 review, R2-07: `criterion.saturated()` recorded this in
+#: the manifest and nothing acted on it, so a task pinned at the bound for 60
+#: epochs - receiving either 400x or 1/400th of the shared gradient the whole
+#: time - finished and reported its metrics like any other.
+MAX_SATURATED_EPOCHS = 10
+
+#: Fraction of held-out proteins allowed to have a near-identical training
+#: protein before a whole-sequence split is refused. Zero: the grouping relation
+#: is supposed to make this impossible, so any positive value is a defect in the
+#: grouping rather than an acceptable rate (round-2 review, R2-04).
+NEAR_DUPLICATE_TOLERANCE = 0.0
+
 # Fallback experimental uncertainty for the three-state neutral band, used only
 # when the stability table reports no per-measurement error. MegaScale's own
 # reported ddG errors are preferred and are read from the `sigma` column.
+#
+# Round-2 review, R2-11: src/heads.py states that "the neutral band is not a
+# hardcoded constant ... which is a noise model rather than an arbitrary
+# threshold". With no `sigma` column - and the override is commented out for
+# every shipped dataset - it is exactly a hardcoded constant, and it decides the
+# class of ~21% of a realistic ddG distribution. Moving it from 0.2 to 1.0 moves
+# that to 8.6% and 40.9%, taking the three-state macro-F1 and confusion matrix
+# with it. It is now a config key (`three_state_sigma`), it is recorded in
+# metrics.json, and a sensitivity row measures what it did.
 DEFAULT_DDG_SIGMA = 0.5
+
+#: Multipliers on the band used for the sensitivity row written to metrics.json.
+BAND_SENSITIVITY_FACTORS = (0.4, 1.0, 2.0)
 
 
 def endless(loader):
@@ -116,6 +149,34 @@ def _loader(dataset, batch_size: int, shuffle: bool, workers: int,
         drop_last=False,
         persistent_workers=workers > 0,
         **loader_kwargs(seed, workers),
+    )
+
+
+def _sequence_loader(dataset, node_budget: int, max_batch: int, shuffle: bool,
+                     workers: int, seed: int = 42) -> DataLoader:
+    """
+    A whole-sequence DataLoader batched by node budget rather than sample count.
+
+    Round-2 review, R2-02: whole-sequence graphs span the entire protein, so at
+    one shared ``batch_size`` they cost up to 8x the ddG batch and put the run
+    past the documented 16 GB card. The budget is the same node count the
+    windowed loaders spend (``batch_size * window``), which is the shape
+    ``scripts/budget.py`` models, so no task can silently demand more than
+    another.
+    """
+    sampler = NodeBudgetBatchSampler(
+        [len(s) for s in dataset.df["parent_seq"]],
+        node_budget=node_budget, max_batch_size=max_batch,
+        shuffle=shuffle, seed=seed,
+    )
+    return DataLoader(
+        dataset,
+        batch_sampler=sampler,
+        num_workers=workers,
+        collate_fn=collate_graphs,
+        persistent_workers=workers > 0,
+        **{k: v for k, v in loader_kwargs(seed, workers).items()
+           if k != "generator"},
     )
 
 
@@ -163,7 +224,37 @@ def build_split_loaders(
                              cfg.num_workers, cfg.seed)
     info = report.as_dict()
     info["split_counts"] = counts
+    info["window_coverage"] = window_coverage(df, int(cfg.window))
     return out, info
+
+
+def window_coverage(df: pd.DataFrame, window: int) -> dict:
+    """
+    How often the site-centred crop covers the whole protein.
+
+    Round-2 review, R2-14: the ``global_pool_readout`` arm is handed a
+    ``window``-long crop centred on the mutation, so for a protein longer than
+    the window the crop still encodes where the mutation is and the arm is not
+    site-blind; for a protein shorter than the window it is. The arm therefore
+    measures a different thing on each dataset, and the delta alone cannot
+    separate them. This records the mix so the ablation table can say which.
+    """
+    if df.empty or "parent_seq" not in df:
+        return {}
+    lengths = df["parent_seq"].str.len()
+    covered = int((lengths <= window).sum())
+    return {
+        "window": window,
+        "rows": int(len(lengths)),
+        "fraction_protein_shorter_than_window": round(covered / len(lengths), 4),
+        "median_protein_length": int(lengths.median()),
+        "note": (
+            "rows where the protein is shorter than the window get a crop equal "
+            "to the whole protein, so the global_pool_readout ablation arm is "
+            "fully site-blind for them; for the rest the site-centred crop still "
+            "encodes the mutation's location and the arm is not (R2-14)"
+        ),
+    }
 
 
 def build_sequence_loaders(
@@ -179,9 +270,15 @@ def build_sequence_loaders(
     recurs across runs. There was also no test split at all, so any number these
     heads produced was measured on the split early stopping ran on.
 
-    Grouping is now by unique sequence, whole groups to one side, with a
-    three-way split and a report. It reuses the same assignment logic as
-    ``scripts/make_splits.py`` so both paths agree.
+    Round-2 review, R2-04: grouping by the exact parent sequence is not a
+    homology relation for the three tables this path serves. An MFI table is a
+    deep mutational scan - thousands of single mutants of one protein, every one
+    a distinct sequence and therefore its own group - so ``verify_no_leakage``
+    passed on a split where 100% of test rows had a training row 1-2 residues
+    away. It now runs the same ``build_groups`` union-find the primary tasks use
+    (identity clustering unioned with a declared parent/construct or gene
+    column) and then AUDITS the result by comparing sequences across the
+    boundary, which is the check that can actually fail.
     """
     if not path or not os.path.exists(path):
         return {}, {}
@@ -195,8 +292,11 @@ def build_sequence_loaders(
     if df.empty:
         return {}, report.as_dict()
 
-    # Whole groups to one split, group = the sequence itself.
-    groups = df["parent_seq"].tolist()
+    # Whole groups to one split, under the same relation the primary tasks use.
+    groups, grouping = S.build_groups(
+        df["parent_seq"].tolist(), declared=df["group"].tolist(),
+        identity=cfg.identity, coverage=cfg.coverage,
+    )
     row_splits = S.row_splits_from_groups(
         groups, ratios=(0.8, 0.1, 0.1), seed=cfg.seed
     )
@@ -205,6 +305,33 @@ def build_sequence_loaders(
     df = df.copy()
     df["split"] = row_splits
 
+    # The check that can fail. verify_no_leakage above only re-states how the
+    # groups were built; this measures the sequences themselves (R2-04).
+    audit = S.near_duplicate_audit(
+        df.loc[df["split"] == "train", "parent_seq"].tolist(),
+        df.loc[df["split"] != "train", "parent_seq"].tolist(),
+    )
+    leaked = audit["fraction_with_near_train_neighbour"]
+    grouping["near_duplicate_audit"] = audit
+    if leaked > NEAR_DUPLICATE_TOLERANCE:
+        raise SystemExit(
+            f"{path}: {leaked:.1%} of held-out proteins have a near-identical "
+            f"protein in train (estimated k-mer Jaccard >= "
+            f"{audit['jaccard_threshold']}), above the "
+            f"{NEAR_DUPLICATE_TOLERANCE:.0%} tolerance. Any metric this head "
+            f"reports would be an interpolation score presented as "
+            f"generalisation.\n"
+            f"  grouping used: {report.notes.get('group_source')}\n"
+            f"  Declare the parent protein each row is a variant of - a "
+            f"parent/construct column, set under this dataset's key in "
+            f"configs/data.yaml - so whole constructs go to one side. Installing "
+            f"MMseqs2 additionally groups homologs. Examples of the overlap: "
+            f"{audit['examples']}"
+        )
+    if leaked:
+        print(f"[load] {path}: near-duplicate audit {leaked:.1%} of held-out "
+              f"proteins (tolerance {NEAR_DUPLICATE_TOLERANCE:.0%})")
+
     out: dict[str, DataLoader] = {}
     counts: dict[str, int] = {}
     for name in ("train", "val", "test"):
@@ -212,34 +339,103 @@ def build_sequence_loaders(
         counts[name] = int(len(part))
         if part.empty:
             continue
-        out[name] = _loader(SequenceDataset(part, store, cfg), batch_size,
-                            name == "train", cfg.num_workers, cfg.seed)
+        out[name] = _sequence_loader(
+            SequenceDataset(part, store, cfg),
+            # `or` not a get() default: the key exists and is null in the
+            # shipped config, which get() would hand back as None.
+            node_budget=int(cfg.get("sequence_node_budget")
+                            or cfg.batch_size * cfg.window),
+            max_batch=batch_size, shuffle=(name == "train"),
+            workers=cfg.num_workers, seed=cfg.seed,
+        )
     info = report.as_dict()
     info["split_counts"] = counts
-    info["grouping"] = "unique parent sequence, whole groups to one split"
+    info["grouping"] = grouping
+    info["node_cap"] = {
+        "max_sequence_nodes": int(cfg.get("max_sequence_nodes", 2048)),
+        "rows_over_cap": int(
+            (df["parent_seq"].str.len() > int(cfg.get("max_sequence_nodes", 2048))).sum()
+        ),
+        "rows": int(len(df)),
+        "note": (
+            "rows whose protein exceeds the cap have their graph truncated, so "
+            "the head sees a prefix. R1-07 asked for the cap to be applied and "
+            "REPORTED; the per-sample `truncated` flag now reaches the batch and "
+            "this counts it up front (R2, R1-07 follow-up)"
+        ),
+    }
     return out, info
 
 
 # ---------------------------------------------------------------------------
 # Losses for one batch of one task
 # ---------------------------------------------------------------------------
-def three_state_labels(batch: dict) -> torch.Tensor:
-    """Class labels from measured ddG and its per-measurement uncertainty."""
+def three_state_labels(batch: dict, fallback_sigma: float = DEFAULT_DDG_SIGMA
+                       ) -> torch.Tensor:
+    """
+    Class labels from measured ddG and its per-measurement uncertainty.
+
+    Rows with no reported error fall back to ``fallback_sigma``. A non-positive
+    reported sigma is treated as missing rather than used: with sigma = 0 only
+    an exactly-zero ddG is neutral, and with a negative sigma (a corrupt column)
+    nothing is ever neutral and no error was raised (R2-11).
+    """
     sigma = batch["sigma"]
-    sigma = torch.where(torch.isfinite(sigma), sigma,
-                        torch.full_like(sigma, DEFAULT_DDG_SIGMA))
+    usable = torch.isfinite(sigma) & (sigma > 0)
+    sigma = torch.where(usable, sigma, torch.full_like(sigma, fallback_sigma))
     return ThreeStateHead.labels_from_ddg(batch["y"], sigma)
 
 
+def band_sensitivity(df: pd.DataFrame, fallback_sigma: float) -> dict:
+    """
+    How the three-state class balance moves with the neutral band (R2-11).
+
+    The three-state macro-F1 is the only reported evidence that the
+    swap-equivariant parameterisation buys anything, and it is a function of a
+    constant that decides roughly a fifth of the labels. Reporting the class
+    distribution at several bands turns that dependence into something a reader
+    can see rather than something they would have to derive.
+
+    Reads the split TABLE, not the loader: the labels are a function of
+    ``target`` and ``sigma`` alone, so pulling them through the loader would
+    rebuild every graph in the training split - once per band - to count
+    integers.
+    """
+    if df is None or df.empty or "target" not in df:
+        return {}
+    y = torch.tensor(df["target"].to_numpy(dtype=float), dtype=torch.float32)
+    if "sigma" in df:
+        sigma = torch.tensor(
+            pd.to_numeric(df["sigma"], errors="coerce").to_numpy(dtype=float),
+            dtype=torch.float32)
+    else:
+        sigma = torch.full_like(y, float("nan"))
+
+    out: dict = {}
+    for factor in BAND_SENSITIVITY_FACTORS:
+        labels = three_state_labels({"y": y, "sigma": sigma},
+                                    fallback_sigma * factor)
+        counts = np.bincount(labels.reshape(-1).numpy(), minlength=3)
+        total = int(counts.sum()) or 1
+        out[f"sigma_x{factor:g}"] = {
+            "band_kcal_per_mol": round(fallback_sigma * factor, 4),
+            "fraction_destabilizing": round(float(counts[0]) / total, 4),
+            "fraction_neutral": round(float(counts[1]) / total, 4),
+            "fraction_stabilizing": round(float(counts[2]) / total, 4),
+        }
+    return out
+
+
 def task_losses(model: HoloGeoN, task: str, batch: dict,
-                weights: dict | None = None) -> dict[str, torch.Tensor]:
+                weights: dict | None = None,
+                fallback_sigma: float = DEFAULT_DDG_SIGMA) -> dict[str, torch.Tensor]:
     """Compute the loss terms this task contributes for one batch."""
     weights = weights or {}
     if task == "stability":
         z = model.context(batch)
         ddg, logvar = model.ddg(batch, z)
         losses = {"stability": gaussian_nll(ddg, logvar, batch["y"])}
-        labels = three_state_labels(batch)
+        labels = three_state_labels(batch, fallback_sigma)
         losses["three_state"] = three_state_loss(
             model.three_state(batch, z), labels,
             class_weights=weights.get("three_state"),
@@ -280,18 +476,62 @@ def _json_safe(obj):
     return obj
 
 
-def compute_class_weights(loaders: dict, device) -> dict:
+#: Cached parents opened to measure mechanistic coverage. A census would be
+#: O(cache size) torch.loads at startup; a sample of this many is enough to tell
+#: "the stream is fed" from "the stream is empty", which is the question.
+MECH_COVERAGE_SAMPLE = 64
+
+
+def measure_mech_coverage(loaders: dict, store: EncodingStore,
+                          sample: int = MECH_COVERAGE_SAMPLE) -> dict:
+    """
+    Mechanistic coverage over the parents this run will read (R2-01).
+
+    Distinct from the cache manifest, which describes whatever precompute last
+    saw. This opens records belonging to the split tables in hand, so a claim
+    about the mechanistic stream can be checked against the run that made it.
+    """
+    seen: list[str] = []
+    for task in sorted(loaders):
+        for split in ("train", "val", "test"):
+            loader = loaders[task].get(split)
+            if loader is None:
+                continue
+            df = getattr(loader.dataset, "df", None)
+            if df is None or "parent_seq" not in df:
+                continue
+            for seq in df["parent_seq"].drop_duplicates():
+                if seq not in seen:
+                    seen.append(seq)
+                if len(seen) >= sample:
+                    break
+            if len(seen) >= sample:
+                break
+        if len(seen) >= sample:
+            break
+    if not seen:
+        return {}
+    out = store.mech_coverage(seen)
+    out["sampled"] = True
+    out["sample_limit"] = sample
+    return out
+
+
+def compute_class_weights(loaders: dict, device,
+                          fallback_sigma: float = DEFAULT_DDG_SIGMA) -> dict:
     """
     Inverse-frequency class weights from the training split.
 
     Scans labels only - no model forward - so it is cheap even on a large table.
+    ``fallback_sigma`` is the three-state neutral band for rows with no reported
+    error; the weights inherit it, so it travels here too (R2-11).
     """
     weights: dict = {}
 
     if "stability" in loaders:
         counts = np.zeros(3, dtype=np.int64)
         for batch in loaders["stability"]["train"]:
-            labels = three_state_labels(batch).reshape(-1).numpy()
+            labels = three_state_labels(batch, fallback_sigma).reshape(-1).numpy()
             counts += np.bincount(labels, minlength=3)
         if counts.sum() and (counts > 0).all():
             inv = counts.sum() / (3.0 * counts)
@@ -313,7 +553,8 @@ def compute_class_weights(loaders: dict, device) -> dict:
 # Evaluation
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def evaluate_task(model: HoloGeoN, task: str, loader: DataLoader, device) -> dict:
+def evaluate_task(model: HoloGeoN, task: str, loader: DataLoader, device,
+                  fallback_sigma: float = DEFAULT_DDG_SIGMA) -> dict:
     """Held-out metrics for one task."""
     model.eval()
     preds, targets, extra = [], [], []
@@ -331,7 +572,8 @@ def evaluate_task(model: HoloGeoN, task: str, loader: DataLoader, device) -> dic
             # parameterisation buys anything. It rides along with stability,
             # on the same split.
             ts_pred.append(model.three_state(batch, z).argmax(-1).cpu().numpy())
-            ts_true.append(three_state_labels(batch).reshape(-1).cpu().numpy())
+            ts_true.append(
+                three_state_labels(batch, fallback_sigma).reshape(-1).cpu().numpy())
         elif task == "pathogenicity":
             preds.append(torch.sigmoid(model.pathogenicity(batch)).reshape(-1).float().cpu().numpy())
         elif task == "idr":
@@ -413,6 +655,11 @@ def main() -> None:
     ap.add_argument("--global-pool-readout", action="store_true",
                     help="ablation: replace the site-anchored readout with the "
                          "v1 global-pool formulation")
+    ap.add_argument("--strict-determinism", action="store_true",
+                    help="deterministic kernels and cuDNN determinism: slower, "
+                         "but makes a rerun bit-reproducible. scripts/ablations.py "
+                         "sets it, because comparing arms across seeds is exactly "
+                         "where run-to-run noise is the confound (R2-15)")
     ap.add_argument("--tag", default="main", help="name for this run's artifacts")
     args = ap.parse_args()
 
@@ -423,6 +670,7 @@ def main() -> None:
             "epochs": args.epochs, "batch_size": args.batch_size, "lr": args.lr,
             "max_rows": args.max_rows, "num_workers": args.num_workers,
             "seed": args.seed,
+            "strict_determinism": True if args.strict_determinism else None,
         },
     )
     os.makedirs(args.out, exist_ok=True)
@@ -431,22 +679,50 @@ def main() -> None:
     # - larger than most ablation effects, which made every single-run
     # delta_vs_full uninterpretable.
     seed_everything(cfg.seed, strict=bool(cfg.get("strict_determinism", False)))
+    # The three-state neutral band for rows with no reported measurement error.
+    # Declared in the config and recorded in metrics.json, so the ~21% of labels
+    # it decides is a stated choice rather than a constant in a module (R2-11).
+    three_state_sigma = float(cfg.get("three_state_sigma") or DEFAULT_DDG_SIGMA)
+    if three_state_sigma <= 0:
+        raise SystemExit(
+            f"three_state_sigma must be positive; got {three_state_sigma}. With "
+            f"0 only an exactly-zero ddG is neutral, and with a negative value "
+            f"nothing is ever neutral."
+        )
     device = describe_device(torch.device(cfg.device) if cfg.device else None)
-    store = EncodingStore(cfg.cache)
+    store = EncodingStore(cfg.cache,
+                          cache_records=int(cfg.get("record_cache_size", 0) or 0))
 
     cache_manifest = store.manifest()
     mech_on = bool(cfg.use_mech_stream and not args.no_mech_stream)
-    if mech_on and cache_manifest and not cache_manifest.get("cds_active"):
-        # Not fatal — a geometry-only run is a legitimate configuration — but it
-        # must not be mistaken for a dual-stream one. R1-05 was exactly this
-        # confusion, invisible because nothing printed or recorded it.
-        print("[train] WARNING: the mechanistic stream is enabled but the encoder "
-              "cache has no active coding sequences "
-              f"(cds_coverage={cache_manifest.get('cds_coverage')}). E_mech will "
-              "hold self-loops only, the stream contributes nothing, and its "
-              "ablation delta will read ~0 for plumbing reasons rather than "
-              "scientific ones. Run `python run.py etl --cds-source ...` and "
-              "re-run precompute, or train with --no-mech-stream and say so.")
+    if mech_on:
+        # Round-2 review, R2-01: this warning was gated on `cache_manifest` being
+        # truthy, so a cache with no manifest.json - every cache that existed
+        # when round 1 ran - took the SILENT branch. The loud case was exactly
+        # backwards: a cache that cannot describe itself is the one a reported
+        # run must not read quietly. Missing manifest now warns; a manifest that
+        # reports zero coverage warns; only a manifest reporting real coverage
+        # is silent.
+        if not cache_manifest:
+            print(f"[train] WARNING: the encoder cache at {cfg.cache} has no "
+                  "manifest.json, so nothing can say whether the mechanistic "
+                  "stream is fed. E_mech may be self-loops only, in which case "
+                  "the stream contributes nothing and its ablation delta is a "
+                  "plumbing artifact. Re-run `python -m scripts.precompute_"
+                  "embeddings` (it writes a manifest without re-encoding what "
+                  "is already cached), or train with --no-mech-stream.")
+        elif not cache_manifest.get("cds_active"):
+            # Not fatal — a geometry-only run is a legitimate configuration — but
+            # it must not be mistaken for a dual-stream one. R1-05 was exactly
+            # this confusion, invisible because nothing printed or recorded it.
+            print("[train] WARNING: the mechanistic stream is enabled but the "
+                  "encoder cache has no records with populated mechanistic "
+                  f"channels (cds_coverage={cache_manifest.get('cds_coverage')}). "
+                  "E_mech will hold self-loops only, the stream contributes "
+                  "nothing, and its ablation delta will read ~0 for plumbing "
+                  "reasons rather than scientific ones. Run `python run.py etl "
+                  "--cds-source ...` and re-run precompute, or train with "
+                  "--no-mech-stream and say so.")
 
     # --- loaders -----------------------------------------------------------
     loaders: dict[str, dict[str, DataLoader]] = {}
@@ -469,6 +745,26 @@ def main() -> None:
             "no training data found. Run scripts.make_splits first, and check "
             "the paths in configs/run.yaml."
         )
+    # Round-2 review, R2-01: measure the mechanistic stream's coverage on the
+    # records this run will actually read, rather than trusting a manifest that
+    # may predate them. Sampled, because opening every record on a 10^4-parent
+    # cache is not worth the startup cost; the sample size travels with the
+    # number so nobody reads it as a census.
+    mech_coverage: dict = {}
+    if mech_on:
+        mech_coverage = measure_mech_coverage(loaders, store)
+        if mech_coverage and mech_coverage.get("cds_active") == 0:
+            print("[train] WARNING: sampled "
+                  f"{mech_coverage['parents_present_in_cache']} cached parent(s) "
+                  "this run will read; NONE has populated mechanistic channels. "
+                  "E_mech is self-loops only for them, so --no-mech-stream would "
+                  "train the same model. Do not report a mechanistic contribution "
+                  "from this run.")
+        elif mech_coverage:
+            print(f"[train] mechanistic coverage (sampled from the cache): "
+                  f"{mech_coverage['cds_coverage']:.3f} over "
+                  f"{mech_coverage['parents_present_in_cache']} parent(s)")
+
     trained_tasks = sorted(loaders)
     untrained = [t for t in ("stability", "pathogenicity", "idr", "mfi", "proteomics")
                  if t not in loaders]
@@ -501,7 +797,7 @@ def main() -> None:
     # distributions are severely skewed (most substitutions are destabilising;
     # ClinVar benign/pathogenic is far from 1:1). Weights are computed once from
     # the training split by inverse frequency.
-    class_weights = compute_class_weights(loaders, device)
+    class_weights = compute_class_weights(loaders, device, three_state_sigma)
     if class_weights:
         print("[train] class balancing: "
               + ", ".join(f"{k}={v.tolist() if v.numel() > 1 else float(v):.4}"
@@ -525,11 +821,38 @@ def main() -> None:
     task_names = list(loaders)
     task_probs = np.array([weights[t] / weight_total for t in task_names])
 
-    steps_per_epoch = max(task_sizes.values())
+    # Round-2 review, R2-10: `steps_per_epoch = max(len(loader))` stopped
+    # denoting a pass over anything once tasks were sampled proportionally. At
+    # MegaScale/ClinVar scale and the shipped temperature 0.5, the PRIMARY task
+    # saw 63% of its own training batches per "epoch", so `epochs: 60` bought
+    # 37.7 passes over the ddG data, and `early_stop_patience: 8` counted units
+    # whose size depended on the OTHER tasks' row counts - adding a proteomics
+    # corpus silently changed what an epoch meant for stability.
+    #
+    # An epoch is now one expected pass over the primary task: it is sampled
+    # with probability p, so it takes len(loader)/p steps to see its own data
+    # once. Every other task is then seen in proportion to its sampling weight,
+    # which is the point of the schedule.
+    primary_for_epoch = "stability" if "stability" in loaders else task_names[0]
+    p_primary = float(task_probs[task_names.index(primary_for_epoch)])
+    steps_per_epoch = max(1, int(round(task_sizes[primary_for_epoch] / max(p_primary, 1e-9))))
     total_steps = steps_per_epoch * cfg.epochs
     print(f"[train] task sizes (batches): {task_sizes}")
     print(f"[train] sampling probabilities (temperature={temperature}): "
           + ", ".join(f"{t}={p:.3f}" for t, p in zip(task_names, task_probs)))
+    print(f"[train] steps_per_epoch={steps_per_epoch} = one expected pass over "
+          f"{primary_for_epoch!r} (its {task_sizes[primary_for_epoch]} batches "
+          f"at sampling probability {p_primary:.3f}). `epochs: {cfg.epochs}` "
+          f"therefore means {cfg.epochs} passes over the primary task, and "
+          f"early stopping counts those.")
+    replay = {t: (steps_per_epoch * float(task_probs[i]) / max(task_sizes[t], 1))
+              for i, t in enumerate(task_names)}
+    heavy = {t: round(r, 1) for t, r in replay.items() if r > 5.0}
+    if heavy:
+        print(f"[train] NOTE: small tables replayed per epoch: {heavy}. A table "
+              f"seen many times per epoch overfits long before the primary task "
+              f"has converged; its head's metrics should be read with that in "
+              f"mind.")
     warmup = max(1, int(cfg.warmup_frac * total_steps))
 
     def lr_at(step: int) -> float:
@@ -564,6 +887,7 @@ def main() -> None:
     best_epoch = -1
     patience = 0
     nan_epochs = 0
+    saturated_epochs = 0
     history: list[dict] = []
     ckpt_path = os.path.join(args.out, "model_best.pt")
     last_path = os.path.join(args.out, "last.pt")
@@ -596,18 +920,25 @@ def main() -> None:
         best_epoch = state.get("best_epoch", -1)
         patience = int(state.get("patience", 0))
         nan_epochs = int(state.get("nan_epochs", 0))
+        saturated_epochs = int(state.get("saturated_epochs", 0))
         history = state.get("history", [])
         rng_ok = restore_rng_state(state.get("rng"))
         print(f"[train] resumed from epoch {state['epoch']} (best {primary_metric}"
               f"={best_score:.4f}, patience={patience}, rng_restored={rng_ok})")
         if not rng_ok:
-            print("[train] NOTE: RNG state was not restored, so this is a "
-                  "continuation with a different data order than an "
-                  "uninterrupted run would have seen.")
+            print("[train] NOTE: RNG state was not restored, so dropout masks "
+                  "and any other global-RNG draw differ from an uninterrupted "
+                  "run. The DATA order is unaffected: it is derived from "
+                  "(seed, epoch) rather than from accumulated generator "
+                  "state (R2-12).")
 
     started = time.time()
     for epoch in range(start_epoch, cfg.epochs + 1):
         model.train()
+        # The batch order for THIS epoch, derived from (seed, epoch) alone, so
+        # a resume reproduces it exactly rather than restarting the loaders
+        # from epoch 1 (R2-12).
+        reseed_loaders_for_epoch(loaders, cfg.seed, epoch)
         cycles = {t: endless(v["train"]) for t, v in loaders.items()}
         running: dict[str, float] = {}
 
@@ -621,7 +952,8 @@ def main() -> None:
             losses: dict[str, torch.Tensor] = {}
             with torch.amp.autocast("cuda", enabled=use_amp):
                 batch = move_batch(next(cycles[task]), device)
-                losses.update(task_losses(model, task, batch, class_weights))
+                losses.update(task_losses(model, task, batch, class_weights,
+                                          three_state_sigma))
                 total, parts = criterion(losses)
             scaler.scale(total).backward()
             scaler.unscale_(opt)
@@ -642,8 +974,13 @@ def main() -> None:
         train_log = {k: v / max(counts.get(k.replace("_weight", ""), 1), 1)
                      for k, v in running.items()}
         train_log["realised_steps"] = dict(realised_steps)
+        # The weight each task's gradient is actually multiplied by. R2-07: the
+        # objective's per-task weighting was only inferable from the loss parts,
+        # and an 8.5x imbalance created by the floors rather than by the data was
+        # invisible in the log.
+        train_log["task_weights"] = criterion.current_weights()
         val = {
-            t: evaluate_task(model, t, v["val"], device)
+            t: evaluate_task(model, t, v["val"], device, three_state_sigma)
             for t, v in loaders.items() if "val" in v
         }
         primary_val = val.get(primary, {})
@@ -674,6 +1011,27 @@ def main() -> None:
                 )
         else:
             nan_epochs = 0
+        saturated_now = criterion.saturated()
+        if saturated_now:
+            saturated_epochs += 1
+            print(f"[train] WARNING: task log-variance at a clamp bound: "
+                  f"{saturated_now} ({saturated_epochs} epoch(s) in a row). "
+                  f"Those tasks are pinned at the extreme of the weight range, "
+                  f"so the objective is no longer balancing them.")
+            if saturated_epochs >= MAX_SATURATED_EPOCHS:
+                raise SystemExit(
+                    f"{saturated_now} have sat at a log-variance clamp bound for "
+                    f"{saturated_epochs} consecutive epochs. The multi-task "
+                    f"weighting has stopped adapting, and whichever task is "
+                    f"pinned at the low bound is receiving 1/400th of the shared "
+                    f"gradient the others get. Aborting rather than finishing a "
+                    f"run whose 'multi-task' objective is effectively "
+                    f"single-task. Re-scale that task's loss, drop it from the "
+                    f"run, or widen TASK_LOGVAR_MIN/MAX deliberately."
+                )
+        else:
+            saturated_epochs = 0
+
         record = {"epoch": epoch, "train": train_log, "val": val,
                   "lr": sched.get_last_lr()[0]}
         history.append(record)
@@ -714,12 +1072,23 @@ def main() -> None:
                  "scaler": scaler.state_dict(),
                  "epoch": epoch, "best_score": best_score, "best_epoch": best_epoch,
                  "patience": patience, "nan_epochs": nan_epochs,
+                 "saturated_epochs": saturated_epochs,
                  "rng": rng_state(),
                  "history": history},
                 last_path,
             )
         except Exception as exc:
-            print(f"[train] checkpoint save failed at epoch {epoch}: {exc}")
+            # Round-2 review, R2-12: this printed one line and continued, so a
+            # disk-full at epoch 3 of 60 was discovered at the end - with no
+            # resumable state written for 57 epochs. The resume checkpoint is
+            # the only thing that makes a 2-3 day run survivable, so losing it
+            # stops the run.
+            raise SystemExit(
+                f"could not write the resume checkpoint {last_path} at epoch "
+                f"{epoch}: {exc}. Continuing would leave the run unresumable "
+                f"while it looks healthy. Free space (or fix permissions) and "
+                f"restart - the best checkpoint so far is at {ckpt_path}."
+            ) from exc
 
         if patience >= cfg.early_stop_patience:
             print(f"[train] early stop: no improvement in {patience} epochs "
@@ -736,7 +1105,7 @@ def main() -> None:
         model.load_state_dict(torch.load(ckpt_path, map_location=device,
                                          weights_only=False)["model"])
         test = {
-            t: evaluate_task(model, t, v["test"], device)
+            t: evaluate_task(model, t, v["test"], device, three_state_sigma)
             for t, v in loaders.items() if "test" in v
         }
     else:
@@ -747,6 +1116,8 @@ def main() -> None:
     manifest = {
         "tag": args.tag,
         "config": cfg.as_dict(),
+        # Which code, on which machine, with which packages (R2-15).
+        "provenance": provenance(),
         "seed": cfg.seed,
         "ablation": {
             "mech_stream": bool(cfg.use_mech_stream and not args.no_mech_stream),
@@ -762,7 +1133,12 @@ def main() -> None:
         # self-loops only, so the stream contributes nothing and its ablation
         # delta measures nothing (R1-05). Recording it here means no write-up can
         # claim a mechanistic contribution without the number that contradicts it.
-        "encoder_cache": store.manifest(),
+        # An empty dict means the cache carried no manifest - which is itself the
+        # answer to "was the mechanistic stream fed?", namely "unknown" (R2-01).
+        "encoder_cache": cache_manifest or {"status": "no manifest.json in the cache"},
+        # Measured here rather than trusted from the manifest: the manifest can
+        # predate the records. Empty when no mech-stream run needs it.
+        "encoder_cache_measured": mech_coverage,
         "task_sizes_batches": task_sizes,
         "task_sampling_probabilities": dict(zip(task_names, task_probs.tolist())),
         "model_kwargs": model_kwargs,
@@ -770,7 +1146,21 @@ def main() -> None:
         "best_epoch": best_epoch,
         "best_checkpoint": ckpt_path if selected else None,
         f"best_val_{primary}_{primary_metric}": best_score,
+        "three_state_band": {
+            "fallback_sigma_kcal_per_mol": three_state_sigma,
+            "n_sigma": 1.0,
+            "note": (
+                "rows carrying a positive `sigma` use their own reported error; "
+                "the rest use this fallback. It decides the class of a large "
+                "fraction of a realistic ddG distribution, so the sensitivity "
+                "table below says how large (R2-11)"
+            ),
+            "sensitivity": band_sensitivity(
+                loaders["stability"]["train"].dataset.df, three_state_sigma
+            ) if "stability" in loaders else {},
+        },
         "loss_weight_saturation": criterion.saturated(),
+        "loss_task_weights_final": criterion.current_weights(),
         "test": test,
         "history": history,
         "wall_clock_hours": (time.time() - started) / 3600.0,

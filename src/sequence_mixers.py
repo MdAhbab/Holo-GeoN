@@ -41,7 +41,7 @@ except Exception:  # noqa: BLE001
 
 
 # ---------------------------------------------------------------------------
-# §8.2-i  Cross-Attention Fusion
+# Cross-Attention Fusion
 # ---------------------------------------------------------------------------
 class CrossAttentionFusion(nn.Module):
     """
@@ -88,7 +88,7 @@ class CrossAttentionFusion(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# §8.2-ii  Selective State-Space mixer ("Mamba")
+# Selective State-Space mixer ("Mamba")
 # ---------------------------------------------------------------------------
 class _PureSelectiveSSM(nn.Module):
     """

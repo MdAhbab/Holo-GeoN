@@ -43,9 +43,26 @@ export default function DdgTab() {
     }
   }
 
-  const isStabilizing = result ? result.ddg > 0 : false
-  const verdictClass = isStabilizing ? 'verdict-stabilizing' : 'verdict-destabilizing'
-  const markerColor = isStabilizing ? '#2563eb' : '#dc2626'
+  // Round-2 review, R2-03 (R1-25 re-opened): this re-derived the direction from
+  // `result.ddg > 0` - the exact sign test R1-25 removed from the backend for
+  // having no neutral case - and then coloured the backend's three-state verdict
+  // with it. A +0.006 kcal/mol prediction whose argmax is `neutral` rendered as
+  // a green "Stabilizing". The verdict now comes from the one head that has a
+  // defined neutral class, which is what `verdict_source` in the payload names.
+  const verdictClass =
+    result?.verdict === 'stabilizing'
+      ? 'verdict-stabilizing'
+      : result?.verdict === 'destabilizing'
+        ? 'verdict-destabilizing'
+        : 'verdict-neutral'
+  const markerColor =
+    result?.verdict === 'stabilizing'
+      ? '#2563eb'
+      : result?.verdict === 'destabilizing'
+        ? '#dc2626'
+        : '#64748b'
+  const verdictArrow =
+    result?.verdict === 'stabilizing' ? '▲' : result?.verdict === 'destabilizing' ? '▼' : '●'
 
   const plotData = result
     ? [
@@ -165,8 +182,9 @@ export default function DdgTab() {
             <div className="result-item">
               <div className="result-label">Direction</div>
               <div style={{ fontWeight: 600 }} className={verdictClass}>
-                {isStabilizing ? '▲ Stabilizing' : '▼ Destabilizing'}
+                {verdictArrow} {result.verdict}
               </div>
+              <div className="result-sub">{result.verdict_source}</div>
             </div>
           </div>
 

@@ -292,7 +292,9 @@ def main() -> None:
         )
 
     mu, sigma, y = predict_split(model, _loader_for(part), device)
-    report = {"checkpoint": args.checkpoint, "splits": args.splits, "split": args.split,
+    report = {"provenance": provenance(),
+              "checkpoint": args.checkpoint, "splits": args.splits,
+              "split": args.split,
               "calibration": calibration_report(mu, sigma, y)}
 
     # Fit the variance scale on the VALIDATION split and report what it would do

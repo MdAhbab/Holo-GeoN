@@ -3,22 +3,37 @@ scripts/contact_sanity.py
 =========================
 Do the edges feeding E_geo carry spatial signal, or just sequence adjacency?
 
-This is the check that justifies building a graph at all. If the contact-head
-edges were merely "residues near each other in sequence", the graph would be a
-chain with extra steps and every claim about capturing tertiary structure
-without MSAs or crystal structures would be empty.
+This is the check that has to justify building a graph at all. If the
+contact-head edges were merely "residues near each other in sequence", the graph
+would be a chain with extra steps and every claim about capturing tertiary
+structure without MSAs or crystal structures would be empty.
+
+Ruling that out is necessary, not sufficient: only the structure-based mode can
+show the edges are *right* rather than merely non-local.
 
 Two modes:
 
 1. **Structure-free (default).** Among the top-L predicted contacts with
    separation >= ``--min-sep``, report the fraction that are long-range
-   (|i - j| >= 24). A sequence-proximity baseline that ranks pairs by closeness
-   has a long-range fraction of exactly 0 by construction, so the gap is
-   non-local signal that no adjacency graph can produce.
-2. **Structure-based (optional).** With ground-truth contact maps
-   (``--true-contacts-dir``, one ``<cache-key>.npy`` per sequence, 1 = C-beta
-   contact), also report precision@L and precision@L/5 against the same
-   baseline — the standard contact-prediction metric.
+   (|i - j| >= 24), against TWO controls: a sequence-proximity baseline (whose
+   long-range fraction is 0 by construction) and a **random-edge control**
+   drawn uniformly from eligible pairs.
+
+   The random control is what makes this mode readable. Round-2 review, R2-13:
+   with only the proximity baseline, the comparison was won by construction -
+   the reviewer fed in 40 caches whose edges were drawn uniformly at random and
+   scored 0.880 against a baseline defined to score 0.000. Beating the proximity
+   baseline shows the head emits long-range *predictions*; it says nothing about
+   whether any of them are *correct*. A head that cannot beat the random control
+   has no spatial signal at all, and no structure-free number can establish more
+   than that.
+
+2. **Structure-based (optional, and the only mode that can support the claim).**
+   With ground-truth contact maps (``--true-contacts-dir``, one
+   ``<cache-key>.npy`` per sequence, 1 = C-beta contact), report precision@L and
+   precision@L/5 against both controls — the standard contact-prediction metric.
+   ``--require-structure`` makes its absence an error, for any run whose numbers
+   will be reported.
 
 Note on the sparse cache: encodings store the top-k contacts per residue
 (k = ``contact_top_k``, default 24) rather than a dense L x L map. Selecting the
@@ -71,6 +86,23 @@ def _top_linear(length: int, k: int, min_sep: int):
     return i[order], j[order]
 
 
+def _top_random(length: int, k: int, min_sep: int, seed: int):
+    """
+    Random-edge control: uniformly drawn eligible pairs.
+
+    The floor any spatial claim has to clear. A uniformly random edge set has a
+    high long-range fraction simply because most pairs at ``|i-j| >= min_sep``
+    are far apart, so "beats the sequence-proximity baseline" is not evidence of
+    structure - it is arithmetic (R2-13).
+    """
+    i, j = np.triu_indices(length, k=min_sep)
+    if i.size == 0:
+        return np.array([], int), np.array([], int)
+    rng = np.random.default_rng(seed)
+    pick = rng.choice(i.size, size=min(k, i.size), replace=False)
+    return i[pick], j[pick]
+
+
 def _range_fractions(i, j):
     if len(i) == 0:
         return float("nan"), float("nan")
@@ -92,19 +124,37 @@ def main() -> None:
     ap.add_argument("--max-seqs", type=int, default=300)
     ap.add_argument("--min-sep", type=int, default=6)
     ap.add_argument("--true-contacts-dir", default=None)
+    ap.add_argument("--require-structure", action="store_true",
+                    help="fail unless ground-truth contact maps are supplied and "
+                         "matched. Use for any run whose contact numbers will be "
+                         "reported: the structure-free mode cannot distinguish "
+                         "the contact head from random edges (R2-13)")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="seed for the random-edge control")
     ap.add_argument("--out", default=os.path.join(ROOT, "results", "contacts"))
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
+
+    if args.require_structure and not args.true_contacts_dir:
+        raise SystemExit(
+            "--require-structure was given without --true-contacts-dir. The "
+            "structure-free mode reports a long-range FRACTION, which a "
+            "uniformly random edge set also scores highly on; it cannot "
+            "establish that the contact head carries structural signal. Supply "
+            "one <cache-key>.npy C-beta contact map per sequence, or drop "
+            "--require-structure and do not cite the result as evidence for the "
+            "graph (R2-13)."
+        )
 
     files = sorted(glob.glob(os.path.join(args.cache, "*.pt")))[: args.max_seqs]
     if not files:
         raise SystemExit(f"no cached *.pt in {args.cache}; run scripts.precompute_embeddings first")
 
-    esm_lr, esm_mr, lin_lr = [], [], []
-    esm_pL, esm_pL5, lin_pL, lin_pL5 = [], [], [], []
+    esm_lr, esm_mr, lin_lr, rnd_lr = [], [], [], []
+    esm_pL, esm_pL5, lin_pL, lin_pL5, rnd_pL, rnd_pL5 = [], [], [], [], [], []
     n_struct = 0
 
-    for path in files:
+    for seq_index, path in enumerate(files):
         rec = torch.load(path, map_location="cpu", weights_only=False)
         edges = rec["contact_edges"].numpy().astype(int)
         probs = rec["contact_probs"].float().numpy()
@@ -114,10 +164,12 @@ def main() -> None:
 
         ei, ej = _top_predicted(edges, probs, length, args.min_sep)
         li, lj = _top_linear(length, length, args.min_sep)
+        ri, rj = _top_random(length, length, args.min_sep, args.seed + seq_index)
         lr, mr = _range_fractions(ei, ej)
         esm_lr.append(lr)
         esm_mr.append(mr)
         lin_lr.append(_range_fractions(li, lj)[0])
+        rnd_lr.append(_range_fractions(ri, rj)[0])
 
         if args.true_contacts_dir:
             key = os.path.splitext(os.path.basename(path))[0]
@@ -130,10 +182,14 @@ def main() -> None:
                     k5 = max(length // 5, 1)
                     e5i, e5j = _top_predicted(edges, probs, k5, args.min_sep)
                     l5i, l5j = _top_linear(length, k5, args.min_sep)
+                    r5i, r5j = _top_random(length, k5, args.min_sep,
+                                           args.seed + seq_index)
                     esm_pL.append(_precision(ei, ej, true_map))
                     esm_pL5.append(_precision(e5i, e5j, true_map))
                     lin_pL.append(_precision(li, lj, true_map))
                     lin_pL5.append(_precision(l5i, l5j, true_map))
+                    rnd_pL.append(_precision(ri, rj, true_map))
+                    rnd_pL5.append(_precision(r5i, r5j, true_map))
 
     def mean(xs):
         xs = [v for v in xs if v == v]
@@ -147,11 +203,18 @@ def main() -> None:
             "medium_range_fraction_topL": mean(esm_mr),
         },
         "sequence_proximity_baseline": {"long_range_fraction_topL": mean(lin_lr)},
+        "random_edge_control": {"long_range_fraction_topL": mean(rnd_lr)},
         "interpretation": (
-            "top-L contact-head pairs contain long-range (|i-j|>=24) contacts that "
-            "a sequence-proximity baseline cannot produce (its long-range fraction "
-            "is 0 by construction); that gap is the non-local signal feeding E_geo"
+            "The long-range fraction is a NECESSARY check, not a sufficient one. "
+            "Beating the sequence-proximity baseline is arithmetic - its "
+            "long-range fraction is 0 by construction - and a uniformly random "
+            "edge set scores near the random_edge_control figure here without "
+            "carrying any structure. Read the head against the RANDOM control, "
+            "and treat even that as evidence only that the edges are non-local. "
+            "Whether they are CORRECT needs precision_vs_structure, which "
+            "requires --true-contacts-dir (R2-13)."
         ),
+        "supports_structural_claim": bool(args.true_contacts_dir and n_struct),
     }
     if args.true_contacts_dir and n_struct:
         summary["precision_vs_structure"] = {
@@ -160,6 +223,8 @@ def main() -> None:
             "contact_head_precision_at_L5": mean(esm_pL5),
             "baseline_precision_at_L": mean(lin_pL),
             "baseline_precision_at_L5": mean(lin_pL5),
+            "random_precision_at_L": mean(rnd_pL),
+            "random_precision_at_L5": mean(rnd_pL5),
         }
 
     out_path = os.path.join(args.out, "contact_sanity.json")
@@ -169,13 +234,22 @@ def main() -> None:
     print("Contact-head sanity (E_geo source vs sequence-proximity baseline):")
     print(f"  sequences sampled                 : {summary['n_sequences']}")
     print(f"  contact head long-range fraction  : {summary['contact_head']['long_range_fraction_topL']:.3f}")
-    print(f"  baseline     long-range fraction  : {summary['sequence_proximity_baseline']['long_range_fraction_topL']:.3f}")
+    print(f"  proximity    long-range fraction  : {summary['sequence_proximity_baseline']['long_range_fraction_topL']:.3f}"
+          f"   (0 by construction)")
+    print(f"  RANDOM EDGES long-range fraction  : {summary['random_edge_control']['long_range_fraction_topL']:.3f}"
+          f"   <- the floor that matters")
     if "precision_vs_structure" in summary:
         p = summary["precision_vs_structure"]
         print(f"  precision@L    head={p['contact_head_precision_at_L']:.3f} "
-              f"vs baseline={p['baseline_precision_at_L']:.3f}")
+              f"vs baseline={p['baseline_precision_at_L']:.3f} "
+              f"vs random={p['random_precision_at_L']:.3f}")
         print(f"  precision@L/5  head={p['contact_head_precision_at_L5']:.3f} "
-              f"vs baseline={p['baseline_precision_at_L5']:.3f}")
+              f"vs baseline={p['baseline_precision_at_L5']:.3f} "
+              f"vs random={p['random_precision_at_L5']:.3f}")
+    else:
+        print("  precision vs structure            : NOT MEASURED. Without "
+              "--true-contacts-dir this run cannot show the edges are correct, "
+              "only that they are non-local (R2-13).")
     print(f"  -> {out_path}")
 
 

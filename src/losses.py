@@ -17,10 +17,19 @@ floating-point noise, and anything larger is a bug rather than a
 under-optimised penalty.
 
 Multi-task weighting follows Kendall & Gal (2018): each task carries a learned
-log-variance and contributes ``L_i / (2 sigma_i^2) + log sigma_i``. Tasks with
-different units and noise levels then balance themselves, instead of needing a
-hand-tuned weight per head that silently decides which task the model actually
-optimises.
+log-variance and contributes ``L_i / (2 sigma_i^2) + log sigma_i``. This removes
+the hand-tuned per-head weight that otherwise silently decides which task the
+model optimises.
+
+What it does NOT do - and round-2 review, R2-07, was right that the previous
+wording implied otherwise - is equalise the gradient each task receives. At the
+stationary point in ``log_var`` the weight is ``0.5 / (L_i - floor_i)``, so every
+task's *contribution to the total* is exactly 0.5 regardless of its difficulty or
+its dataset size, while the *gradient* it sends the shared trunk scales as
+``1 / (L_i - floor_i)``: a task with a high loss is weighted DOWN. That is the
+actual behaviour of the objective, it is worth knowing before reading a
+multi-task result, and :meth:`UncertaintyWeightedLoss.equilibrium_weights` makes
+it inspectable rather than a thing to be derived from the source.
 """
 
 from __future__ import annotations
@@ -85,31 +94,45 @@ def antisymmetry_violation(ddg_forward: torch.Tensor, ddg_reverse: torch.Tensor)
 # ---------------------------------------------------------------------------
 # Multi-task weighting
 # ---------------------------------------------------------------------------
-#: Lower bound of each task loss, used to shift it non-negative for weighting.
+# Why a floor exists at all.
+#
+# Round-1 review, R1-09: Kendall & Gal's derivation assumes a NON-NEGATIVE task
+# loss. A heteroscedastic Gaussian NLL is negative whenever the predictive
+# density exceeds 1 - with the log-variance clamp its minimum is -4.081 - and
+# for a negative value, ``value * exp(-log_var)`` is minimised by driving
+# log_var to minus infinity. The objective was unbounded below: the reviewer
+# measured the total reaching -1.9e19 with a stability weight of 4.7e18 after
+# 300 steps, at which point the global gradient clip hands the entire budget to
+# one task and every other head stops learning, while the printed loss looks
+# like spectacular progress.
+#
+# ddG NLL goes negative once the typical predicted sigma drops below ~0.24
+# kcal/mol, which is reachable on MegaScale where many mutations are
+# near-neutral and well predicted. So this is not a corner case.
+
+#: 0.5 * (log(2*pi) + LOGVAR_MIN), with LOGVAR_MIN = -10 as clamped in
+#: gaussian_nll and in SubstitutionScoreHead. This is the lowest value any task
+#: loss in this project can attain.
+GLOBAL_LOSS_FLOOR = -4.0811
+
+#: Round-2 review, R2-07: the floors used to be per-task - -4.0811 for the two
+#: Gaussian-NLL tasks and 0.0 for the cross-entropy and MSE ones - which is a
+#: constant that differs BETWEEN tasks, and therefore not neutral. The
+#: equilibrium weight is ``0.5 / (L - floor)``, so at a typical ddG NLL of 1.0
+#: the primary task received weight 0.098 against pathogenicity's 0.833: an 8.5x
+#: imbalance created by an asymmetric constant rather than by the data.
 #:
-#: Round-1 review, R1-09: Kendall & Gal's derivation assumes a NON-NEGATIVE task
-#: loss. A heteroscedastic Gaussian NLL is negative whenever the predictive
-#: density exceeds 1 - with the log-variance clamp its minimum is -4.081 - and
-#: for a negative value, ``value * exp(-log_var)`` is minimised by driving
-#: log_var to minus infinity. The objective was unbounded below: the reviewer
-#: measured the total reaching -1.9e19 with a stability weight of 4.7e18 after
-#: 300 steps, at which point the global gradient clip hands the entire budget to
-#: one task and every other head stops learning, while the printed loss looks
-#: like spectacular progress.
-#:
-#: ddG NLL goes negative once the typical predicted sigma drops below ~0.24
-#: kcal/mol, which is reachable on MegaScale where many mutations are
-#: near-neutral and well predicted. So this is not a corner case.
+#: One floor for every task fixes that. It is still a valid lower bound (every
+#: loss here exceeds it, cross-entropy and MSE trivially so), it still makes the
+#: shifted quantity non-negative as Kendall & Gal's derivation requires, and a
+#: UNIFORM offset preserves the relative weighting between tasks.
 LOSS_FLOORS: dict[str, float] = {
-    # 0.5 * (log(2*pi) + LOGVAR_MIN), with LOGVAR_MIN = -10 as clamped in
-    # gaussian_nll and in SubstitutionScoreHead.
-    "stability": -4.0811,
-    "idr": -4.0811,
-    # Cross-entropy and MSE are non-negative already.
-    "three_state": 0.0,
-    "pathogenicity": 0.0,
-    "mfi": 0.0,
-    "proteomics": 0.0,
+    "stability": GLOBAL_LOSS_FLOOR,
+    "idr": GLOBAL_LOSS_FLOOR,
+    "three_state": GLOBAL_LOSS_FLOOR,
+    "pathogenicity": GLOBAL_LOSS_FLOOR,
+    "mfi": GLOBAL_LOSS_FLOOR,
+    "proteomics": GLOBAL_LOSS_FLOOR,
 }
 
 #: Bound on the learned log-variances. Spans a 400x weight range, wide enough
@@ -124,10 +147,17 @@ class UncertaintyWeightedLoss(nn.Module):
 
     Two guards on the original formulation:
 
-    * Each task loss is shifted by its lower bound (:data:`LOSS_FLOORS`) so the
-      weighted term sees a non-negative quantity, as the derivation requires.
-      The shift is a constant, so it changes no gradient with respect to the
-      model - only the sign of what the weight multiplies.
+    * Each task loss is shifted by :data:`GLOBAL_LOSS_FLOOR` so the weighted
+      term sees a non-negative quantity, as the derivation requires.
+
+      The shift is constant with respect to the model PARAMETERS, but it is
+      not gradient-neutral, and the docstring here used to say it was
+      (round-2 review, R2-07). ``log_var`` is learned, its stationary point
+      is ``lv* = log(2 * (L - floor))``, so the floor moves ``lv*``, moves
+      ``exp(-lv)``, and therefore moves the gradient the model receives from
+      that task. What makes it safe is that the SAME floor applies to every
+      task: a uniform offset preserves the relative weighting, where the
+      per-task floors it replaced did not.
     * The learned log-variances are clamped to
       ``[TASK_LOGVAR_MIN, TASK_LOGVAR_MAX]``.
 
@@ -170,6 +200,36 @@ class UncertaintyWeightedLoss(nn.Module):
             raise ValueError("no losses supplied")
         return total, parts
 
+    def equilibrium_weights(self, losses: dict) -> dict:
+        """
+        The weight each task would receive at its stationary log-variance.
+
+        ``lv* = log(2 * (L - floor))`` minimises the per-task term, giving
+        weight ``0.5 / (L - floor)`` and a contribution of exactly 0.5. Handy
+        for reading a multi-task run: if one task's weight is an order of
+        magnitude below another's, that is the objective's doing and not the
+        data's (R2-07).
+        """
+        out = {}
+        for name, value in losses.items():
+            floor = self.floors.get(name, 0.0)
+            shifted = float(value) - floor
+            if shifted <= 0:
+                out[name] = None
+                continue
+            lv = min(max(math.log(2.0 * shifted), TASK_LOGVAR_MIN),
+                     TASK_LOGVAR_MAX)
+            out[name] = math.exp(-lv)
+        return out
+
+    def current_weights(self) -> dict:
+        """``exp(-log_var)`` per task, as the objective is applying it now."""
+        return {
+            name: float(torch.exp(-p.detach().clamp(TASK_LOGVAR_MIN,
+                                                    TASK_LOGVAR_MAX)))
+            for name, p in self.log_var.items()
+        }
+
     def saturated(self, tol: float = 1e-3) -> list[str]:
         """Tasks whose log-variance has hit a clamp bound - worth reporting."""
         out = []
@@ -200,6 +260,8 @@ def pathogenicity_loss(
 
 
 __all__ = [
+    "GLOBAL_LOSS_FLOOR",
+    "LOSS_FLOORS",
     "gaussian_nll",
     "sigma_gaussian_nll",
     "antisymmetry_violation",

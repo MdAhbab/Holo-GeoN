@@ -28,9 +28,29 @@
 #   sigma   per-measurement ddG uncertainty          (sets the three-state neutral band)
 #   label   pathogenic / benign                      (pathogenicity)
 #   gene    gene symbol                              (merged into split grouping)
+#   parent  the protein this row is a VARIANT OF     (merged into split grouping)
 #   cds     real coding NUCLEOTIDE sequence          (enables the mechanistic stream)
 #   rg      experimental radius of gyration          (IDR)
 #   value   MFI / retention time / expression
+#
+# About `parent`, and why a whole-sequence table may be refused
+# -------------------------------------------------------------
+# A deep mutational scan is thousands of single point mutants of ONE construct.
+# Every row is a distinct sequence, so grouping by the sequence gives every
+# variant its own group and any split of them passes a group-key leakage check
+# while every test row sits one residue from a training row. Round-2 review,
+# R2-04 measured exactly that: 426 groups, `verify_no_leakage -> True`, and 100%
+# of test rows within 1-2 residues of a training row.
+#
+# `parent` is the column that fixes it: name whatever identifies the construct
+# (a construct id, a UniProt accession, a gene symbol) and whole constructs go
+# to one side of the split. Auto-detection looks for parent / construct /
+# protein / uniprot / accession and similar; set it explicitly when it misses.
+#
+# Every split is then audited by comparing held-out sequences against training
+# sequences directly, and training REFUSES a table whose held-out proteins have
+# near-identical training proteins. If a run stops with "near-identical protein
+# in train", this is the key to set.
 #
 # wt_seq and mt_seq must be PROTEIN sequences. Pointing them at nucleotide
 # columns will not error — A, C, G and T are all valid amino-acid letters, so a
@@ -56,6 +76,20 @@ clinvar_protein_pairs:
   # mt_seq: alt_protein
   # label:  clinical_significance
   # gene:   gene_symbol
+
+# Whole-sequence tables (IDR / MFI / proteomics). Add a block per file, keyed by
+# its basename without the extension. `parent` is effectively required for any
+# deep-mutational-scan-shaped table - see the note above.
+#
+# example_mfi_table:
+#   wt_seq: variant_sequence
+#   value:  mean_fluorescence
+#   parent: construct_id       # <- whole constructs to one side of the split
+#
+# example_idr_table:
+#   wt_seq: sequence
+#   rg:     rg_angstrom
+#   parent: uniprot_id
 
 # ---------------------------------------------------------------------------
 # Graph and feature hyperparameters. Merged flat into the run configuration.

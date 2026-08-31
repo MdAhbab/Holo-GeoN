@@ -275,6 +275,17 @@ input[type="number"]:focus {
   color: var(--red);
 }
 
+.verdict-neutral {
+  color: var(--text-muted);
+}
+
+/* Provenance line under a result: which head produced it. */
+.result-sub {
+  margin-top: 2px;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
 .result-row {
   display: flex;
   gap: 32px;

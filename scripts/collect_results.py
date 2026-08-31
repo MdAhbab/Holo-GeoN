@@ -145,8 +145,11 @@ def main() -> None:
                     add(f"| {name} | {key} | {fmt(value)} |")
         add("")
         add("`esm_mlp` is the control that matters: a supervised MLP on the same "
-            "cached embeddings with no graph. The gap between it and the model is "
-            "the message-passing contribution.")
+            "cached embeddings, no graph, matched training budget. The gap "
+            "between it and the model is the JOINT contribution of the graph, "
+            "the site-anchored readout, the SSM, the cross-attention fusion and "
+            "the mechanistic channels - the ablation table below is what "
+            "separates them. Parameter count is not matched; see `parameters`.")
     add("")
 
     # --- ablations ---------------------------------------------------------

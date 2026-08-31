@@ -17,9 +17,13 @@ form itself rather than from a training penalty:
     thermodynamic constraint holds to floating-point precision. v1 enforced it
     with a soft penalty and still measured mean violations of 0.029-0.071
     kcal/mol.
-  * **Free deep mutational scans.** All 19 substitutions at a site reuse the
-    same ``z``, so a full 20 x L scan costs one encoder pass rather than
-    20 x L x 2.
+  * **Cheap deep mutational scans.** All 19 substitutions at a site reuse the
+    same ``z``, and ``z`` itself depends only on the parent, so a full 20 x L
+    scan costs **one encoder pass for the protein** plus L cheap backbone
+    passes - against 20 x L x 2 encoder passes for a re-encode-the-mutant
+    formulation. (Round-2 review, R2-05: this sentence was accurate about the
+    architecture and false about the code, which ran one encoder pass per
+    position until the scan loop was actually hoisted.)
 """
 
 from __future__ import annotations

@@ -39,6 +39,10 @@ CALIBRATION_PATH = Path(
 )
 MAX_SEQ_LENGTH = int(os.environ.get("HOLOGEON_MAX_LENGTH", "5000"))
 MAX_SCAN_POSITIONS = int(os.environ.get("HOLOGEON_MAX_SCAN", "600"))
+# Sites per backbone forward pass during a scan. Each site is a `window`-node
+# graph, so this times the window is the padded node count of one batch - the
+# same quantity src/data.NodeBudgetBatchSampler caps during training (R2-02).
+SCAN_SITE_BATCH = int(os.environ.get("HOLOGEON_SCAN_BATCH", "32"))
 
 # 95% interval multiplier for a Gaussian predictive distribution.
 Z95 = 1.959964
@@ -66,6 +70,9 @@ class HoloGeoNEngine:
         self._device = None
         self._config: dict = {}
         self._calibration: Optional[dict] = None
+        #: Which sigma `self._calibration` describes. Serving one interval and
+        #: reporting another's coverage is R2-09.
+        self._calibration_of: str = "no calibration file"
         self._sigma_scale: float = 1.0
         self._untrained_heads: list[str] = []
 
@@ -115,12 +122,40 @@ class HoloGeoNEngine:
             if CALIBRATION_PATH.exists():
                 with open(CALIBRATION_PATH, encoding="utf-8") as fh:
                     payload = json.load(fh)
-                self._calibration = payload.get("calibration")
-                # A scale fitted on the validation split, applied to every sigma
-                # the interface reports. Without it a measured miscalibration
-                # had no remedy anywhere in the codebase.
-                scale = (payload.get("variance_scale") or {}).get("scale")
+                # A scale fitted on the validation split, applied to the ddG
+                # sigma the interface reports. Without it a measured
+                # miscalibration had no remedy anywhere in the codebase.
+                variance_scale = payload.get("variance_scale") or {}
+                scale = variance_scale.get("scale")
                 self._sigma_scale = float(scale) if scale else 1.0
+                # Round-2 review, R2-09: the interface reported the calibration
+                # of the RAW sigma while serving `sigma * scale`. The reviewer
+                # constructed a case where the flag read True at ECE 0.0053
+                # while the band actually drawn had 99.8% coverage for a nominal
+                # 95% and an ECE of 0.070 - above the repository's own 0.05
+                # tolerance. scripts/calibration.py already computed
+                # `calibration_after_scaling` and nothing read it. Whichever
+                # sigma is served is the one whose numbers get published.
+                after = variance_scale.get("calibration_after_scaling")
+                if self._sigma_scale != 1.0 and after:
+                    self._calibration = after
+                    self._calibration_of = (
+                        f"the served sigma (raw x {self._sigma_scale:.3f})"
+                    )
+                else:
+                    self._calibration = payload.get("calibration")
+                    self._calibration_of = "the served sigma (unscaled)"
+                    if self._sigma_scale != 1.0:
+                        # A scale is applied but the run recorded no post-scaling
+                        # measurement, so nothing here describes what is served.
+                        self._calibration = None
+                        self._calibration_of = (
+                            f"NOT MEASURED: a scale of {self._sigma_scale:.3f} is "
+                            f"applied but {CALIBRATION_PATH.name} carries no "
+                            f"calibration_after_scaling, so no measurement "
+                            f"describes the interval this interface draws. "
+                            f"Re-run scripts.calibration."
+                        )
             self._ready = True
         except Exception as exc:  # noqa: BLE001
             self._error = f"{exc.__class__.__name__}: {exc}"
@@ -159,7 +194,12 @@ class HoloGeoNEngine:
                 "observed_coverage": cal.get("coverage_observed"),
                 "well_calibrated": cal.get("well_calibrated"),
                 "measured_on": str(CALIBRATION_PATH),
+                # Which sigma these numbers describe. When a variance scale is
+                # applied, they describe the SCALED sigma - the one the ddG
+                # endpoint actually draws its interval from (R2-09).
+                "describes": self._calibration_of,
             } if cal else None,
+            "calibration_note": None if cal else self._calibration_of,
         }
 
     # ------------------------------------------------------------------
@@ -264,11 +304,20 @@ class HoloGeoNEngine:
         """
         Deep mutational scan: ddG for every substitution over a window.
 
-        One encoder pass per position covers all 20 candidate residues, because
-        the head is conditioned on residue identity rather than re-encoding a
-        mutant sequence. The predecessor called full inference once per cell —
-        20 x L x 2 encoder passes, or roughly 16,000 for a 400-residue protein,
-        which made this endpoint unusable with a real model loaded.
+        **One encoder pass per protein**, not per position. The encoder output
+        does not depend on the mutation site, and the head is conditioned on
+        residue identity rather than on a re-encoded mutant sequence, so the
+        whole scan reuses a single ESM-2 forward pass and then runs the
+        trainable backbone in batches of sites.
+
+        Round-2 review, R2-05: the round-1 fix split ``_context_for`` into
+        ``_encode_once`` + ``_batch_for_sites`` - the two pieces needed to hoist
+        the encoder call - and then left this loop calling ``_context_for`` per
+        position. The reviewer counted 60 encoder calls for a 60-position scan,
+        all on one identical sequence, while three docstrings claimed one. At
+        ``MAX_SCAN_POSITIONS = 600`` that was 600 identical ESM-2 650M forward
+        passes for one heatmap, and ``/api/compare`` pays it for up to 400
+        positions on every AlphaFold comparison.
         """
         from src.substitution import AA_ORDER, aa_index
 
@@ -286,14 +335,21 @@ class HoloGeoNEngine:
 
         torch = self._torch
         positions = list(range(start, end + 1))
+        sites = [p - 1 for p in positions]
+
+        rec = self._encode_once(seq)          # the one encoder pass
         columns: list[list[float]] = []
-        for pos in positions:
-            site = pos - 1
-            z, batch = self._context_for(seq, site)
-            batch["wt_idx"] = torch.tensor([aa_index(seq[site])], device=self._device)
+        for lo in range(0, len(sites), SCAN_SITE_BATCH):
+            chunk = sites[lo:lo + SCAN_SITE_BATCH]
+            batch = self._batch_for_sites(rec, chunk)
+            batch["wt_idx"] = torch.tensor(
+                [aa_index(seq[site]) for site in chunk], device=self._device
+            )
             with torch.no_grad():
-                row = self._model.scan(batch, z)[0]
-            columns.append([round(float(v), 4) for v in row])
+                z = self._model.context(batch)
+                rows = self._model.scan(batch, z)
+            for row in rows:
+                columns.append([round(float(v), 4) for v in row])
 
         # Transpose to rows = amino acids, columns = positions.
         matrix = [[columns[c][r] for c in range(len(positions))]
@@ -313,6 +369,14 @@ class HoloGeoNEngine:
         Refuses when that head was never trained: a forward pass through
         randomly-initialised weights returns a number, and a number the
         interface displays is a claim.
+
+        The ddG variance scale is deliberately NOT applied here. Round-2 review,
+        R2-09: it was, and ``scripts/calibration.py`` fits that scalar from
+        ``model.ddg()`` alone - so a correction in kcal/mol was multiplying a
+        radius of gyration in angstrom, moving the reported 95% interval from
+        1.78 A to 4.44 A for the same model and sequence. A per-head scale would
+        have to be fitted on a per-head calibration set; until one exists this
+        head serves the sigma it predicted.
         """
         self._require()
         if "idr" in self._untrained_heads:
@@ -327,13 +391,23 @@ class HoloGeoNEngine:
         _, batch = self._context_for(seq, 0)
         with torch.no_grad():
             mu_t, sigma_t = self._model.idr(batch)
-        mu, sigma = float(mu_t.item()), float(sigma_t.item()) * self._sigma_scale
+        mu, sigma = float(mu_t.item()), float(sigma_t.item())
         return {
             "length": len(seq),
             "mu": round(mu, 4),
             "sigma": round(max(sigma, 1e-3), 4),
             "ci_low": round(mu - Z95 * sigma, 4),
             "ci_high": round(mu + Z95 * sigma, 4),
+            # Round-2 review, R2-03: the interface displayed a "Character:
+            # Globular / Extended" chip computed in the browser from
+            # `mu / L**0.33 < 2.5` - two constants that appear nowhere else in
+            # the repository, with no citation, no config key and no model
+            # involved. A categorical biophysical conclusion the model never
+            # produced, presented next to numbers it did. It is gone; what the
+            # head actually emits says where it came from, as the ddG payload
+            # already does.
+            "value_source": "IDR head, radius of gyration in Angstrom",
+            "ci_source": "model predicted sigma (Gaussian, 95%)",
         }
 
 

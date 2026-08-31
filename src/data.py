@@ -58,6 +58,14 @@ _CANDIDATES: dict[str, list[str]] = {
     "rg": ["rg", "radius_of_gyration", "rg_exp", "rg_angstrom"],
     "value": ["value", "mfi", "intensity", "retention_time", "rt", "expression"],
     "species": ["species", "species_id", "organism"],
+    # The protein a row is a variant OF. For a deep mutational scan every row is
+    # a distinct sequence, so grouping by the sequence puts 400 variants of one
+    # construct into 400 groups and any split of them leaks (round-2 review,
+    # R2-04). This column is what makes such a table splittable; set it in
+    # configs/data.yaml when auto-detection misses it.
+    "parent": ["parent", "parent_id", "parent_seq_id", "construct", "construct_id",
+               "protein", "protein_id", "uniprot", "uniprot_id", "accession",
+               "wt_name", "wt_id", "variant_of"],
 }
 
 
@@ -431,7 +439,19 @@ def load_sequence_table(
         if not np.isfinite(v):
             report.drop("non_finite_value")
             continue
-        rec = {"parent_seq": s, "target": v, "group": s}
+        # Round-2 review, R2-04: `group` used to be the row's own sequence
+        # unconditionally, which is the identity relation dressed up as a
+        # grouping. A declared parent/construct column wins; a gene column is
+        # the next best; only then does it fall back to the sequence, and the
+        # report says so rather than leaving the caller to assume.
+        declared = None
+        for key in ("parent", "gene"):
+            if col.get(key) is not None:
+                value = df[col[key]].iat[i]
+                if value is not None and str(value).lower() not in ("", "nan", "none"):
+                    declared = f"{key}:{value}"
+                    break
+        rec = {"parent_seq": s, "target": v, "group": declared or s}
         rec["cds"] = str(df[col["cds"]].iat[i]) if col["cds"] else None
         if col["species"] is not None:
             try:
@@ -442,6 +462,14 @@ def load_sequence_table(
 
     out = pd.DataFrame.from_records(records)
     report.rows_out = len(out)
+    group_col = next((k for k in ("parent", "gene") if col.get(k) is not None), None)
+    report.notes["group_source"] = (
+        f"declared column {col[group_col]!r} (canonical {group_col!r})" if group_col
+        else "the row's own sequence - NO grouping column was found, so a deep "
+             "mutational scan of one construct would be split across the "
+             "boundary. Declare a parent/construct column in configs/data.yaml"
+    )
+    report.notes["group_declared"] = bool(group_col)
     return out.reset_index(drop=True), report
 
 
@@ -613,6 +641,123 @@ class SequenceDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
+# Batching by node budget
+# ---------------------------------------------------------------------------
+class NodeBudgetBatchSampler(torch.utils.data.Sampler):
+    """
+    Batches capped by **padded node count**, not by sample count.
+
+    Round-2 review, R2-02: the R1-07 fix grew a whole-sequence graph from a
+    256-node window to the entire protein (up to ``max_sequence_nodes``, shipped
+    at 2048) while every task went on sharing one ``batch_size: 64``. Activation
+    memory here is linear in nodes - edges are ``graph_top_k`` per node plus
+    backbone plus self-loops, the GATv2 message tensors are per-edge, and the
+    SSM scan buffers are per-node - so a whole-sequence batch cost 8x the ddG
+    batch the budget script models, putting the analytic lower bound above the
+    documented 16 GB card. Three of the six heads could not be trained at the
+    shipped configuration, and nothing said so until the OOM.
+
+    Capping ``len(batch) * max_nodes_in_batch`` instead of ``len(batch)`` makes
+    the memory a batch can demand a declared constant rather than a consequence
+    of how long the proteins happen to be. A 2048-node protein yields 8 samples
+    per batch at the shipped budget; a 200-residue one yields ``max_batch_size``.
+
+    Padding is the other half: :func:`collate_graphs` pads to the longest sample,
+    so batching long and short proteins together wastes the budget on zeros.
+    Indices are shuffled, chunked into megabatches, and sorted by node count
+    within each, which keeps a batch's members close in length without making
+    the epoch order deterministic.
+
+    Args:
+        node_counts    : nodes per sample, in dataset index order.
+        node_budget    : maximum ``len(batch) * max_nodes_in_batch``.
+        max_batch_size : cap on samples per batch regardless of size.
+        shuffle        : shuffle between epochs (train) or keep dataset order.
+        seed           : base seed; combined with the epoch set by
+                         :meth:`set_epoch` so the order is a pure function of
+                         ``(seed, epoch)`` and a resume is exact (R2-12).
+    """
+
+    def __init__(self, node_counts, node_budget: int, max_batch_size: int,
+                 shuffle: bool = True, seed: int = 42, megabatch_factor: int = 8):
+        self.node_counts = [max(int(n), 1) for n in node_counts]
+        self.node_budget = max(int(node_budget), 1)
+        self.max_batch_size = max(int(max_batch_size), 1)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.epoch = 0
+        # A small whole-sequence table is exhausted several times inside one
+        # epoch (scripts/train.endless re-creates the iterator), and its
+        # docstring promises a reshuffle on each pass - `itertools.cycle`
+        # replaying identical batches is what R1-03 removed. So the order is a
+        # function of (seed, epoch, pass), not of (seed, epoch) alone.
+        self.pass_index = 0
+        self.megabatch_factor = max(int(megabatch_factor), 1)
+        self._cached: tuple[int, int, list[list[int]]] | None = None
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+        self.pass_index = 0
+        self._cached = None
+
+    def _build(self, pass_index: int) -> list[list[int]]:
+        n = len(self.node_counts)
+        order = list(range(n))
+        if self.shuffle:
+            g = np.random.default_rng(
+                self.seed * 1_000_003 + self.epoch * 7_919 + pass_index)
+            order = [int(i) for i in g.permutation(n)]
+
+        span = self.max_batch_size * self.megabatch_factor
+        batches: list[list[int]] = []
+        for chunk_start in range(0, n, span):
+            chunk = order[chunk_start:chunk_start + span]
+            # Longest first: the first member sets the padded width, so the
+            # budget is spent on real residues rather than on padding.
+            chunk.sort(key=lambda i: -self.node_counts[i])
+            batch: list[int] = []
+            widest = 0
+            for i in chunk:
+                trial_width = max(widest, self.node_counts[i])
+                if batch and (
+                    len(batch) + 1 > self.max_batch_size
+                    or (len(batch) + 1) * trial_width > self.node_budget
+                ):
+                    batches.append(batch)
+                    batch, widest = [i], self.node_counts[i]
+                else:
+                    batch.append(i)
+                    widest = trial_width
+            if batch:
+                batches.append(batch)
+        if self.shuffle:
+            g = np.random.default_rng(
+                self.seed * 104_729 + self.epoch * 7_919 + pass_index)
+            batches = [batches[int(i)] for i in g.permutation(len(batches))]
+        return batches
+
+    def _batches(self, pass_index: int) -> list[list[int]]:
+        key = (self.epoch, pass_index)
+        if self._cached is None or self._cached[:2] != key:
+            self._cached = (self.epoch, pass_index, self._build(pass_index))
+        return self._cached[2]
+
+    def __iter__(self):
+        batches = self._batches(self.pass_index)
+        # Advance only for a shuffling loader: an evaluation loader must yield
+        # the same order every time it is read.
+        if self.shuffle:
+            self.pass_index += 1
+        yield from batches
+
+    def __len__(self) -> int:
+        # Does NOT advance the pass counter: len() is asked for at setup and
+        # between epochs, and consuming a pass there would desynchronise the
+        # order from (seed, epoch, pass).
+        return len(self._batches(self.pass_index))
+
+
+# ---------------------------------------------------------------------------
 # Collation
 # ---------------------------------------------------------------------------
 def collate_graphs(samples: list[dict]) -> dict:
@@ -665,6 +810,13 @@ def collate_graphs(samples: list[dict]) -> dict:
         "edge_mech": edge_mech,
         "attr_mech": attr_mech,
         "site": torch.tensor([s["site"] for s in samples], dtype=torch.long),
+        # Round-1 review, R1-07 asked for the node cap to be "applied AND
+        # reported"; round 2 found it applied and reported to nobody - the flag
+        # was set in build_sample_graph, dropped here, and a repo-wide grep found
+        # no consumer. It now reaches the batch, and scripts/train.py counts it
+        # into metrics.json, so a run that silently truncated proteins says so.
+        "truncated": torch.tensor([bool(s.get("truncated", False))
+                                   for s in samples], dtype=torch.bool),
         "neighborhood_mask": neighborhood,
         "wt_idx": torch.tensor([s["wt_idx"] for s in samples], dtype=torch.long),
         "mt_idx": torch.tensor([s["mt_idx"] for s in samples], dtype=torch.long),
@@ -689,6 +841,7 @@ def move_batch(batch: dict, device) -> dict:
 
 __all__ = [
     "LoadReport",
+    "NodeBudgetBatchSampler",
     "detect_columns",
     "load_mutation_table",
     "load_sequence_table",

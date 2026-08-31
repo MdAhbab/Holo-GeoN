@@ -5,6 +5,9 @@ export interface CalibrationInfo {
   expected_calibration_error: number | null
   observed_coverage: Record<string, number> | null
   measured_on: string
+  // Which sigma these numbers describe. The interface may serve `sigma * scale`,
+  // and reporting the raw sigma's coverage against a scaled band is R2-09.
+  describes: string
 }
 
 export interface HealthResponse {
@@ -15,7 +18,9 @@ export interface HealthResponse {
   window: number | null
   untrained_heads: string[]
   uncertainty_calibrated: boolean
+  sigma_scale: number
   calibration: CalibrationInfo | null
+  calibration_note: string | null
 }
 
 // DDG predictor
@@ -44,6 +49,9 @@ export interface DdgResponse {
     stabilizing: number
   }
   verdict: string
+  // Names the head the verdict came from, so the interface never has to guess a
+  // direction from the sign of ddg (R1-25 / R2-03).
+  verdict_source: string
 }
 
 // Stability scan
@@ -71,6 +79,8 @@ export interface IdrResponse {
   sigma: number
   ci_low: number
   ci_high: number
+  value_source: string
+  ci_source: string
 }
 
 // AlphaFold Compare

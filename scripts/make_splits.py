@@ -20,6 +20,13 @@ component under "same cluster OR same gene". Without MMseqs2 on PATH the
 clustering relation degrades to exact parent-sequence identity, which is still
 protein-disjoint, and the run records which of the two happened.
 
+The relation lives in ``src/splits.build_groups`` so the whole-sequence tasks in
+``scripts/train.py`` use the identical one rather than a second implementation
+that drifted (round-2 review, R2-04). Whichever relation is used, the split is
+then AUDITED by comparing held-out sequences against training sequences
+directly - ``verify_no_leakage`` can only restate how the groups were built,
+whereas the audit can fail.
+
 Example
 -------
 python -m scripts.make_splits --data data/megascale_ddg_pairs.parquet \
@@ -36,71 +43,14 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import numpy as np
-
 from src import splits as S
 from src.config import load_config
 from src.data import load_mutation_table
+from src.provenance import provenance
 
-
-class _UnionFind:
-    def __init__(self):
-        self.parent: dict[str, str] = {}
-
-    def find(self, x: str) -> str:
-        self.parent.setdefault(x, x)
-        root = x
-        while self.parent[root] != root:
-            root = self.parent[root]
-        while self.parent[x] != root:      # path compression
-            self.parent[x], x = root, self.parent[x]
-        return root
-
-    def union(self, a: str, b: str) -> None:
-        ra, rb = self.find(a), self.find(b)
-        if ra != rb:
-            self.parent[rb] = ra
-
-
-def build_groups(df, identity: float, coverage: float) -> tuple[list[str], dict]:
-    """Connected components under 'same identity cluster OR same gene'."""
-    parents = sorted(df["parent_seq"].unique())
-    info: dict = {"n_parent_sequences": len(parents)}
-
-    seq_to_cluster: dict[str, str] = {}
-    if S.mmseqs_available():
-        keyed = {S.group_key_for_sequence(s): s for s in parents}
-        clusters = S.cluster_with_mmseqs(
-            keyed, min_seq_id=identity, coverage=coverage
-        )
-        for s in parents:
-            k = S.group_key_for_sequence(s)
-            seq_to_cluster[s] = clusters.get(k, k)
-        info["clustering"] = f"mmseqs2 @ {identity:.0%} identity, {coverage:.0%} coverage"
-    else:
-        print(
-            "[splits] mmseqs not found on PATH — falling back to exact "
-            "parent-sequence grouping. This is still protein-disjoint, but a "
-            "close homolog can appear on both sides. Install MMseqs2 "
-            "(conda install -c bioconda mmseqs2) for identity-clustered splits."
-        )
-        for s in parents:
-            seq_to_cluster[s] = S.group_key_for_sequence(s)
-        info["clustering"] = "exact parent-sequence identity (MMseqs2 unavailable)"
-
-    uf = _UnionFind()
-    for s in parents:
-        uf.union(f"c:{seq_to_cluster[s]}", f"s:{s}")
-
-    has_gene = "group" in df.columns and not df["group"].equals(df["parent_seq"])
-    if has_gene:
-        for gene, seq in zip(df["group"], df["parent_seq"]):
-            uf.union(f"g:{gene}", f"s:{seq}")
-    info["gene_relation_used"] = bool(has_gene)
-
-    groups = [uf.find(f"s:{s}") for s in df["parent_seq"]]
-    info["n_groups"] = len(set(groups))
-    return groups, info
+#: Fraction of held-out proteins allowed to have a near-identical training
+#: protein. Zero: the grouping relation is supposed to make this impossible.
+NEAR_DUPLICATE_TOLERANCE = 0.0
 
 
 def main() -> None:
@@ -134,16 +84,45 @@ def main() -> None:
     if df.empty:
         raise SystemExit(f"{args.data}: no usable rows after normalisation.")
 
-    groups, info = build_groups(df, cfg.identity, cfg.coverage)
+    has_gene = "group" in df.columns and not df["group"].equals(df["parent_seq"])
+    groups, info = S.build_groups(
+        df["parent_seq"].tolist(),
+        declared=df["group"].tolist() if has_gene else None,
+        identity=cfg.identity, coverage=cfg.coverage,
+    )
     row_splits = S.row_splits_from_groups(
         groups, ratios=tuple(args.ratios), seed=cfg.seed
     )
-    if not S.verify_no_leakage(groups, row_splits):
+    # Round-2 review, R2-17: the report used to write `no_group_spans_splits`
+    # as the literal True. It was true - the raise below guarantees it - but a
+    # constant asserting its own validation is the pattern R1-02 deleted
+    # `validated_by_real_run` for. Write what the check returned.
+    no_group_spans = S.verify_no_leakage(groups, row_splits)
+    if not no_group_spans:
         raise SystemExit("leakage detected: a group spans more than one split")
 
     df = df.copy()
     df["split"] = row_splits
     df["group_used"] = groups
+
+    # verify_no_leakage only re-states how the groups were built. This measures
+    # the sequences across the boundary, so it can fail where the group key is
+    # blind (R2-04).
+    audit = S.near_duplicate_audit(
+        df.loc[df["split"] == "train", "parent_seq"].tolist(),
+        df.loc[df["split"] != "train", "parent_seq"].tolist(),
+    )
+    leaked = audit["fraction_with_near_train_neighbour"]
+    if leaked > NEAR_DUPLICATE_TOLERANCE:
+        raise SystemExit(
+            f"{args.data}: {leaked:.1%} of held-out proteins have a "
+            f"near-identical protein in train (estimated k-mer Jaccard >= "
+            f"{audit['jaccard_threshold']}). Whole groups went to one side, so "
+            f"the grouping relation itself is too fine: declare the parent "
+            f"protein or gene under this dataset's key in configs/data.yaml, "
+            f"and install MMseqs2 to group homologs. Overlap examples: "
+            f"{audit['examples']}"
+        )
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     df.to_parquet(args.out)
@@ -171,6 +150,7 @@ def main() -> None:
         os.path.dirname(args.out) or ".", f"leakage_report_{args.kind}.json"
     )
     payload = {
+        "provenance": provenance(),
         "data": args.data,
         "kind": args.kind,
         "grouping": info,
@@ -178,7 +158,8 @@ def main() -> None:
         "seed": cfg.seed,
         "split_counts": {k: int(v) for k, v in counts.items()},
         "per_split": variance,
-        "no_group_spans_splits": True,
+        "no_group_spans_splits": no_group_spans,
+        "near_duplicate_audit": audit,
         "load_report": report.as_dict(),
     }
     with open(report_path, "w", encoding="utf-8") as fh:
@@ -186,7 +167,11 @@ def main() -> None:
 
     print(f"[splits] wrote {args.out} | rows={len(df)} | splits={counts}")
     print(f"[splits] {info['clustering']} | groups={info['n_groups']} "
-          f"| gene relation merged: {info['gene_relation_used']}")
+          f"| gene relation merged: {info['declared_group_relation_used']}")
+    print(f"[splits] near-duplicate audit: "
+          f"{audit['fraction_with_near_train_neighbour']:.1%} of "
+          f"{audit['n_held_checked']} held-out proteins have a near-identical "
+          f"training protein")
     for name, stats in sorted(variance.items()):
         print(f"[splits]   {name}: {stats}")
     print(f"[splits] leakage report -> {report_path}")

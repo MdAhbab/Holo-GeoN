@@ -168,15 +168,29 @@ def stage_train(args, cfg) -> None:
 
 
 def stage_baselines(args, cfg) -> None:
+    """
+    Controls for BOTH reported tasks.
+
+    Round-2 review, R2-16: this only ever passed the stability split, so a
+    reported ClinVar AUROC had no control at all - nothing said what an MLP on
+    the same embeddings would score, which is the comparison a reviewer asks for
+    first.
+    """
     out = os.path.join(cfg.out_root, "baselines")
-    if done(os.path.join(out, "baselines.json")):
-        print("[skip] baselines already complete")
-        return
-    stability, _ = _split_paths()
-    a = ["--splits", stability, "--out", out]
-    if args.skip_zero_shot:
-        a.append("--skip-zero-shot")
-    py("scripts.baselines", *a)
+    stability, clinvar = _split_paths()
+    for kind, splits in (("stability", stability), ("pathogenicity", clinvar)):
+        target = os.path.join(out, kind)
+        if done(os.path.join(target, "baselines.json")):
+            print(f"[skip] {kind} baselines already complete")
+            continue
+        if not done(splits):
+            print(f"[baselines] no {kind} split table at {splits}; skipping. Its "
+                  f"head will have no control, so do not report it against one.")
+            continue
+        a = ["--splits", splits, "--out", target]
+        if args.skip_zero_shot:
+            a.append("--skip-zero-shot")
+        py("scripts.baselines", *a)
 
 
 def stage_ablations(args, cfg) -> None:
@@ -185,8 +199,14 @@ def stage_ablations(args, cfg) -> None:
         print("[skip] ablations already complete")
         return
     stability, clinvar = _split_paths()
+    # Round-2 review, R2-06: this passed no --seeds, so the documented
+    # one-command pipeline ran a single seed per arm and wrote deltas to four
+    # decimals with no test behind them. Five seeds is the minimum at which the
+    # paired test has usable power against the 0.030 test-Pearson run-to-run
+    # spread round 1 measured.
     py("scripts.ablations", "--stability-splits", stability,
-       "--pathogenicity-splits", clinvar, "--out", out)
+       "--pathogenicity-splits", clinvar, "--out", out,
+       "--seeds", *[str(s) for s in args.seeds])
 
 
 def stage_calibration(args, cfg) -> None:
@@ -209,12 +229,27 @@ def stage_contacts(args, cfg) -> None:
     if done(os.path.join("results", "contacts", "contact_sanity.json")):
         print("[skip] contact sanity already complete")
         return
-    py("scripts.contact_sanity", "--cache", cfg.cache, "--max-seqs", 300)
+    a = ["--cache", cfg.cache, "--max-seqs", 300]
+    if args.true_contacts_dir:
+        a += ["--true-contacts-dir", args.true_contacts_dir, "--require-structure"]
+    else:
+        # Round-2 review, R2-13: without ground-truth maps this stage reports a
+        # long-range FRACTION, which uniformly random edges also score highly
+        # on. It runs - the number is a useful smoke test - but the pipeline says
+        # plainly that it cannot support the claim it is cited for.
+        print("[contacts] NOTE: no --true-contacts-dir. This produces a "
+              "long-range fraction against a proximity baseline and a random "
+              "control, which can show the contact edges are NON-LOCAL but not "
+              "that they are CORRECT. Do not cite it as evidence for building a "
+              "graph; pass --true-contacts-dir <dir of C-beta maps> for "
+              "precision@L.")
+    py("scripts.contact_sanity", *a)
 
 
 def stage_results(args, cfg) -> None:
     py("scripts.collect_results", "--runs", os.path.join(cfg.out_root, "main"),
-       "--baselines", os.path.join(cfg.out_root, "baselines", "baselines.json"),
+       "--baselines", os.path.join(cfg.out_root, "baselines", "stability",
+                                   "baselines.json"),
        "--ablations", os.path.join(cfg.out_root, "ablations", "ablations.json"))
 
 
@@ -278,6 +313,14 @@ def main() -> None:
                     help="raw table(s) carrying a nucleotide column, for the etl stage")
     ap.add_argument("--encode-mutants", action="store_true",
                     help="calibration: embed mutants for the reversibility check")
+    ap.add_argument("--true-contacts-dir", default=None,
+                    help="contacts: directory of <cache-key>.npy C-beta contact "
+                         "maps. Without it the contact stage cannot show the "
+                         "edges are correct, only that they are non-local (R2-13)")
+    ap.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44, 45, 46],
+                    help="seeds for the ablation grid. Deltas are paired across "
+                         "them and Holm-corrected; below 3 no test is possible "
+                         "and the verdicts read null (R2-06)")
     ap.add_argument("--skip-zero-shot", action="store_true",
                     help="baselines: skip the slow masked-LM baseline")
     args = ap.parse_args()

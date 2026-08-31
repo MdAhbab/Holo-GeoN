@@ -281,10 +281,15 @@ and they are the ones that matter most for the paper:
 - **`cds_coverage` is now a recorded number.** The encoder cache carries a
   manifest, `train.py` copies it into `metrics.json`, and training warns when the
   mechanistic stream is enabled against a cache with zero coverage.
-  **Round 2 showed this does not yet do what this paragraph claims** — the number
-  is counted from the input table rather than from the cache, and the warning is
-  skipped for any cache written before manifests existed (R2-01). Until that is
-  fixed, `cds_coverage` is not evidence about E_mech.
+  **Round 2 showed this did not do what this paragraph claimed** — the number was
+  counted from the input table rather than from the cache, and the warning was
+  skipped for any cache written before manifests existed (R2-01). The retraction
+  stays visible here rather than being edited away. It is now fixed:
+  `EncodingStore.mech_coverage` opens the cached records themselves, a missing
+  manifest is the loud case, and `scripts/train.py` additionally measures
+  coverage over the parents the run will actually read. `cds_coverage` is
+  evidence about E_mech again — and `tests/test_round2_fixes.py` fails if it
+  stops being.
 - **`scripts/budget.py` refuses to print an unmeasured estimate.** See above.
 - **`validated_by_real_run` is deleted.** A flag that asserts validation is worse
   than no flag when nothing checks it.
@@ -322,6 +327,69 @@ and its 35.3 → 2.81 ms fix, exclusion accounting on the primary tasks, both
 no-val-split refusals, the CLNSIG vocabulary, fp16 `logaddexp`, the bounded
 objective, degenerate-input robustness, and the absence of any demo path in the
 backend.
+
+**Fixed in the round-2 fix commit.** All 17 new findings, plus the four round-1
+items round 2 re-opened (R1-07's reporting half, R1-13, R1-17's second claim,
+R1-26) and the documentation contradictions. `tests/test_round2_fixes.py` adds 90
+checks, each written to fail against `bbae5e7`; the suite is 177 → 267.
+
+What changed, for the findings where the *number* moved:
+
+| ID | Before | After |
+|---|---|---|
+| R2-01 | `cds_coverage: 1.0` against a mech-free cache | Measured by opening cached records; reads `0.0` on that cache and `1.0` on a fed one. A **missing** manifest is now the loud branch, not the silent one |
+| R2-02 | 8× the ddG batch, 48 GB analytic lower bound at `batch_size: 64` | Batched by padded **node count**, capped at the ddG batch's own budget → 6.3 GB, with 12% padding waste. `budget.py` models the path and its GAT term lost a spurious `/ 2` (4.12 → 5.35 GB for the ddG batch) |
+| R2-04 | `verify_no_leakage → True` on a split where 100% of test rows sat 1–2 residues from a training row | A MinHash near-duplicate audit measures the same 100% and **refuses the run**; 0% on unrelated proteins, so it is not always-on |
+| R2-05 | 60 encoder calls for a 60-position scan | 1, with the batched scan matching the single-site path to 1e-3 |
+| R2-06 | P(≥1 spurious flag over 20 null comparisons) = 0.82 at 5 seeds | 0.055 — Holm-corrected paired t-tests over a pre-registered family, with intervals |
+| R2-07 | 8.5× weight imbalance from asymmetric floors at a typical ddG NLL | 1.09×, from a single uniform floor |
+| R2-09 | `uncertainty_calibrated: True`, ECE 0.0053, for a band whose true ECE was 0.070 | Reports the post-scaling verdict — flag `False`, ECE 0.073 — and the IDR head no longer inherits a scale fitted in kcal/mol |
+| R2-12 | Resume replayed epoch 1 as epoch 2 under `rng_restored=True` | Batch order is a pure function of `(seed, epoch, pass)`; resume is exact |
+| R1-26 | 128 residues per boundary drawn from a strictly shorter chunk, clamp or no clamp | Selection scores *retained context*; dominates the old rule at every residue and every length tested, and the worst-served residue nearly doubles |
+
+Three corrections to the round-2 report itself, from re-checking its claims:
+
+- **`app/frontend/dist/` is not checked in.** It is gitignored and appears in no
+  commit on any branch (`git rev-list --all` finds no tree containing it). The
+  R2-03 source defect was entirely real and is fixed; the "and in the checked-in
+  bundle" half describes a locally built artifact, so there is no stale bundle to
+  rebuild and no CI check needed for one.
+- **R2-02's ceiling is worse than reported.** The reviewer's scaled figure was
+  33 GB (39.7 GB with the GAT term corrected). Modelling the path properly gives
+  **48.1 GB**, because the SSM scan-step count grows with the node count too.
+- **R2-13's `--true-contacts-dir` requirement now has a flag** rather than being
+  mandatory: the structure-free mode still runs as a smoke test, but it reports a
+  random-edge control beside the proximity baseline, records
+  `supports_structural_claim`, and `run.py contacts` prints plainly that the
+  result cannot be cited as evidence for the graph.
+
+**A result that came out of fixing R2-06, and that changes what the planned run
+can conclude.** The statistics are now correct, and correct statistics say the
+experiment as designed is underpowered. With run-to-run noise at the 0.030 test
+Pearson round 1 measured, the smallest effect detectable at 80% power is:
+
+| seeds | family of 8 | family of 20 |
+|---|---|---|
+| 5 (the new default) | 0.117 | 0.145 |
+| 10 | 0.059 | 0.067 |
+| 15 | 0.044 | 0.049 |
+| 20 | 0.037 | 0.041 |
+
+Ablation effects in this literature are commonly 0.01–0.05. At five seeds the
+grid can only resolve effects far larger than that, so most arms will come back
+"not significant" for want of power rather than for want of an effect.
+`ablations.json` now marks exactly those rows `underpowered` and prints the
+minimum detectable effect beside them, so the distinction is on the page instead
+of being inferred. **Before the real run, decide deliberately**: narrow the
+declared family to the metrics the paper actually claims, budget more seeds, or
+state the power limit in the results. What is no longer possible is reporting a
+non-significant delta as evidence a component does not matter.
+
+Still not verifiable here, and unchanged from §5 of the report: everything that
+needs a GPU, ESM-2 weights, MMseqs2, or real data. The 48 GB and 6.3 GB figures
+are analytic; run `python -m scripts.budget --device cuda` on the card before
+trusting either. This environment does have ViennaRNA, so the mechanistic path is
+exercised, but with stub embeddings.
 
 ### Round 3 — pending
 

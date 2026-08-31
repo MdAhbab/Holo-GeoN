@@ -193,7 +193,8 @@ def mechanistic_features(
     organism: str = "human",
 ) -> torch.Tensor:
     """
-    Build the ``(length, 7)`` mechanistic feature tensor for one sequence.
+    Build the ``(length, N_MECH_CHANNELS)`` mechanistic feature tensor for
+    one sequence.
 
     ``dna_seq`` is the **real** coding sequence for this protein, or None. With
     a CDS and ViennaRNA present, channels 0-1 are populated and ``mech_valid``

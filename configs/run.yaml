@@ -76,6 +76,18 @@ site_anchored_readout: true
 # Epochs is an upper bound: training stops early when the primary validation
 # metric stops improving. v1 ran a fixed 8 epochs and its best epoch was 8,
 # meaning it was still improving when it stopped.
+#
+# Round-2 review, R2-10: an "epoch" now means ONE EXPECTED PASS OVER THE PRIMARY
+# TASK. It used to mean max(len(loader)) steps, which - once tasks were sampled
+# proportionally - gave the primary task only ~63% of its own batches per epoch,
+# so `epochs: 60` bought 37.7 passes over the ddG data and `early_stop_patience`
+# counted units whose size depended on the OTHER tasks' row counts.
+#
+# BUDGET NOTE: at MegaScale/ClinVar scale this makes an epoch ~1.6x longer in
+# steps than it was, so 60 epochs is ~1.6x the compute the old number implied.
+# That is the correct 60 passes rather than 37.7, but if the wall-clock budget
+# is fixed, lower this to ~38 to match what the previous configuration actually
+# did. scripts/train.py prints steps_per_epoch and how it was derived.
 epochs: 60
 batch_size: 64
 lr: 0.0003
@@ -95,3 +107,48 @@ task_sampling_temperature: 0.5
 # Whole-sequence tasks span the entire protein rather than a window; this caps
 # pathological inputs, and the cap is reported when it bites.
 max_sequence_nodes: 2048
+
+# Whole-sequence batches are capped by padded NODE count rather than by sample
+# count. Round-2 review, R2-02: at one shared batch_size a 2048-node protein
+# graph costs 8x the 256-node ddG batch the memory budget is computed for, which
+# put the analytic lower bound past the 16 GB target card and made three of the
+# six heads untrainable at the shipped configuration. null means "spend the same
+# node budget as the windowed loaders", i.e. batch_size * window = 16384, so a
+# whole-sequence step and a ddG step cost the same by construction. Verify on
+# the target GPU with:
+#     python -m scripts.budget --device cuda --sequence-nodes 2048
+sequence_node_budget: null
+
+# Three-state neutral band, in kcal/mol, for stability rows that report no
+# per-measurement error. A mutation is labelled "neutral" when |ddG| <= sigma.
+# Round-2 review, R2-11: this was a module constant while src/heads.py claimed
+# the band "is not a hardcoded constant". The `sigma:` column override is
+# commented out for every shipped dataset, so in practice this value decides the
+# class of roughly a fifth of a realistic ddG distribution - and the three-state
+# macro-F1 is the only reported evidence the swap-equivariant head buys
+# anything. metrics.json records it with a sensitivity table.
+three_state_sigma: 0.5
+
+# Encoder records held in memory per DataLoader worker; 0 disables the cache.
+# MutationDataset reads one record per ROW while the cache is keyed by PARENT, so
+# on MegaScale the same .pt is deserialised ~100x per epoch per protein. Each
+# record is about L * esm_dim * 2 bytes (~1.5 MB at L=600, dim=1280), so 32
+# records costs roughly 50 MB per worker - times num_workers. Off by default:
+# round-1's commit message claimed a graph cache that did not exist (R1-17), and
+# the replacement should be enabled deliberately with the RAM cost in view.
+record_cache_size: 0
+
+# --- ablations -------------------------------------------------------------
+# The ONE metric per task the ablation grid compares, declared before any run.
+# Round-2 review, R2-06: the grid used to compare every numeric key in the test
+# metrics - 80 uncorrected comparisons across 5 arms, including `target_std` and
+# `pos_rate`, which are properties of the split and identical across arms. Under
+# the global null the chance of at least one spurious "component matters" flag
+# was 0.999. Deltas are now paired across seeds and Holm-corrected over exactly
+# this family.
+ablation_metrics:
+  stability: pearson
+  pathogenicity: auroc
+  idr: pearson
+  mfi: pearson
+  proteomics: pearson
