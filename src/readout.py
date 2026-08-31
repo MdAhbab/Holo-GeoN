@@ -73,9 +73,15 @@ class SiteAnchoredReadout(nn.Module):
         dropout : applied inside the fusion MLPs.
     """
 
-    def __init__(self, dim: int, out_dim: int | None = None, dropout: float = 0.1):
+    def __init__(self, dim: int, out_dim: int | None = None, dropout: float = 0.1,
+                 site_anchored: bool = True):
         super().__init__()
         out_dim = out_dim or dim
+        # site_anchored=False reproduces the v1 formulation - pool the whole
+        # graph and ignore where the mutation is - so scripts/ablations.py can
+        # measure whether anchoring recovers the ~1/L signal a global pool
+        # dilutes. It is an ablation axis, not a supported configuration.
+        self.site_anchored = site_anchored
         self.neighborhood_pool = MaskedAttentionPool(dim)
         self.global_pool = MaskedAttentionPool(dim)
         self.fuse = nn.Sequential(
@@ -108,6 +114,8 @@ class SiteAnchoredReadout(nn.Module):
         Returns:
             (B, out_dim) context vectors.
         """
+        if not self.site_anchored:
+            return self.global_only(h, mask)
         b = torch.arange(h.size(0), device=h.device)
         z_site = h[b, site.clamp(min=0, max=h.size(1) - 1)]
         z_neigh = self.neighborhood_pool(h, neighborhood_mask)

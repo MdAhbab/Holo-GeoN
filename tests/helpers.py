@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
-from src.features import mechanistic_features
+from src.features import N_MECH_CHANNELS, mechanistic_features
 from src.graphs import build_geometric_graph, build_mechanistic_graph, khop_neighborhood
 from src.substitution import AA_ORDER
 
@@ -111,7 +111,7 @@ def make_batch(
     """Build a model-ready batch directly, without touching the data layer."""
     L = pad_to or length
     esm = torch.zeros(batch_size, L, dim)
-    mech = torch.zeros(batch_size, L, 7)
+    mech = torch.zeros(batch_size, L, N_MECH_CHANNELS)
     mask = torch.zeros(batch_size, L, dtype=torch.bool)
     neighborhood = torch.zeros(batch_size, L, dtype=torch.bool)
     eg, ag, em, am, sites = [], [], [], [], []
@@ -157,6 +157,7 @@ def make_batch(
         "mt_idx": mt,
         "y": torch.randn(batch_size, generator=g),
         "sigma": torch.full((batch_size,), float("nan")),
+        "seq_length": torch.full((batch_size,), float(length)),
     }
 
 

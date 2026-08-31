@@ -97,21 +97,35 @@ def stage_inspect(args, cfg) -> None:
             py("scripts.inspect_data", "--data", path)
 
 
-def stage_etl(args, cfg) -> None:
+def stage_etl(args, cfg) -> str | None:
+    """
+    Attach the real coding sequence and RETURN the path downstream stages read.
+
+    Round-1 review, R1-05: this used to write the CDS-joined table and then
+    merely print "set stability_data ... to use it". ``stage_all`` immediately
+    called precompute with the unmodified path, so every downstream stage read
+    the table with no ``wt_dna`` column: ``mech_valid`` was 0 everywhere,
+    ``E_mech`` held only self-loops, and the ``no_mech_stream`` ablation - the
+    arm that exists to test the paper's distinguishing contribution - measured a
+    stream that had never been fed. The delta would have read ~0 and been
+    written up as "the mechanistic stream does not contribute", which is the
+    wrong conclusion from a plumbing bug.
+    """
     if not args.cds_source:
         print("[etl] no --cds-source given. Skipping.\n"
               "      Without a real coding sequence the mechanistic channels stay "
               "masked (mech_valid = 0) and E_mech is empty. That is the honest\n"
               "      state, not a failure — but the mechanistic stream then has "
               "nothing to contribute and its ablation will read ~0.")
-        return
+        return None
     out = cfg.stability_data.replace(".parquet", "_cds.parquet")
     if done(out):
-        print(f"[skip] etl already produced {out}")
-        return
+        print(f"[etl] reusing {out}")
+        return out
     py("scripts.etl_cds", "--table", cfg.stability_data,
        "--source", *args.cds_source, "--out", out)
-    print(f"[etl] set stability_data: {out} in configs/run.yaml to use it.")
+    print(f"[etl] downstream stages will read {out}")
+    return out
 
 
 def stage_precompute(args, cfg) -> None:
@@ -209,7 +223,11 @@ def stage_test(args, cfg) -> None:
 
 
 def stage_all(args, cfg) -> None:
-    stage_etl(args, cfg)
+    # The CDS-joined table produced by etl is threaded through the rest of the
+    # run in memory, so the mechanistic stream is actually fed (R1-05).
+    cds_table = stage_etl(args, cfg)
+    if cds_table:
+        cfg.values["stability_data"] = cds_table
     stage_precompute(args, cfg)
     stage_splits(args, cfg)
     stage_train(args, cfg)

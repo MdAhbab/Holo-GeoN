@@ -104,3 +104,35 @@ def get_cai_weights(organism: str = "human") -> dict[str, float]:
 # ---------------------------------------------------------------------------
 # Back-translation (usage-weighted proxy transcript)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Single-codon substitution
+# ---------------------------------------------------------------------------
+def preferred_codon(aa: str, organism: str = "human") -> str | None:
+    """
+    The most-used codon for one amino acid under the reference usage table.
+
+    This exists for exactly one purpose: substituting the single codon at a
+    mutated site in a REAL coding sequence, so the mutant's mechanistic channels
+    can be derived from the same transcript as the parent's
+    (``scripts/calibration.py`` reversibility check).
+
+    It is emphatically NOT back-translation. Back-translation synthesises a whole
+    transcript from a protein, which makes every mechanistic feature a
+    deterministic function of the amino-acid sequence and therefore
+    informationally empty - see ``src/features.py``. Here the transcript is real
+    and only the mutated codon is chosen; a real variant would carry a specific
+    codon that the protein-level data does not record, so the choice is stated
+    rather than hidden, and it affects one codon's CAI and its local folding
+    window.
+    """
+    weights = get_cai_weights(organism)
+    best, best_w = None, -1.0
+    for codon, coded_aa in GENETIC_CODE.items():
+        if coded_aa != aa.upper():
+            continue
+        w = weights.get(codon, 0.0)
+        if w > best_w:
+            best, best_w = codon, w
+    return best

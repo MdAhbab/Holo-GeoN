@@ -48,7 +48,11 @@ class HoloGeoN(nn.Module):
         gat_heads       : GATv2 attention heads.
         dropout         : dropout across backbone, readout and heads.
         use_ssm         : selective state-space residue mixer.
-        use_mech_stream : E_mech message-passing stream.
+        use_mech_stream : E_mech (translational coupling) message-passing stream.
+        use_geo_stream  : E_geo (spatial contact) message-passing stream.
+        site_anchored_readout : anchor the readout at the mutated residue.
+                          False reproduces the v1 global-pool formulation and
+                          exists only as an ablation axis.
         num_species     : >0 conditions the proteomics head on a species id.
     """
 
@@ -63,6 +67,8 @@ class HoloGeoN(nn.Module):
         dropout: float = 0.1,
         use_ssm: bool = True,
         use_mech_stream: bool = True,
+        use_geo_stream: bool = True,
+        site_anchored_readout: bool = True,
         num_species: int = 0,
     ):
         super().__init__()
@@ -78,9 +84,12 @@ class HoloGeoN(nn.Module):
             heads=gat_heads,
             use_ssm=use_ssm,
             use_mech_stream=use_mech_stream,
+            use_geo_stream=use_geo_stream,
             dropout=dropout,
         )
-        self.readout = SiteAnchoredReadout(out_dim, ctx_dim, dropout=dropout)
+        self.readout = SiteAnchoredReadout(
+            out_dim, ctx_dim, dropout=dropout, site_anchored=site_anchored_readout
+        )
 
         # One shared residue vocabulary across every mutation-conditioned head.
         self.aa_embedding = AminoAcidEmbedding(aa_dim)
@@ -145,13 +154,15 @@ class HoloGeoN(nn.Module):
 
     def scan(self, batch: dict, z: torch.Tensor | None = None) -> torch.Tensor:
         """
-        ``(B, 20)`` ddG for every substitution at the batch's sites.
+        ``(B, 21)`` ddG for every substitution at the batch's sites.
 
-        One backbone pass covers all 20 candidates, which is what makes a full
-        deep mutational scan tractable in the interface.
+        One backbone pass covers every candidate, which is what makes a full
+        deep mutational scan tractable in the interface. The last column is the
+        unknown-residue slot; it keeps the wild-type column exactly zero even
+        when the parent residue is non-standard.
         """
         z = self.context(batch) if z is None else z
-        return self.ddg_head.scan(z, batch["wt_idx"], n_aa=N_AMINO_ACIDS)
+        return self.ddg_head.scan(z, batch["wt_idx"], n_aa=N_AMINO_ACIDS + 1)
 
     # ------------------------------------------------------------------
     # Whole-sequence tasks
@@ -159,15 +170,15 @@ class HoloGeoN(nn.Module):
     def idr(self, batch: dict, z: torch.Tensor | None = None):
         """``(mu, sigma)`` of the radius of gyration, in Angstrom."""
         z = self.global_context(batch) if z is None else z
-        return self.idr_head(z)
+        return self.idr_head(z, batch.get("seq_length"))
 
     def mfi(self, batch: dict, z: torch.Tensor | None = None) -> torch.Tensor:
         z = self.context(batch) if z is None else z
-        return self.mfi_head(z)
+        return self.mfi_head(z, batch.get("seq_length"))
 
     def proteomics(self, batch: dict, z: torch.Tensor | None = None) -> torch.Tensor:
         z = self.global_context(batch) if z is None else z
-        return self.proteomics_head(z, batch.get("species_id"))
+        return self.proteomics_head(z, batch.get("species_id"), batch.get("seq_length"))
 
     # ------------------------------------------------------------------
     def parameter_count(self) -> dict[str, int]:
@@ -208,6 +219,8 @@ def model_kwargs_from_config(cfg, esm_dim: int, **overrides) -> dict:
         "dropout": get("dropout", 0.1),
         "use_ssm": get("use_ssm", True),
         "use_mech_stream": get("use_mech_stream", True),
+        "use_geo_stream": get("use_geo_stream", True),
+        "site_anchored_readout": get("site_anchored_readout", True),
         "num_species": get("num_species", 0),
     }
     kwargs.update({k: v for k, v in overrides.items() if v is not None})

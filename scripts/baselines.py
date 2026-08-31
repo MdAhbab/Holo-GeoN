@@ -49,7 +49,9 @@ from src.config import load_config
 from src.device import describe_device
 from src.encoder import EncodingStore, EsmEncoder
 from src.metrics import classification_metrics, regression_metrics
+from src.seeding import loader_kwargs, seed_everything
 from src.substitution import AA_ORDER, aa_index
+from src.encoder import MAX_CONTEXT_RESIDUES
 from src.windowing import window_bounds
 
 
@@ -79,13 +81,26 @@ def esm_zero_shot_baseline(test: pd.DataFrame, cfg, device, limit: int | None) -
     encoder = EsmEncoder(cfg.esm_model, device=str(device))
     rows = test if limit is None else test.iloc[:limit]
     scores, truth = [], []
+    truncated = 0
     target = "label" if "label" in rows.columns else "target"
 
     for _, row in tqdm(list(rows.iterrows()), desc="esm zero-shot"):
         seq, site = row["parent_seq"], int(row["site"])
-        # Score inside the same window the model sees, so the comparison is fair.
-        start, end = window_bounds(len(seq), site, cfg.window)
-        sub, local = seq[start:end], site - start
+        # Score on the FULL sequence, which is the context the model's own
+        # inputs carry: embeddings are computed by ESM-2 over the whole protein
+        # and cached at full length, and the window is sliced from that. Round-1
+        # review, R1-12: scoring the baseline on a 256-residue window "so the
+        # comparison is fair" gave it strictly less context than the model,
+        # handicapping the control that the central empirical claim rests on.
+        #
+        # Sequences beyond the encoder's context are scored on the largest
+        # window the encoder can take, centred on the site, and counted.
+        if len(seq) <= MAX_CONTEXT_RESIDUES:
+            sub, local = seq, site
+        else:
+            start, end = window_bounds(len(seq), site, MAX_CONTEXT_RESIDUES)
+            sub, local = seq[start:end], site - start
+            truncated += 1
         marg = encoder.masked_marginals(sub, [local])[local]
         vocab = encoder.tokenizer.get_vocab()
         wt_tok, mt_tok = vocab.get(row["wt_aa"]), vocab.get(row["mt_aa"])
@@ -100,9 +115,15 @@ def esm_zero_shot_baseline(test: pd.DataFrame, cfg, device, limit: int | None) -
     metrics["n"] = int(len(p))
     if "pearson" in metrics:
         metrics["abs_pearson"] = abs(metrics["pearson"])
+    metrics["scored_on_full_sequence"] = int(len(p) - truncated)
+    metrics["scored_on_truncated_context"] = int(truncated)
     metrics["note"] = (
-        "higher score = more tolerated, so a negative correlation with a "
-        "destabilising ddG is the expected direction"
+        "wild-type-marginal log-odds: a higher score means the substitution is "
+        "more tolerated. Under the internal convention (positive ddG is "
+        "STABILISING, see src/data.DDG_CONVENTION) a more-tolerated substitution "
+        "has a HIGHER ddG, so the expected correlation is POSITIVE. Round-1 "
+        "review, R1-19: this docstring previously asserted the opposite, which "
+        "would have made a correctly-signed result look like a bug"
     )
     return metrics
 
@@ -150,10 +171,13 @@ def esm_mlp_baseline(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame,
     }
     loaders = {
         k: DataLoader(v, batch_size=batch_size, shuffle=(k == "train"),
-                      num_workers=cfg.num_workers)
+                      num_workers=cfg.num_workers,
+                      **loader_kwargs(cfg.seed, cfg.num_workers))
         for k, v in sets.items() if len(v)
     }
     in_dim = sets["train"][0][0].numel()
+    # Seeded so the control is as reproducible as the model it is compared with.
+    torch.manual_seed(cfg.seed)
     model = nn.Sequential(
         nn.Linear(in_dim, 512), nn.ReLU(), nn.Dropout(0.1),
         nn.Linear(512, 256), nn.ReLU(),
@@ -176,7 +200,7 @@ def esm_mlp_baseline(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame,
         model.eval()
         preds, truth = [], []
         with torch.no_grad():
-            for x, y in loaders.get("val", loaders["test"]):
+            for x, y in loaders["val"]:
                 out = model(x.to(device)).reshape(-1).cpu()
                 preds.append(torch.sigmoid(out).numpy() if classification else out.numpy())
                 truth.append(y.numpy())
@@ -226,6 +250,7 @@ def main() -> None:
     cfg = load_config(args.config, overrides={
         "cache": args.cache, "esm_model": args.esm_model, "device": args.device})
     os.makedirs(args.out, exist_ok=True)
+    seed_everything(cfg.seed)
     device = describe_device(torch.device(cfg.device) if cfg.device else None)
     store = EncodingStore(cfg.cache)
 
@@ -235,7 +260,16 @@ def main() -> None:
     val = df[df.split == "val"]
     test = df[df.split == "test"]
     if val.empty:
-        val = test
+        # Round-1 review, R1-12: this used to fall back to `val = test`, so the
+        # MLP baseline - described everywhere as "the control that matters" -
+        # was early-stopped on the very split it was then scored on. The gap to
+        # the full model is the paper's central empirical claim; leaking into
+        # the control makes it unmeasurable in the direction it is claimed.
+        raise SystemExit(
+            f"{args.splits}: no validation rows. The MLP baseline needs a val "
+            f"split for model selection - selecting on test would inflate it. "
+            f"Re-generate the split table with scripts.make_splits."
+        )
     print(f"[baselines] target={target}  train={len(train)} val={len(val)} test={len(test)}")
 
     results: dict[str, dict] = {}

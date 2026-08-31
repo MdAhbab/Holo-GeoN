@@ -20,6 +20,7 @@ python -m scripts.budget --batch-size 64 --window 256 --unique-residues 12000000
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 
@@ -106,6 +107,23 @@ def main() -> None:
     print(f"E_geo edges        : ~{int(batch['edge_geo'].shape[1] * scale):,}")
     print(f"E_mech edges       : ~{int(batch['edge_mech'].shape[1] * scale):,}")
 
+    # Analytic terms that dominate activation memory. Round-1 review, R1-16: the
+    # previous "activations ~6x node features" constant had no relation to the
+    # graph, and each of these two terms alone exceeded the 0.78 GB it produced.
+    e_geo = int(batch["edge_geo"].shape[1] * scale)
+    e_mech = int(batch["edge_mech"].shape[1] * scale)
+    # GATv2Conv keeps a per-edge message tensor (E, heads, out_channels) for
+    # backward, in each of 4 convolutions (2 layers x 2 streams).
+    gat_bytes = 4 * (e_geo + e_mech) / 2 * kwargs["gat_heads"] * cfg.hidden * 4
+    # The associative scan allocates a_prev/x_prev and rewrites a_c/x_c at each
+    # of ceil(log2 L) steps, all retained by autograd.
+    scan_steps = max(1, math.ceil(math.log2(max(cfg.window, 2))))
+    scan_bytes = scan_steps * 4 * node_bytes * scale if cfg.use_ssm else 0.0
+
+    print(f"GATv2 edge tensors : {gat_bytes / GB:.2f} GB (4 convs, "
+          f"{e_geo + e_mech:,} edges, {kwargs['gat_heads']} heads)")
+    print(f"SSM scan buffers   : {scan_bytes / GB:.2f} GB ({scan_steps} steps)")
+
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
         batch = {k: (v.to(device) if torch.is_tensor(v) else v)
@@ -113,20 +131,28 @@ def main() -> None:
         out, _ = model.ddg(batch)
         out.sum().backward()
         peak = torch.cuda.max_memory_allocated()
-        print(f"measured peak      : {_mib(peak)} at batch "
+        print(f"MEASURED peak      : {_mib(peak)} at batch "
               f"{batch['esm'].shape[0]}")
         projected = peak * scale
-        print(f"projected at {cfg.batch_size:<4}  : {projected / GB:.2f} GB "
-              f"({'fits' if projected < args.vram_gb * GB * 0.8 else 'TIGHT'} "
-              f"in {args.vram_gb:.0f} GB)")
+        headroom = "fits" if projected < args.vram_gb * GB * 0.8 else "TIGHT"
+        print(f"measured, scaled to {cfg.batch_size}: {projected / GB:.2f} GB "
+              f"({headroom} in {args.vram_gb:.0f} GB)")
     else:
         out, _ = model.ddg(batch)
         out.sum().backward()
-        print("measured peak      : (CUDA not available here — run this on the "
-              "target GPU for a measured figure)")
-        print(f"estimate at {cfg.batch_size:<5} : "
-              f"{(node_bytes * scale * 6 + counts['total'] * 16) / GB:.2f} GB "
-              f"(activations ~6x node features + weights and optimiser states)")
+        floor = (gat_bytes + scan_bytes + node_bytes * scale
+                 + counts["total"] * 16) / GB
+        print()
+        print("MEASURED peak      : UNAVAILABLE - no CUDA device here.")
+        print("This script will not print an activation 'estimate' without a")
+        print("torch.cuda.max_memory_allocated() measurement: the previous")
+        print("constant-multiplier estimate under-stated peak by an order of")
+        print("magnitude, and a hardware plan was built on it.")
+        print()
+        print(f"Analytic LOWER BOUND at {cfg.batch_size}: {floor:.2f} GB")
+        print("  (edge tensors + scan buffers + node features + optimiser state;")
+        print("   a lower bound, not a peak - real peak is higher.)")
+        print(f"  Run this on the target GPU for the real number.")
 
     print()
     print("--- notes ---")

@@ -60,6 +60,9 @@ DEFAULTS: dict[str, Any] = {
     "coverage": 0.80,
     "cv_folds": 5,
     "seed": 42,
+    # Deterministic algorithms + cuDNN determinism. Slower, but makes a rerun
+    # bit-reproducible; worth it for the ablation arms.
+    "strict_determinism": False,
 
     # --- graph ---
     "graph_top_k": 16,       # neighbours per node in the built graph
@@ -77,6 +80,8 @@ DEFAULTS: dict[str, Any] = {
     "dropout": 0.1,
     "use_ssm": True,
     "use_mech_stream": True,   # ablation axis; the shipped model is dual-stream
+    "use_geo_stream": True,    # ablation axis
+    "site_anchored_readout": True,  # ablation axis; False is the v1 formulation
 
     # --- training ---
     "epochs": 60,
@@ -89,6 +94,11 @@ DEFAULTS: dict[str, Any] = {
     "amp": True,
     "num_workers": 4,
     "max_rows": None,
+    # Task sampling exponent: 1 is strictly proportional to loader size, 0.5 a
+    # square-root schedule, 0 the old equal-steps-per-task behaviour.
+    "task_sampling_temperature": 0.5,
+    # Cap on nodes for a whole-sequence graph (IDR / MFI / proteomics).
+    "max_sequence_nodes": 2048,
 }
 
 

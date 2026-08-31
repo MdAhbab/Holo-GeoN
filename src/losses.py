@@ -85,9 +85,51 @@ def antisymmetry_violation(ddg_forward: torch.Tensor, ddg_reverse: torch.Tensor)
 # ---------------------------------------------------------------------------
 # Multi-task weighting
 # ---------------------------------------------------------------------------
+#: Lower bound of each task loss, used to shift it non-negative for weighting.
+#:
+#: Round-1 review, R1-09: Kendall & Gal's derivation assumes a NON-NEGATIVE task
+#: loss. A heteroscedastic Gaussian NLL is negative whenever the predictive
+#: density exceeds 1 - with the log-variance clamp its minimum is -4.081 - and
+#: for a negative value, ``value * exp(-log_var)`` is minimised by driving
+#: log_var to minus infinity. The objective was unbounded below: the reviewer
+#: measured the total reaching -1.9e19 with a stability weight of 4.7e18 after
+#: 300 steps, at which point the global gradient clip hands the entire budget to
+#: one task and every other head stops learning, while the printed loss looks
+#: like spectacular progress.
+#:
+#: ddG NLL goes negative once the typical predicted sigma drops below ~0.24
+#: kcal/mol, which is reachable on MegaScale where many mutations are
+#: near-neutral and well predicted. So this is not a corner case.
+LOSS_FLOORS: dict[str, float] = {
+    # 0.5 * (log(2*pi) + LOGVAR_MIN), with LOGVAR_MIN = -10 as clamped in
+    # gaussian_nll and in SubstitutionScoreHead.
+    "stability": -4.0811,
+    "idr": -4.0811,
+    # Cross-entropy and MSE are non-negative already.
+    "three_state": 0.0,
+    "pathogenicity": 0.0,
+    "mfi": 0.0,
+    "proteomics": 0.0,
+}
+
+#: Bound on the learned log-variances. Spans a 400x weight range, wide enough
+#: for genuinely different task scales and narrow enough that one task cannot
+#: monopolise the shared gradient.
+TASK_LOGVAR_MIN, TASK_LOGVAR_MAX = -3.0, 3.0
+
+
 class UncertaintyWeightedLoss(nn.Module):
     """
-    Learned per-task weighting (Kendall & Gal, 2018).
+    Learned per-task weighting (Kendall & Gal, 2018), made bounded below.
+
+    Two guards on the original formulation:
+
+    * Each task loss is shifted by its lower bound (:data:`LOSS_FLOORS`) so the
+      weighted term sees a non-negative quantity, as the derivation requires.
+      The shift is a constant, so it changes no gradient with respect to the
+      model - only the sign of what the weight multiplies.
+    * The learned log-variances are clamped to
+      ``[TASK_LOGVAR_MIN, TASK_LOGVAR_MAX]``.
 
     Args:
         tasks : task names. One log-variance parameter is learned per task.
@@ -97,9 +139,10 @@ class UncertaintyWeightedLoss(nn.Module):
     receives no gradient.
     """
 
-    def __init__(self, tasks: list[str]):
+    def __init__(self, tasks: list[str], floors: dict[str, float] | None = None):
         super().__init__()
         self.tasks = list(tasks)
+        self.floors = {t: (floors or LOSS_FLOORS).get(t, 0.0) for t in self.tasks}
         self.log_var = nn.ParameterDict(
             {t: nn.Parameter(torch.zeros(())) for t in self.tasks}
         )
@@ -114,14 +157,27 @@ class UncertaintyWeightedLoss(nn.Module):
                 raise KeyError(
                     f"loss {name!r} was not declared at construction; known: {self.tasks}"
                 )
-            lv = self.log_var[name]
-            weighted = value * torch.exp(-lv) + 0.5 * lv
+            lv = self.log_var[name].clamp(TASK_LOGVAR_MIN, TASK_LOGVAR_MAX)
+            # Shift non-negative for the weighted term; add the constant back so
+            # the reported total is still comparable across runs.
+            floor = self.floors[name]
+            shifted = value - floor
+            weighted = shifted * torch.exp(-lv) + 0.5 * lv + floor
             total = weighted if total is None else total + weighted
             parts[name] = float(value.detach())
             parts[f"{name}_weight"] = float(torch.exp(-lv).detach())
         if total is None:
             raise ValueError("no losses supplied")
         return total, parts
+
+    def saturated(self, tol: float = 1e-3) -> list[str]:
+        """Tasks whose log-variance has hit a clamp bound - worth reporting."""
+        out = []
+        for name, p in self.log_var.items():
+            v = float(p.detach())
+            if v <= TASK_LOGVAR_MIN + tol or v >= TASK_LOGVAR_MAX - tol:
+                out.append(name)
+        return out
 
 
 # ---------------------------------------------------------------------------

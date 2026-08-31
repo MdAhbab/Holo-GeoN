@@ -82,10 +82,20 @@ class LoadReport:
     rows_in: int = 0
     rows_out: int = 0
     dropped: dict[str, int] = field(default_factory=dict)
+    #: Free-form provenance that must travel with the data: the sign convention
+    #: applied, the exact label terms that were dropped, and similar. Anything a
+    #: reader would need to interpret the kept rows correctly.
+    notes: dict = field(default_factory=dict)
 
     def drop(self, reason: str, n: int = 1) -> None:
         if n:
             self.dropped[reason] = self.dropped.get(reason, 0) + n
+
+    def note_value(self, key: str, value) -> None:
+        """Record a distinct value that was seen and rejected, with a count."""
+        bucket = self.notes.setdefault(key, {})
+        k = str(value)
+        bucket[k] = bucket.get(k, 0) + 1
 
     def as_dict(self) -> dict:
         total_dropped = sum(self.dropped.values())
@@ -96,6 +106,7 @@ class LoadReport:
             "rows_dropped": total_dropped,
             "dropped_fraction": (total_dropped / self.rows_in) if self.rows_in else 0.0,
             "dropped_by_reason": dict(self.dropped),
+            "notes": dict(self.notes),
         }
 
     def summary(self) -> str:
@@ -108,6 +119,31 @@ class LoadReport:
 # ---------------------------------------------------------------------------
 # Normalised loading
 # ---------------------------------------------------------------------------
+#: Internal sign convention, fixed for the whole project.
+#:
+#: Round-1 review, R1-19: the convention was stated once, in a comment in the
+#: web backend, contradicted in the baselines docstring, and never enforced.
+#: Pearson r and Spearman rho are invariant to a global sign flip, so a table
+#: ingested with the opposite convention produces an apparently excellent
+#: correlation while the three-state labels, the interface's
+#: stabilising/destabilising verdict and every qualitative claim are inverted -
+#: with nothing in any artifact revealing it.
+DDG_CONVENTION = "ddG = dG_mut - dG_wt; positive is STABILISING"
+_SIGN_KEYS = {"stabilizing_positive": 1.0, "destabilizing_positive": -1.0}
+
+
+def _resolve_ddg_sign(overrides: dict[str, str] | None) -> tuple[float, str]:
+    """Sign multiplier that maps a dataset's convention onto the internal one."""
+    key = (overrides or {}).get("ddg_sign", "stabilizing_positive")
+    if key not in _SIGN_KEYS:
+        raise ValueError(
+            f"ddg_sign must be one of {sorted(_SIGN_KEYS)}, got {key!r}. "
+            f"Set it under this dataset's key in configs/data.yaml. "
+            f"Internally, {DDG_CONVENTION}."
+        )
+    return _SIGN_KEYS[key], key
+
+
 def load_mutation_table(
     path: str,
     kind: str,
@@ -121,6 +157,13 @@ def load_mutation_table(
     Args:
         kind : ``"stability"`` (needs a numeric target) or ``"pathogenicity"``
                (needs a binary label).
+
+    Targets are normalised to the internal sign convention
+    (:data:`DDG_CONVENTION`) using the dataset's ``ddg_sign`` key, and the
+    applied sign is recorded in the load report. A sanity check follows: over a
+    large mutation set the mean ddG must be negative, because random
+    substitutions are destabilising on average. A positive mean is reported
+    loudly, since the most likely cause is an unlabelled convention flip.
 
     Grouping for leakage control: stability groups by parent sequence, and
     pathogenicity groups by gene where a gene column exists, falling back to the
@@ -141,6 +184,13 @@ def load_mutation_table(
             f"{path}: could not find columns for {missing}. Present: {list(df.columns)}. "
             f"Set the real names under this dataset's key in configs/data.yaml."
         )
+
+    sign, sign_key = (_resolve_ddg_sign(overrides) if kind == "stability" else (1.0, "n/a"))
+    report.notes["ddg_sign"] = sign_key
+    report.notes["convention"] = DDG_CONVENTION if kind == "stability" else "n/a"
+
+    if kind != "stability":
+        _reject_legacy_integer_labels(df[col["label"]], path)
 
     wt = df[col["wt_seq"]].astype(str).str.upper()
     mt = df[col["mt_seq"]].astype(str).str.upper()
@@ -169,7 +219,7 @@ def load_mutation_table(
         }
         if kind == "stability":
             try:
-                rec["target"] = float(df[col["target"]].iat[i])
+                rec["target"] = sign * float(df[col["target"]].iat[i])
             except (TypeError, ValueError):
                 report.drop("unparseable_target")
                 continue
@@ -181,9 +231,13 @@ def load_mutation_table(
             )
             rec["group"] = w
         else:
-            rec["label"] = _binary_label(df[col["label"]].iat[i])
+            raw_label = df[col["label"]].iat[i]
+            rec["label"] = _binary_label(raw_label)
             if rec["label"] is None:
                 report.drop("unmappable_label")
+                # Which terms were rejected, so an unrecognised vocabulary shows
+                # up in the leakage report rather than vanishing.
+                report.note_value("rejected_label_terms", raw_label)
                 continue
             rec["group"] = str(df[col["gene"]].iat[i]) if col["gene"] else w
 
@@ -192,26 +246,144 @@ def load_mutation_table(
 
     out = pd.DataFrame.from_records(records)
     report.rows_out = len(out)
+
+    if kind == "stability" and len(out) >= 100:
+        mean_ddg = float(out["target"].mean())
+        report.notes["mean_ddg_after_sign_normalisation"] = mean_ddg
+        if mean_ddg > 0:
+            # Random substitutions are destabilising on average, so a positive
+            # mean under the internal convention almost always means the source
+            # table uses the opposite sign and ddg_sign was left at its default.
+            print(
+                f"[load] WARNING: mean ddG is {mean_ddg:+.3f} after applying "
+                f"ddg_sign={sign_key!r}. Under {DDG_CONVENTION}, the mean over a "
+                f"large mutation set should be NEGATIVE. This table may use the "
+                f"opposite convention - set ddg_sign: destabilizing_positive "
+                f"under its key in configs/data.yaml. Correlation metrics are "
+                f"invariant to this flip and will NOT reveal it."
+            )
+            report.notes["sign_warning"] = (
+                "mean ddG is positive under the internal convention; the source "
+                "table may use the opposite sign"
+            )
+
     return out.reset_index(drop=True), report
 
 
+def _reject_legacy_integer_labels(series: pd.Series, path: str) -> None:
+    """
+    Refuse a numeric label column that looks like the legacy integer CLNSIG scale.
+
+    That encoding is 0 Uncertain, 2 Benign, 3 Likely benign, 4 Likely pathogenic,
+    5 Pathogenic. Reading it as "any nonzero is pathogenic" silently maps Benign
+    and Likely-benign to the positive class, which is not recoverable from the
+    run artifacts - so it fails here instead.
+    """
+    if not pd.api.types.is_numeric_dtype(series):
+        return
+    values = set(pd.unique(series.dropna()).tolist())
+    if values and not values <= {0, 1, 0.0, 1.0, True, False}:
+        raise ValueError(
+            f"{path}: the label column holds numeric values {sorted(values)[:8]}, "
+            f"which is not a 0/1 encoding. If this is the legacy integer CLNSIG "
+            f"scale (2=Benign, 3=Likely benign, 4=Likely pathogenic, 5=Pathogenic), "
+            f"map it to the CLNSIG text vocabulary or to explicit 0/1 before "
+            f"loading. Holo-GeoN will not guess: reading 'any nonzero' as "
+            f"pathogenic silently labels benign variants pathogenic."
+        )
+
+
+# ClinVar CLNSIG vocabulary, matched exactly rather than by substring.
+#
+# Round-1 review, R1-04: substring matching mapped
+# `Conflicting_interpretations_of_pathogenicity` to pathogenic, because the
+# string contains "pathogenic". Conflicting-classification variants are one of
+# the largest CLNSIG classes and are explicitly NOT a pathogenic call - ACMG
+# treats them as unresolved. They are also the hardest, most ambiguous variants,
+# so assigning them all to the positive class corrupts the labels and inflates
+# the positive rate. Because those rows were *kept*, nothing in the exclusion
+# accounting revealed it.
+_BENIGN_TERMS = {
+    "benign",
+    "likely_benign",
+    "benign/likely_benign",
+}
+_PATHOGENIC_TERMS = {
+    "pathogenic",
+    "likely_pathogenic",
+    "pathogenic/likely_pathogenic",
+}
+# Present in ClinVar and deliberately not a binary call. Listed explicitly so a
+# new vocabulary term is dropped-and-counted rather than guessed at.
+_UNRESOLVED_TERMS = {
+    "conflicting_interpretations_of_pathogenicity",
+    "conflicting_classifications_of_pathogenicity",
+    "uncertain_significance",
+    "uncertain_risk_allele",
+    "not_provided",
+    "no_classification_for_the_single_variant",
+    "no_classification_from_unflagged_records",
+    "drug_response",
+    "association",
+    "association_not_found",
+    "risk_factor",
+    "protective",
+    "affects",
+    "confers_sensitivity",
+    "other",
+}
+
+
+def _normalise_clnsig(value: str) -> str:
+    """Canonical form of a CLNSIG term: lowercase, underscores, no modifiers."""
+    s = str(value).strip().lower().replace(" ", "_")
+    # ClinVar appends secondary terms after '|' and penetrance modifiers after
+    # ',': `Likely_pathogenic|other`, `Pathogenic,_low_penetrance`. The primary
+    # classification is the first field.
+    s = s.split("|", 1)[0]
+    s = s.split(",", 1)[0]
+    return s.strip("_")
+
+
 def _binary_label(value) -> int | None:
-    """Map a clinical-significance value to 1 (pathogenic) / 0 (benign)."""
-    if isinstance(value, (int, np.integer)) or isinstance(value, (float, np.floating)):
-        if pd.isna(value):
-            return None
-        return int(value != 0)
-    s = str(value).strip().lower()
+    """
+    Map a clinical-significance value to 1 (pathogenic) / 0 (benign), or None.
+
+    None means "not a binary call" and the caller counts it as an exclusion.
+    Anything outside the known vocabulary returns None rather than being
+    guessed at, so an unrecognised term shows up in the leakage report instead
+    of silently joining a class.
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, (bool, np.bool_)):
+        return int(value)
+    if isinstance(value, (int, np.integer, float, np.floating)):
+        # Only an explicit 0/1 encoding is accepted. The legacy integer CLNSIG
+        # scale (0 Uncertain, 2 Benign, 3 Likely benign, 4 Likely pathogenic,
+        # 5 Pathogenic) is NOT interpreted here: reading "any nonzero" as
+        # pathogenic silently mapped Benign and Likely-benign to the positive
+        # class, and that is not recoverable from the run artifacts.
+        v = float(value)
+        if v == 0.0:
+            return 0
+        if v == 1.0:
+            return 1
+        return None
+
+    s = _normalise_clnsig(value)
     if not s or s == "nan":
         return None
-    if "benign" in s:
+    if s in _UNRESOLVED_TERMS:
+        return None
+    if s in _BENIGN_TERMS:
         return 0
-    if "pathogenic" in s or "deleterious" in s:
+    if s in _PATHOGENIC_TERMS:
         return 1
-    if s in {"0", "false"}:
+    if s in {"true", "yes"}:
+        return 1
+    if s in {"false", "no"}:
         return 0
-    if s in {"1", "true"}:
-        return 1
     return None
 
 
@@ -298,19 +470,39 @@ def build_sample_graph(
     site: int | None,
     window: int,
     cfg: dict,
+    max_nodes: int | None = None,
 ) -> dict:
     """
-    Window one cached protein and build both edge sets.
+    Build both edge sets for one cached protein.
 
     ``record`` is an :class:`EncodingStore` entry. ``site`` is the mutation
-    position in whole-protein coordinates, or None for whole-sequence tasks
-    (which window from the start).
+    position in whole-protein coordinates.
+
+    With a ``site``, the graph covers a ``window``-long slice centred on it, so
+    the mutation is always present and always in context.
+
+    With ``site is None`` — the whole-sequence tasks — the graph covers the
+    **entire protein**, not a window. Round-1 review, R1-07: anchoring at 0 and
+    windowing gave those heads residues [0, window) only, which is precisely the
+    head truncation this project exists to remove. It is worst for the radius of
+    gyration, which is dominated by chain length (R_g = R_0 N^v): a 900-residue
+    and a 300-residue chain sharing an N-terminus were indistinguishable, and
+    the mask could not even recover the length. ``max_nodes`` caps pathological
+    inputs; when it bites, the caller is told via ``truncated`` rather than
+    finding out from a silently short mask.
     """
     emb = record["emb"]
     length = emb.shape[0]
-    anchor = 0 if site is None else min(site, length - 1)
-    start, end = window_bounds(length, anchor, window)
-    n = end - start
+    truncated = False
+
+    if site is None:
+        n = length if max_nodes is None else min(length, max_nodes)
+        truncated = n < length
+        start, end, anchor = 0, n, 0
+    else:
+        anchor = min(site, length - 1)
+        start, end = window_bounds(length, anchor, window)
+        n = end - start
 
     esm = emb[start:end].float()
 
@@ -349,6 +541,11 @@ def build_sample_graph(
         "site": local_site,
         "neighborhood": neighborhood,
         "n": n,
+        # True chain length, independent of how many residues this graph holds.
+        # The whole-sequence heads need it explicitly: pooling cannot recover a
+        # length the graph does not span.
+        "length": length,
+        "truncated": truncated,
     }
 
 
@@ -402,7 +599,11 @@ class SequenceDataset(Dataset):
     def __getitem__(self, i: int) -> dict:
         row = self.df.iloc[i]
         rec = self.store.get(row["parent_seq"])
-        g = build_sample_graph(rec, None, self.window, self.cfg)
+        # site=None -> the whole protein, not a window (see build_sample_graph).
+        g = build_sample_graph(
+            rec, None, self.window, self.cfg,
+            max_nodes=int(self.cfg.get("max_sequence_nodes", 2048)),
+        )
         g["wt_idx"] = 0
         g["mt_idx"] = 0
         g["y"] = float(row["target"])
@@ -469,6 +670,11 @@ def collate_graphs(samples: list[dict]) -> dict:
         "mt_idx": torch.tensor([s["mt_idx"] for s in samples], dtype=torch.long),
         "y": torch.tensor([s["y"] for s in samples], dtype=torch.float32),
         "sigma": torch.tensor([s["sigma"] for s in samples], dtype=torch.float32),
+        # True chain length per sample. The whole-sequence heads consume it
+        # directly; a pool over the graph cannot recover it.
+        "seq_length": torch.tensor(
+            [float(s.get("length", s["n"])) for s in samples], dtype=torch.float32
+        ),
     }
     if "species_id" in samples[0]:
         batch["species_id"] = torch.tensor(

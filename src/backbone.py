@@ -84,10 +84,12 @@ class DualStreamGNN(nn.Module):
         hidden, out_dim : GATv2 sizes.
         heads           : GATv2 attention heads.
         use_ssm         : run the selective state-space mixer.
-        use_mech_stream : enable the E_mech stream. The shipped model is
-                          dual-stream; this exists so the ablation runner can
-                          measure the mechanistic stream's contribution against
-                          an otherwise identical model.
+        use_mech_stream : enable the E_mech (translational coupling) stream.
+        use_geo_stream  : enable the E_geo (spatial contact) stream.
+                          The shipped model runs both; these exist so the
+                          ablation runner can measure one stream's contribution
+                          against an otherwise identical model. At least one
+                          must be enabled.
     """
 
     def __init__(
@@ -99,24 +101,30 @@ class DualStreamGNN(nn.Module):
         heads: int = 4,
         use_ssm: bool = True,
         use_mech_stream: bool = True,
+        use_geo_stream: bool = True,
         dropout: float = 0.1,
     ):
         super().__init__()
         if not PYG_AVAILABLE:
             raise ImportError(_PYG_HINT)
+        if not (use_geo_stream or use_mech_stream):
+            raise ValueError("at least one message-passing stream must be enabled")
 
         self.esm_dim = esm_dim
         self.mech_dim = mech_dim
         self.out_dim = out_dim
         self.use_mech_stream = use_mech_stream
+        self.use_geo_stream = use_geo_stream
 
         self.ssm = SelectiveSSM(dim=esm_dim) if use_ssm else None
         self.fusion = CrossAttentionFusion(esm_dim=esm_dim, mech_dim=mech_dim, heads=heads)
 
         node_dim = esm_dim + mech_dim
-        self.geo_stream = _Stream(node_dim, hidden, out_dim, heads)
+        if use_geo_stream:
+            self.geo_stream = _Stream(node_dim, hidden, out_dim, heads)
         if use_mech_stream:
             self.mech_stream = _Stream(node_dim, hidden, out_dim, heads)
+        if use_geo_stream and use_mech_stream:
             self.fuse = nn.Linear(2 * out_dim, out_dim)
 
         self.residual_proj = nn.Linear(esm_dim, out_dim, bias=False)
@@ -159,12 +167,12 @@ class DualStreamGNN(nn.Module):
 
         # 3. message passing over each stream
         x_flat = nodes.reshape(B * L, -1)
-        g = self.geo_stream(x_flat, edge_geo, attr_geo)
-        if self.use_mech_stream:
-            m = self.mech_stream(x_flat, edge_mech, attr_mech)
+        g = self.geo_stream(x_flat, edge_geo, attr_geo) if self.use_geo_stream else None
+        m = self.mech_stream(x_flat, edge_mech, attr_mech) if self.use_mech_stream else None
+        if g is not None and m is not None:
             h = self.fuse(torch.cat([g, m], dim=-1))
         else:
-            h = g
+            h = g if g is not None else m
 
         # 4. language-model residual + norm
         h = self.norm(h + self.residual_proj(x_esm.reshape(B * L, -1)))

@@ -43,7 +43,12 @@ split_method: mmseqs
 identity: 0.30
 coverage: 0.80
 cv_folds: 5
+
+# Seeding. Round-1 review found nothing in the training path was seeded, so two
+# runs of the same command differed by 0.030 test Pearson - larger than most
+# ablation effects. Everything stochastic now derives from this.
 seed: 42
+strict_determinism: false   # deterministic kernels: slower, bit-reproducible
 
 # --- graph -----------------------------------------------------------------
 graph_top_k: 16
@@ -60,7 +65,12 @@ gat_heads: 4
 aa_dim: 32
 dropout: 0.1
 use_ssm: true
+# Ablation axes. The shipped model has all three on; scripts/ablations.py flips
+# one at a time so a component's contribution is measured against an otherwise
+# identical model.
 use_mech_stream: true
+use_geo_stream: true
+site_anchored_readout: true
 
 # --- training --------------------------------------------------------------
 # Epochs is an upper bound: training stops early when the primary validation
@@ -76,3 +86,12 @@ grad_clip: 1.0
 amp: true
 num_workers: 4
 max_rows: null
+
+# Multi-task sampling: tasks are drawn in proportion to len(loader) ** this.
+# 1.0 is strictly proportional, 0.0 gives every task the same number of steps
+# (which replayed a 300-row table ~844x per epoch against a 270k-row one).
+task_sampling_temperature: 0.5
+
+# Whole-sequence tasks span the entire protein rather than a window; this caps
+# pathological inputs, and the cap is reported when it bites.
+max_sequence_nodes: 2048

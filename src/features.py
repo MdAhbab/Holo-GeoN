@@ -3,7 +3,7 @@ src/features.py
 ===============
 Per-residue mechanistic features.
 
-Seven channels, in a fixed order:
+Eight channels, in a fixed order:
 
     0  mrna_fold   local mRNA minimum free energy per nucleotide (ViennaRNA)
     1  cai         per-codon relative adaptiveness (reference codon-usage table)
@@ -12,9 +12,10 @@ Seven channels, in a fixed order:
     4  volume      side-chain van der Waals volume, normalised to [0, 1]
     5  helix       Chou-Fasman P_alpha helix propensity, normalised to [0, 1]
     6  mech_valid  1.0 where channels 0-1 are real, 0.0 where they are absent
+    7  aa_known    1.0 for one of the 20 standard residues, 0.0 for B/Z/X/U/O
 
-Channels 2-5 are computable from the amino-acid sequence alone and are always
-real. Channels 0-1 need a **coding sequence** and are zeroed without one.
+Channels 2-5 and 7 are computable from the amino-acid sequence alone and are
+always real. Channels 0-1 need a **coding sequence** and are zeroed without one.
 
 On the removal of back-translation
 ----------------------------------
@@ -48,9 +49,20 @@ except Exception:  # pragma: no cover - environment dependent
     RNA = None
     VIENNA_AVAILABLE = False
 
-N_MECH_CHANNELS = 7
+N_MECH_CHANNELS = 8
 
-CH_MRNA, CH_CAI, CH_CHARGE, CH_HYDRO, CH_VOLUME, CH_HELIX, CH_VALID = range(7)
+CH_MRNA, CH_CAI, CH_CHARGE, CH_HYDRO, CH_VOLUME, CH_HELIX, CH_VALID, CH_AA_KNOWN = range(8)
+
+#: Neutral fallbacks for a non-standard residue (B, Z, X, U, O).
+#:
+#: Round-1 review, R1-24: the scalar channels fell back inconsistently -
+#: hydropathy and helix propensity landed mid-scale, but volume fell back to
+#: 0.0, which is SMALLER than glycine. The network was being told "this side
+#: chain is smaller than any real residue" rather than "this residue is
+#: unknown". Mid-scale defaults plus an explicit aa_known flag say the latter.
+_UNKNOWN_HYDRO = 0.5
+_UNKNOWN_VOLUME = 0.5
+_UNKNOWN_HELIX = 0.5
 
 # --- residue tables -------------------------------------------------------
 _RESIDUE_CHARGE: dict[str, float] = {
@@ -204,10 +216,17 @@ def mechanistic_features(
 
     for i in range(L):
         aa = protein_seq[i].upper()
+        known = aa in KD_HYDROPATHY
         feat[i, CH_CHARGE] = charge[i]
-        feat[i, CH_HYDRO] = _scaled(KD_HYDROPATHY, aa, _KD_MIN, _KD_MAX, 0.0)
-        feat[i, CH_VOLUME] = min(1.0, RESIDUE_VOLUME.get(aa, 0.0) / _VOL_MAX)
-        feat[i, CH_HELIX] = _scaled(HELIX_PROPENSITY, aa, _PA_MIN, _PA_MAX, 1.0)
+        feat[i, CH_AA_KNOWN] = 1.0 if known else 0.0
+        if known:
+            feat[i, CH_HYDRO] = _scaled(KD_HYDROPATHY, aa, _KD_MIN, _KD_MAX, 0.0)
+            feat[i, CH_VOLUME] = min(1.0, RESIDUE_VOLUME[aa] / _VOL_MAX)
+            feat[i, CH_HELIX] = _scaled(HELIX_PROPENSITY, aa, _PA_MIN, _PA_MAX, 1.0)
+        else:
+            feat[i, CH_HYDRO] = _UNKNOWN_HYDRO
+            feat[i, CH_VOLUME] = _UNKNOWN_VOLUME
+            feat[i, CH_HELIX] = _UNKNOWN_HELIX
         if have_cds:
             feat[i, CH_MRNA] = mrna[i]
             feat[i, CH_CAI] = cai[i]
@@ -219,7 +238,8 @@ def mechanistic_features(
 __all__ = [
     "N_MECH_CHANNELS",
     "VIENNA_AVAILABLE",
-    "CH_MRNA", "CH_CAI", "CH_CHARGE", "CH_HYDRO", "CH_VOLUME", "CH_HELIX", "CH_VALID",
+    "CH_MRNA", "CH_CAI", "CH_CHARGE", "CH_HYDRO", "CH_VOLUME", "CH_HELIX",
+    "CH_VALID", "CH_AA_KNOWN",
     "KD_HYDROPATHY", "RESIDUE_VOLUME", "HELIX_PROPENSITY",
     "mechanistic_features", "cai_per_residue", "cai_sequence",
     "charge_per_residue", "mrna_fold_per_residue",

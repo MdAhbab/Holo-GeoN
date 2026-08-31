@@ -13,10 +13,13 @@ Two decisions worth stating.
 
 **Contact head, not attention map.** Edges come from ``predict_contacts``,
 whose output is supervised against real structural contacts, rather than from
-raw attention. The repository's own ``scripts/contact_sanity.py`` measures a
-0.252 long-range fraction (|i-j| >= 24) among top-L contact-head pairs versus
-0.000 for a sequence-proximity baseline — that non-local signal is the whole
-reason for building a graph instead of a chain.
+raw attention. Whether that actually carries non-local signal on your data is
+measured, not asserted: run ``scripts/contact_sanity.py`` after precompute and
+read ``results/contacts/contact_sanity.json``. It reports the long-range
+fraction (|i-j| >= 24) among top-L predicted pairs against a sequence-proximity
+baseline whose long-range fraction is 0 by construction. That gap is the whole
+reason for building a graph instead of a chain, and it is the first thing to
+check if the geometric stream underperforms.
 
 **Sparse, full-length storage.** A dense ``L x L`` map costs O(L^2) on disk and
 is thrown away immediately after thresholding; storing the top-k neighbours per
@@ -33,6 +36,7 @@ see :func:`EsmEncoder.encode` for what that does and does not preserve.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 
 import torch
@@ -200,8 +204,16 @@ class EsmEncoder(nn.Module):
             edges, probs = sparse_topk_contacts(cm, top_k, min_sep)
         else:
             emb = torch.zeros((L, self.dim), dtype=torch.float32)
-            # Distance from the nearest chunk boundary, per residue; a later
-            # chunk only overwrites a residue if it sees it with more context.
+            # Selection score per residue: distance from the nearest chunk
+            # boundary, capped at half the chunk length.
+            #
+            # Round-1 review, R1-26: using boundary distance alone, a residue in
+            # the overlap could be taken from a SHORT tail chunk simply because
+            # it sat nearer that chunk's middle - 128 residues per boundary, for
+            # every protein over the context limit, drawn from a fragment with
+            # strictly less context than the full-length chunk that also covered
+            # them. Capping at chunk_length/2 makes a short chunk unable to
+            # outscore a long one, so a residue never moves to less context.
             best_margin = torch.full((L,), -1.0)
             all_edges, all_probs = [], []
             for start, end in spans:
@@ -209,6 +221,7 @@ class EsmEncoder(nn.Module):
                 n = end - start
                 pos = torch.arange(n)
                 margin = torch.minimum(pos, torch.tensor(n - 1) - pos).float()
+                margin = torch.clamp(margin, max=n / 2.0)
                 take = margin > best_margin[start:end]
                 emb[start:end][take] = c_emb[take]
                 best_margin[start:end][take] = margin[take]
@@ -296,6 +309,39 @@ class EncodingStore:
         torch.save(rec, tmp)
         os.replace(tmp, dst)
         return dst
+
+    # -- manifest ----------------------------------------------------------
+    # A cache directory is a pile of opaque .pt files, so nothing downstream can
+    # tell what produced it: which encoder, at what contact settings, and - the
+    # one that silently changes what the model is - how many parents carried a
+    # real coding sequence. Round-1 review R1-05 turned on exactly that
+    # invisibility: E_mech was empty for a whole run and no artifact said so.
+    # The manifest makes coverage a recorded number that train.py copies into
+    # metrics.json, so a claim about the mechanistic stream can be checked
+    # against the cache the run actually read.
+    MANIFEST = "manifest.json"
+
+    def manifest_path(self) -> str:
+        return os.path.join(self.cache_dir, self.MANIFEST)
+
+    def manifest(self) -> dict:
+        """The cache manifest, or ``{}`` if the cache predates one."""
+        try:
+            with open(self.manifest_path(), encoding="utf-8") as fh:
+                return json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def write_manifest(self, entries: dict) -> str:
+        """Merge ``entries`` into the manifest and write it atomically."""
+        merged = self.manifest()
+        merged.update(entries)
+        os.makedirs(self.cache_dir, exist_ok=True)
+        tmp = self.manifest_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(merged, fh, indent=2, sort_keys=True)
+        os.replace(tmp, self.manifest_path())
+        return self.manifest_path()
 
     @staticmethod
     def projected_bytes(total_residues: int, dim: int, top_k: int) -> int:

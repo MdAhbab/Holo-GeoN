@@ -1,27 +1,32 @@
 """
 src/sequence_mixers.py
 ======================
-Future-work architectural modules (paper §8.2), implemented as **optional**,
-self-contained, weight-compatible blocks that the backbone can switch on:
+Two residue-axis mixers used by the backbone. **Both are on in the shipped
+model** — ``src/model.py`` defaults ``use_ssm=True`` and ``src/backbone.py``
+constructs the fusion unconditionally. They are exposed as constructor flags so
+``scripts/ablations.py`` can hold everything else fixed and measure one
+component, not because either is optional in the configuration you would train.
 
-  • CrossAttentionFusion (§8.2-i)
-        Replaces the simple geometric stacking ``cat([esm, mech])`` with explicit
-        cross-modal attention between the evolutionary (ESM-2) and mechanistic
-        tracks.  It still emits a 323-dim node tensor (320 fused ESM + 3 raw
-        mechanistic channels) so the rest of the backbone is unchanged.
+  * ``CrossAttentionFusion``
+        Cross-modal attention between the language-model track (queries) and the
+        mechanistic channels (keys/values), so mechanistic context modulates the
+        evolutionary representation rather than being concatenated beside it.
+        Emits ``esm_dim + mech_dim`` per residue — at the shipped configuration
+        that is 1280 + 8 = 1288.
 
-  • SelectiveSSM (§8.2-ii, "Mamba")
-        A linear-time state-space sequence mixer over the residue dimension.
-        If the real ``mamba_ssm`` package is installed it is used directly;
-        otherwise a dependency-free selective state-space recurrence (S6-style,
-        input-dependent gating) is used so the module runs anywhere, including
-        on CPU.  Either way the input/output shape is (B, L, D).
+  * ``SelectiveSSM``
+        A linear-time selective state-space mixer over residues, giving every
+        residue a cheap view of the whole window before any graph structure is
+        imposed. Uses ``mamba_ssm`` when installed (CUDA only); otherwise a
+        dependency-free S6-style recurrence solved by a parallel associative
+        scan, which runs anywhere including CPU. Either way the shape contract
+        is (B, L, D) in, (B, L, D) out.
 
-Both default to OFF in the backbone, so existing behaviour and any existing
-checkpoints are preserved unless explicitly enabled.
+Round-1 review, R1-22: this docstring previously said both modules "default to
+OFF ... unless explicitly enabled", referenced "paper §8.2", and sized the
+fusion at 320 + 3 = 323 dimensions. All three were wrong for the shipped model,
+and method sections get written from module docstrings.
 """
-
-from __future__ import annotations
 
 import torch
 import torch.nn as nn
@@ -44,15 +49,15 @@ class CrossAttentionFusion(nn.Module):
 
     ESM embeddings act as the *query*; the (projected) mechanistic features act as
     *key*/*value*, so each residue's evolutionary representation is refined by the
-    mechanistic context most relevant to it.  Output keeps the 323-dim contract.
+    mechanistic context most relevant to it. Output is ``esm_dim + mech_dim``.
 
     Args:
-        esm_dim   : ESM-2 hidden size (320).
-        mech_dim  : number of mechanistic channels (3).
+        esm_dim   : language-model hidden size (1280 for ESM-2 650M).
+        mech_dim  : number of mechanistic channels (8).
         heads     : attention heads.
     """
 
-    def __init__(self, esm_dim: int = 320, mech_dim: int = 3, heads: int = 4):
+    def __init__(self, esm_dim: int = 1280, mech_dim: int = 8, heads: int = 4):
         super().__init__()
         self.esm_dim = esm_dim
         self.mech_dim = mech_dim
@@ -78,7 +83,7 @@ class CrossAttentionFusion(nn.Module):
             key_padding_mask=key_padding_mask, need_weights=False,
         )
         fused_esm = self.norm(esm + attn_out)                # residual + norm
-        # Preserve the raw mechanistic channels so GAT_IN_CHANNELS stays 323.
+        # Keep the raw mechanistic channels alongside the fused representation.
         return torch.cat([fused_esm, mech], dim=-1)
 
 

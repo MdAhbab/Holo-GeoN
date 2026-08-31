@@ -66,6 +66,7 @@ class HoloGeoNEngine:
         self._device = None
         self._config: dict = {}
         self._calibration: Optional[dict] = None
+        self._sigma_scale: float = 1.0
         self._untrained_heads: list[str] = []
 
     # ------------------------------------------------------------------
@@ -113,7 +114,13 @@ class HoloGeoNEngine:
             )
             if CALIBRATION_PATH.exists():
                 with open(CALIBRATION_PATH, encoding="utf-8") as fh:
-                    self._calibration = json.load(fh).get("calibration")
+                    payload = json.load(fh)
+                self._calibration = payload.get("calibration")
+                # A scale fitted on the validation split, applied to every sigma
+                # the interface reports. Without it a measured miscalibration
+                # had no remedy anywhere in the codebase.
+                scale = (payload.get("variance_scale") or {}).get("scale")
+                self._sigma_scale = float(scale) if scale else 1.0
             self._ready = True
         except Exception as exc:  # noqa: BLE001
             self._error = f"{exc.__class__.__name__}: {exc}"
@@ -139,38 +146,63 @@ class HoloGeoNEngine:
             "esm_model": self._config.get("esm_model"),
             "window": self._config.get("window"),
             "untrained_heads": self._untrained_heads,
-            # The interface may only present an interval as calibrated if a
-            # calibration run measured it. Absent that, it says so.
-            "uncertainty_calibrated": bool(cal),
+            # Round-1 review, R1-14: this used to be `bool(cal)` - the existence
+            # of a file. A calibration run measuring 11% coverage for a 95% band
+            # flipped the interface to "calibrated". It now reports the VERDICT
+            # the calibration run computed from its own numbers, and surfaces
+            # those numbers so a reader can check it.
+            "uncertainty_calibrated": bool(cal.get("well_calibrated", False)),
+            "sigma_scale": self._sigma_scale,
             "calibration": {
                 "expected_calibration_error": cal.get("expected_calibration_error"),
+                "max_coverage_gap": cal.get("max_coverage_gap"),
                 "observed_coverage": cal.get("coverage_observed"),
+                "well_calibrated": cal.get("well_calibrated"),
                 "measured_on": str(CALIBRATION_PATH),
             } if cal else None,
         }
 
     # ------------------------------------------------------------------
-    def _context_for(self, seq: str, site: int):
-        """Encode a sequence and build the model context at one site."""
-        from src.data import build_sample_graph, collate_graphs, move_batch
+    def _encode_once(self, seq: str) -> dict:
+        """
+        Encode a sequence. The result does not depend on any mutation site, so
+        a scan reuses it across every position.
 
-        torch = self._torch
+        Round-1 review, R1-13: the scan called this per position on the
+        identical, unchanged sequence, so a 600-position heatmap ran 600
+        identical ESM-2 forward passes. The docstrings claimed "one encoder
+        pass"; the implementation did L.
+        """
+        from src.features import mechanistic_features
+
         rec = self._encoder.encode(
             seq,
             top_k=self._config.get("contact_top_k", 24),
             min_sep=self._config.get("contact_min_sep", 3),
         )
-        from src.features import mechanistic_features
-
         # A sequence typed into the interface carries no coding sequence, so the
         # mechanistic channels are masked (mech_valid = 0) and E_mech is empty
         # for it. That is the same handling the training pipeline gives a row
         # without a CDS.
         rec["mech"] = mechanistic_features(seq, None, len(seq)).half()
+        return rec
 
-        graph = build_sample_graph(rec, site, self._config.get("window", 256), self._config)
-        graph.update({"wt_idx": 0, "mt_idx": 0, "y": 0.0, "sigma": float("nan")})
-        batch = move_batch(collate_graphs([graph]), self._device)
+    def _batch_for_sites(self, rec: dict, sites: list[int]):
+        """Build one batch of per-site graphs from an already-encoded protein."""
+        from src.data import build_sample_graph, collate_graphs, move_batch
+
+        window = self._config.get("window", 256)
+        graphs = []
+        for site in sites:
+            g = build_sample_graph(rec, site, window, self._config)
+            g.update({"wt_idx": 0, "mt_idx": 0, "y": 0.0, "sigma": float("nan")})
+            graphs.append(g)
+        return move_batch(collate_graphs(graphs), self._device)
+
+    def _context_for(self, seq: str, site: int):
+        """Encode a sequence and build the model context at one site."""
+        torch = self._torch
+        batch = self._batch_for_sites(self._encode_once(seq), [site])
         with torch.no_grad():
             z = self._model.context(batch)
         return z, batch
@@ -193,7 +225,16 @@ class HoloGeoNEngine:
             three = torch.softmax(self._model.three_state(batch, z), dim=-1)[0]
 
         ddg = float(ddg_t.item())
-        sigma = float(torch.exp(0.5 * logvar_t).item())
+        sigma = float(torch.exp(0.5 * logvar_t).item()) * self._sigma_scale
+        classes = ["destabilizing", "neutral", "stabilizing"]
+        # Round-1 review, R1-25: the verdict was a strict sign test with no
+        # neutral case, in a payload that simultaneously reported a three-class
+        # probability including "neutral" - so a ddG of +0.006 was rendered
+        # "stabilizing" while the head's own argmax said neutral. It now comes
+        # from the head that has a defined neutral class, and the payload says
+        # so.
+        verdict = classes[int(torch.argmax(three).item())]
+        cal = self._calibration or {}
         return {
             "mutation": f"{wt_aa}{site + 1}{mut_aa}",
             "position": site + 1,
@@ -203,14 +244,19 @@ class HoloGeoNEngine:
             "sigma": round(sigma, 4),
             "ci_low": round(ddg - Z95 * sigma, 4),
             "ci_high": round(ddg + Z95 * sigma, 4),
-            "ci_source": "model predicted sigma (Gaussian, 95%)",
-            "uncertainty_calibrated": bool(self._calibration),
+            "ci_source": (
+                "model predicted sigma (Gaussian, 95%)"
+                + (f", rescaled by {self._sigma_scale:.3f} from calibration"
+                   if self._sigma_scale != 1.0 else "")
+            ),
+            "uncertainty_calibrated": bool(cal.get("well_calibrated", False)),
             "three_state": {
                 "destabilizing": round(float(three[0]), 4),
                 "neutral": round(float(three[1]), 4),
                 "stabilizing": round(float(three[2]), 4),
             },
-            "verdict": "stabilizing" if ddg > 0 else "destabilizing",
+            "verdict": verdict,
+            "verdict_source": "three-state head argmax",
         }
 
     # ------------------------------------------------------------------
@@ -281,7 +327,7 @@ class HoloGeoNEngine:
         _, batch = self._context_for(seq, 0)
         with torch.no_grad():
             mu_t, sigma_t = self._model.idr(batch)
-        mu, sigma = float(mu_t.item()), float(sigma_t.item())
+        mu, sigma = float(mu_t.item()), float(sigma_t.item()) * self._sigma_scale
         return {
             "length": len(seq),
             "mu": round(mu, 4),
@@ -294,7 +340,7 @@ class HoloGeoNEngine:
 # ---------------------------------------------------------------------------
 def clean_sequence(seq: str) -> str:
     """Uppercase, strip FASTA headers and whitespace, validate the alphabet."""
-    from src.substitution import AA_ORDER
+    from src.substitution import AA_ORDER, NON_STANDARD_AA
 
     if not seq:
         raise ValueError("empty sequence")
@@ -302,11 +348,22 @@ def clean_sequence(seq: str) -> str:
     seq = "".join("".join(lines).split()).upper()
     if not seq:
         raise ValueError("sequence contains no residues")
-    bad = sorted(set(seq) - set(AA_ORDER))
+    # Round-1 review, R1-24: rejecting the whole sequence for a single B/Z/X/U/O
+    # meant the interface refused UniProt entries the training path accepts.
+    # Non-standard residues are allowed and flagged by the aa_known channel; the
+    # nucleotide check below is what actually needs to fail loudly.
+    bad = sorted(set(seq) - set(AA_ORDER) - set(NON_STANDARD_AA))
     if bad:
         raise ValueError(
             f"invalid amino-acid symbol(s): {''.join(bad)}. This field takes a "
-            f"PROTEIN sequence, not nucleotides."
+            f"PROTEIN sequence."
+        )
+    if len(seq) >= 8 and set(seq) <= set("ACGTU"):
+        raise ValueError(
+            "this looks like a nucleotide sequence. A, C, G, T and U are all "
+            "valid amino-acid letters, so a protein language model would accept "
+            "it silently and return meaningless predictions. Paste the PROTEIN "
+            "sequence."
         )
     if len(seq) > MAX_SEQ_LENGTH:
         raise ValueError(f"sequence too long ({len(seq)} > {MAX_SEQ_LENGTH})")

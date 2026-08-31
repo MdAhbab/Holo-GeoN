@@ -14,6 +14,17 @@
 #   wt_seq  wild-type / reference PROTEIN sequence   (this is the parent that gets encoded)
 #   mt_seq  mutant / alternate PROTEIN sequence      (used only to locate the substitution)
 #   target  numeric ddG label                        (stability)
+#   ddg_sign  which sign convention the target uses:
+#             stabilizing_positive (default) | destabilizing_positive
+#             Holo-GeoN's internal convention is ddG = dG_mut - dG_wt, so
+#             POSITIVE means STABILISING. Correlation metrics are invariant to a
+#             global sign flip, so an inverted table produces an excellent r
+#             while every qualitative claim - the three-state labels, the
+#             interface verdict, the zero-shot direction - is backwards, with
+#             nothing in any artifact revealing it. Set this per dataset; the
+#             loader normalises to the internal convention, records the applied
+#             sign in the leakage report, and warns if the mean ddG comes out
+#             positive (random substitutions are destabilising on average).
 #   sigma   per-measurement ddG uncertainty          (sets the three-state neutral band)
 #   label   pathogenic / benign                      (pathogenicity)
 #   gene    gene symbol                              (merged into split grouping)
@@ -31,6 +42,7 @@ megascale_ddg_pairs:
   # wt_seq: wildtype_sequence
   # mt_seq: mutant_sequence
   # target: ddG
+  # ddg_sign: stabilizing_positive
   # sigma:  ddG_std
   # cds:    dna_seq          # real CDS -> CAI + ViennaRNA folding -> E_mech.
   #                          # Recover it with `python run.py etl --cds-source ...`

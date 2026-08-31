@@ -33,6 +33,10 @@ import torch.nn as nn
 from src.windowing import MutationParseError
 
 AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
+#: Residues that appear in real sequence databases but are not one of the 20.
+#: B = Asx, Z = Glx, X = any, U = selenocysteine, O = pyrrolysine. They map to
+#: UNKNOWN_AA_IDX and are flagged by the aa_known mechanistic channel.
+NON_STANDARD_AA = "BZXUO"
 AA_TO_IDX: dict[str, int] = {a: i for i, a in enumerate(AA_ORDER)}
 N_AMINO_ACIDS = len(AA_ORDER)
 UNKNOWN_AA_IDX = N_AMINO_ACIDS          # a dedicated slot, never a silent 0
@@ -91,6 +95,6 @@ class AminoAcidEmbedding(nn.Module):
 
 
 __all__ = [
-    "AA_ORDER", "AA_TO_IDX", "N_AMINO_ACIDS", "UNKNOWN_AA_IDX",
+    "AA_ORDER", "NON_STANDARD_AA", "AA_TO_IDX", "N_AMINO_ACIDS", "UNKNOWN_AA_IDX",
     "MutationParseError", "aa_index", "parse_mutation", "AminoAcidEmbedding",
 ]

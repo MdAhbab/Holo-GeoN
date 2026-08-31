@@ -133,25 +133,70 @@ def main() -> None:
             f"projected cache {projected_gb:.2f} GB exceeds --max-cache-gb "
             f"{args.max_cache_gb}. Use a smaller --esm-model, or cap --max-seqs."
         )
+    def record_manifest(encoded_ok: int, failed: int) -> None:
+        """
+        Write what this cache is, so downstream artifacts can cite it.
+
+        ``cds_coverage`` is the number that matters most: the mechanistic stream
+        is only fed for parents that carried a real transcript AND had ViennaRNA
+        available to fold it. If it reads 0, E_mech is self-loops only and the
+        ``no_mech_stream`` ablation is measuring nothing (R1-05).
+        """
+        active = n_with_cds if VIENNA_AVAILABLE else 0
+        store.write_manifest({
+            "esm_model": cfg.esm_model,
+            "dim": dim,
+            "contact_top_k": cfg.contact_top_k,
+            "contact_min_sep": cfg.contact_min_sep,
+            "parents_requested": len(parents),
+            "parents_encoded_this_pass": encoded_ok,
+            "encode_failures_this_pass": failed,
+            "parents_with_cds_column": n_with_cds,
+            "vienna_available": VIENNA_AVAILABLE,
+            "cds_active": active,
+            "cds_coverage": round(active / len(parents), 4) if parents else 0.0,
+        })
+
     if not todo:
         print("[precompute] cache already complete.")
+        record_manifest(0, 0)
         return
 
     device = describe_device(torch.device(cfg.device) if cfg.device else None)
     encoder = EsmEncoder(cfg.esm_model, device=str(device))
 
     failures = 0
+    encoded = 0
     for seq, dna in tqdm(list(todo.items()), desc="encoding"):
         try:
             rec = encoder.encode(seq, top_k=cfg.contact_top_k, min_sep=cfg.contact_min_sep)
             rec["mech"] = mechanistic_features(seq, dna, len(seq)).half()
             rec["has_cds"] = bool(dna) and VIENNA_AVAILABLE
+            # The coding sequence travels with the record so a single-codon
+            # substitution can rebuild a mutant's mechanistic channels from the
+            # SAME transcript (scripts/calibration.py reversibility check).
+            rec["cds"] = dna
             store.put(rec)
+            encoded += 1
         except Exception as exc:  # keep going; a single bad row must not end the pass
             failures += 1
             print(f"  ! failed (len={len(seq)}): {type(exc).__name__}: {exc}")
 
+    record_manifest(encoded, failures)
     print(f"[precompute] done. cache={cfg.cache}  failures={failures}")
+    print(f"[precompute] manifest written: {store.manifest_path()}")
+    if failures:
+        # Round-1 review, R1-06: a swallowed encoding failure left a parent with
+        # no cache entry, which downstream became a FileNotFoundError from inside
+        # a DataLoader worker - possibly twenty epochs into a two-day run. The
+        # pass reports its failures with a non-zero status so `run.py all` stops
+        # here rather than training on a silently incomplete cache.
+        raise SystemExit(
+            f"{failures} sequence(s) failed to encode. Their parents have no "
+            f"cache entry, so any row referencing them would be dropped (and "
+            f"counted) at load time. Investigate the errors above, then re-run "
+            f"precompute - it skips what is already cached."
+        )
 
 
 if __name__ == "__main__":

@@ -1,11 +1,11 @@
-# Holo-GNN backend — lightweight HTTP layer dependencies
+# Holo-GeoN web backend — HTTP layer only.
+#
+# The backend serves predictions from the trained model; it has no
+# demonstration or synthetic mode, so the modelling stack in ../../requirements.txt
+# is a hard requirement, not an optional extra. Without a checkpoint and those
+# packages the API starts and reports `model_loaded: false` on /api/health, and
+# every prediction endpoint returns 503 rather than a placeholder number.
 fastapi
 uvicorn[standard]
 requests
-numpy
 pydantic
-
-# Optional heavy stack (torch, transformers, torch-geometric) is needed only for
-# FULL (non-demo) inference mode. Those packages are listed in:
-#   ../../HoloGNN/requirements.txt
-# Install them separately if you have trained weights and want real predictions.

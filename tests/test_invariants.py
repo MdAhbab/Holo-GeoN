@@ -172,7 +172,8 @@ def test_model_invariants() -> None:
             ddg_rev, _ = model.ddg(reversed_batch, z)
             violation = float((ddg + ddg_rev).abs().max())
             check(violation == 0.0,
-                  f"[{mode}] ddG is exactly antisymmetric (max violation {violation:.2e})")
+                  f"[{mode}] ddG is exactly antisymmetric for a FIXED context "
+                  f"(max violation {violation:.2e})")
 
             ts = model.three_state(batch, z)
             ts_rev = model.three_state(reversed_batch, z)
@@ -187,10 +188,36 @@ def test_model_invariants() -> None:
             wt_col = scan.gather(1, batch["wt_idx"].view(-1, 1))
             check(float(wt_col.abs().max()) < 1e-5,
                   f"[{mode}] scan's wild-type column is zero")
+            check(scan.shape[1] == 21,
+                  f"[{mode}] scan covers 20 residues plus the unknown slot")
 
             check(bool(torch.isfinite(logvar).all()), f"[{mode}] logvar is finite")
             mu, sigma = model.idr(batch)
             check(bool((sigma > 0).all()), f"[{mode}] IDR sigma is positive")
+
+    # Round-1 review, R1-23: the checks above pass one shared context to both
+    # directions, which verifies the HEAD. The model-level property needs two
+    # independent forward passes, and holds exactly only under eval() - in train
+    # mode the readout's dropout draws an independent mask per call. The README
+    # claim is scoped accordingly, and both halves are asserted here.
+    model.eval()
+    with torch.no_grad():
+        a, _ = model.ddg(batch)
+        b, _ = model.ddg(reversed_batch)
+        indep = float((a + b).abs().max())
+        check(indep == 0.0,
+              f"[eval] ddG is exactly antisymmetric across INDEPENDENT passes "
+              f"(max violation {indep:.2e})")
+
+    model.train()
+    with torch.no_grad():
+        a, _ = model.ddg(batch)
+        b, _ = model.ddg(reversed_batch)
+        train_indep = float((a + b).abs().max())
+        check(train_indep > 0.0,
+              f"[train] independent passes differ as expected from readout "
+              f"dropout ({train_indep:.2e}) - the exactness claim is scoped to "
+              f"a fixed context, and to inference")
 
     # Padding must not change a real sample's prediction.
     model.eval()
