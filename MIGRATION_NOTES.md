@@ -21,11 +21,11 @@ What *was* run, and passes:
 
 | Check | Status |
 |---|---|
-| Unit + invariant tests (`python run.py test`) | 120 checks, all passing |
+| Unit + invariant tests (`python run.py test`) | 175 checks, all passing |
 | End-to-end pipeline on synthetic data through the real CLI stages | passing |
 | Live web backend, with and without a checkpoint, every endpoint | passing |
 | Frontend `tsc` + `vite build` | passing |
-| Hardware budget from measured tensor shapes | ~20.6M trainable params, ~0.8 GB at batch 64 |
+| Hardware budget from real tensor shapes | 20,607,788 trainable params; analytic lower bound 4.12 GB at batch 64, **no peak estimate** — see below |
 
 Everything measured in those runs used a **synthetic stub encoder** with seeded
 noise for embeddings. Those numbers describe plumbing — shapes, batching,
