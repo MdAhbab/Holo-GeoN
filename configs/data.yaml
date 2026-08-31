@@ -1,33 +1,57 @@
-# configs/data.yaml
-# ------------------------------------------------------------------
-# Column-name overrides for the preprocessed parquet files.
-# Run `python -m scripts.inspect_data --data <file>` first; if the auto-detected
-# mapping shows None for a column you need, set the real name here. Leave a key
-# out (or null) to keep auto-detection.
+# configs/data.yaml — per-dataset column overrides.
 #
-# These keys mirror src/data.py _CANDIDATES.
-# ------------------------------------------------------------------
+# This file IS read. In v1 it was not: the guide told users to set column names
+# here when auto-detection failed, but no script imported it, so edits had no
+# effect and the real fix was to rewrite the parquet. Everything now loads
+# through src/config.py, which merges this file into the run configuration.
+#
+# Each top-level key is a dataset filename without its extension, so
+# `data/megascale_ddg_pairs.parquet` is configured under `megascale_ddg_pairs`.
+# Only set what auto-detection gets wrong — run
+# `python -m scripts.inspect_data --data <file>` first and look for `-> None`.
+#
+# Canonical names, and what they mean:
+#   wt_seq  wild-type / reference PROTEIN sequence   (this is the parent that gets encoded)
+#   mt_seq  mutant / alternate PROTEIN sequence      (used only to locate the substitution)
+#   target  numeric ddG label                        (stability)
+#   sigma   per-measurement ddG uncertainty          (sets the three-state neutral band)
+#   label   pathogenic / benign                      (pathogenicity)
+#   gene    gene symbol                              (merged into split grouping)
+#   cds     real coding NUCLEOTIDE sequence          (enables the mechanistic stream)
+#   rg      experimental radius of gyration          (IDR)
+#   value   MFI / retention time / expression
+#
+# wt_seq and mt_seq must be PROTEIN sequences. Pointing them at nucleotide
+# columns will not error — A, C, G and T are all valid amino-acid letters, so a
+# protein language model accepts them silently and learns nothing. That failure
+# mode is exactly what produced a meaningless ClinVar task in the predecessor
+# repository, so check `scripts.inspect_data` output rather than assuming.
 
 megascale_ddg_pairs:
-  # wt_seq:  wildtype_sequence
-  # mt_seq:  mutant_sequence
-  # target:  ddG
-  # wt_dna:  wt_cds        # set if a coding-DNA column exists -> enables real CAI/mRNA + E_mech
-  # mt_dna:  mt_cds
-  # No coding-DNA column? Run with `--back-translate` (run.py / configs/run.yaml) to
-  # build E_mech from a usage-weighted proxy transcript instead. See guide.md 2a.
+  # wt_seq: wildtype_sequence
+  # mt_seq: mutant_sequence
+  # target: ddG
+  # sigma:  ddG_std
+  # cds:    dna_seq          # real CDS -> CAI + ViennaRNA folding -> E_mech.
+  #                          # Recover it with `python run.py etl --cds-source ...`
+  #                          # if the processed table dropped it. There is no
+  #                          # back-translation fallback: a proxy transcript is a
+  #                          # deterministic function of the protein and carries
+  #                          # no information the embeddings lack.
 
 clinvar_protein_pairs:
-  # wt_seq:  ref_protein
-  # mt_seq:  alt_protein
-  # label:   clinical_significance
-  # gene:    gene_symbol
+  # wt_seq: ref_protein
+  # mt_seq: alt_protein
+  # label:  clinical_significance
+  # gene:   gene_symbol
 
-# ------------------------------------------------------------------
-# Graph / feature hyperparameters (E_mech edge thresholds eps/delta)
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Graph and feature hyperparameters. Merged flat into the run configuration.
+# ---------------------------------------------------------------------------
 graph:
-  geo_threshold: 0.5      # ESM contact-probability cutoff for E_geo
-  eps: 0.10               # |CAI_i - CAI_j| threshold for E_mech
-  delta: 0.10             # |mRNA_i - mRNA_j| threshold for E_mech
-  mech_max_degree: 8      # cap on mechanistic neighbours per residue
+  graph_top_k: 16         # neighbours per node in the built graph
+  geo_threshold: 0.30     # contact-probability floor for an E_geo edge
+  eps: 0.10               # |dCAI|  threshold for an E_mech edge
+  delta: 0.10             # |dmRNA| threshold for an E_mech edge
+  mech_max_degree: 8      # degree cap keeping E_mech sparse
+  neighborhood_hops: 2    # k-hop site neighbourhood for the readout

@@ -27,14 +27,15 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+# One exception type for "this is not a single substitution", shared with
+# src/windowing.py. Two same-named classes in different modules meant an
+# `except` on one silently failed to catch the other.
+from src.windowing import MutationParseError
+
 AA_ORDER = "ACDEFGHIKLMNPQRSTVWY"
 AA_TO_IDX: dict[str, int] = {a: i for i, a in enumerate(AA_ORDER)}
 N_AMINO_ACIDS = len(AA_ORDER)
 UNKNOWN_AA_IDX = N_AMINO_ACIDS          # a dedicated slot, never a silent 0
-
-
-class MutationParseError(ValueError):
-    """Raised for a malformed or inconsistent mutation code."""
 
 
 def aa_index(aa: str) -> int:

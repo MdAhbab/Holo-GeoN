@@ -1,44 +1,77 @@
-# configs/run.yaml — one place to control the whole pipeline.
-# Edit paths / epochs here, then:  python run.py all --config configs/run.yaml
-# Any value here can also be overridden on the command line (CLI wins).
+# configs/run.yaml — pipeline configuration.
+#
+#   python run.py all --config configs/run.yaml
+#
+# Any value here can be overridden on the command line; the CLI always wins.
+# Column-name overrides and graph hyperparameters live in configs/data.yaml,
+# which is merged into the same namespace (both files are read — see
+# src/config.py).
 
-# --- shared ---
-esm_model: facebook/esm2_t30_150M_UR50D   # fast (640-d). Use t33_650M for 1280-d.
-cache: cache/emb_150M                      # embedding cache dir (must match esm_model)
-device: cuda                               # cuda | cpu
-max_length: 256
+# --- encoder ---------------------------------------------------------------
+# Frozen throughout. 650M is the shipped default; 150M (facebook/esm2_t30_150M_UR50D,
+# 640-d) roughly halves the cache and the precompute pass if disk is tight.
+esm_model: facebook/esm2_t33_650M_UR50D
+cache: cache/esm2_650M
+device: cuda
+
+# Mutation-centered window length, in residues. The window is always placed
+# around the mutated residue, never at the sequence head.
+window: 256
+
+# Contacts cached per residue, and the minimum sequence separation for a pair to
+# count as a contact rather than backbone context.
+contact_top_k: 24
+contact_min_sep: 3
+
+# --- data ------------------------------------------------------------------
 out_root: runs
-
-# --- data sources (the preprocessed parquet files on this machine) ---
 stability_data: data/megascale_ddg_pairs.parquet
-clinvar_data:   data/clinvar_protein_pairs.parquet
-clinvar_ddg:    data/clinvar_protein_pairs.parquet.ddg_w49.npy   # optional
+clinvar_data: data/clinvar_protein_pairs.parquet
 
-# --- splitting ---
-split_method: mmseqs     # mmseqs (strict 30% identity) | group (parent/gene fallback)
+# Optional tables. A head whose table is absent stays untrained, is recorded as
+# untrained in the run manifest, and must not be described as a capability.
+idr_data: null           # experimental radius of gyration (PED / SAXS)
+mfi_data: null           # deep-mutational-scan fluorescence
+proteomics_data: null    # retention time / expression
+
+max_protein_length: 5000
+
+# --- splits ----------------------------------------------------------------
+# MMseqs2 clustering at this identity, unioned with gene identity where a gene
+# column exists. Applies to every task.
+split_method: mmseqs
 identity: 0.30
+coverage: 0.80
+cv_folds: 5
+seed: 42
 
-# --- training ---
-epochs_stability: 8
-epochs_pathogenicity: 6
-epochs_idr: 5
-batch_stability: 16
-batch_pathogenicity: 32
+# --- graph -----------------------------------------------------------------
+graph_top_k: 16
+geo_threshold: 0.30
+eps: 0.10
+delta: 0.10
+mech_max_degree: 8
+neighborhood_hops: 2
+
+# --- model -----------------------------------------------------------------
+hidden: 256
+out_dim: 256
+gat_heads: 4
+dropout: 0.1
+use_ssm: true
+use_mech_stream: true
+
+# --- training --------------------------------------------------------------
+# Epochs is an upper bound: training stops early when the primary validation
+# metric stops improving. v1 ran a fixed 8 epochs and its best epoch was 8,
+# meaning it was still improving when it stopped.
+epochs: 60
+batch_size: 64
 lr: 0.0003
-
-# --- toggles ---
-run_ablation: true       # also train the single-track (--no-mech-track) model
-run_idr: true            # train the IDR head against the physics prior
-run_baseline: true       # ESM zero-shot ΔΔG baseline
-run_contacts: true       # geometric-track sanity check (long-range signal, Q2)
-
-# --- mechanistic track options ---
-back_translate: false    # if stability data has NO coding-DNA column, set true to
-                         # build E_mech from a usage-weighted proxy transcript
-                         # (needs ViennaRNA; it is an explicit proxy, not a real CDS)
-sweep_eps_delta: false   # also probe E_mech eps/delta threshold sensitivity (Q9)
-# true_contacts_dir:     # optional dir of <md5>.npy ground-truth maps -> precision@L in contacts stage
-
-# --- optional caps for a faster first pass (null = use everything) ---
-max_seqs: null           # cap unique sequences in precompute
-max_rows: null           # cap rows per split in training
+weight_decay: 0.0001
+warmup_frac: 0.05
+early_stop_patience: 8
+grad_clip: 1.0
+amp: true
+num_workers: 4
+max_rows: null

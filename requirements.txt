@@ -1,31 +1,51 @@
-# HoloGNN — Python dependencies
-# Install order matters: install a CUDA build of torch FIRST (see guide.md),
-# then torch_geometric, then the rest.
+# =============================================================================
+# Holo-GeoN — Python dependencies
+# =============================================================================
+# GPU NOTE (NVIDIA RTX 50-series / Blackwell, sm_120 — e.g. RTX 5070 Ti):
+#   A plain `pip install torch` may fetch a wheel without sm_120 kernels, so the
+#   GPU either errors ("no kernel image is available for execution") or silently
+#   runs on the CPU. Install the CUDA 12.8 build FIRST, then the rest:
+#
+#       pip install torch --index-url https://download.pytorch.org/whl/cu128
+#       pip install -r requirements.txt
+#
+#   Every stage prints its detected device on launch and warns with the fix if
+#   the installed wheel cannot target the card (see src/device.py).
+# =============================================================================
 
-# Core (install the CUDA wheel that matches the GPU/driver; see guide.md)
-torch>=2.2
+# Core. >=2.7 ships cu128 wheels with Blackwell support.
+torch>=2.7
 
-# Graph neural network layers (GATv2Conv)
+# Graph message passing (GATv2Conv). Required, not optional: there is no
+# non-graph fallback path, because a model that silently skips its GNN layers is
+# not the model this repository evaluates.
 torch_geometric>=2.5
 
-# Protein language model + tokeniser
+# Frozen protein language model + tokeniser (ESM-2).
 transformers>=4.40
 
-# Real mRNA secondary-structure folding (minimum free energy)
+# Real mRNA secondary-structure folding (minimum free energy). Without it the
+# mechanistic channels stay masked (mech_valid = 0) and E_mech is empty — the
+# stream is simply inactive rather than approximated.
 ViennaRNA>=2.6
 
-# Config + data / metrics / plotting
+# Config, data, metrics, plotting.
 pyyaml>=6.0
 pandas>=2.0
-pyarrow>=14.0          # parquet
+pyarrow>=14.0
 numpy>=1.24
 scikit-learn>=1.3
+scipy>=1.10
 matplotlib>=3.7
 tqdm>=4.65
 
-# Optional (faster ESM contact head / alt loader); not required:
-# fair-esm>=2.0
-
-# NOTE: MMseqs2 is a BINARY, not a pip package. Install separately for strict
-# splits:   conda install -c bioconda mmseqs2     (or download a static build).
-# Without it, make_splits.py falls back to protein-disjoint grouping.
+# NOTE: MMseqs2 is a BINARY, not a pip package. Install it separately for
+# identity-clustered splits:
+#     conda install -c bioconda mmseqs2
+# Without it, scripts/make_splits.py falls back to exact parent-sequence
+# grouping, which is still protein-disjoint but does not separate homologs. The
+# leakage report records which of the two was used.
+#
+# The web interface has its own lightweight dependency set in
+# app/backend/requirements.txt; `python runapp.py` installs it into a private
+# virtualenv.

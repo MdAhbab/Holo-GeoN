@@ -1,365 +1,277 @@
 #!/usr/bin/env python
 """
-run.py — single entrypoint for HoloGNN
-======================================
-One file your friend runs to set up the environment and to train / test / eval
-the whole model. Configure everything in configs/run.yaml (or override on the
-command line; CLI always wins).
+run.py — single entrypoint for Holo-GeoN
+========================================
 
-Quick start
------------
-    python run.py setup                 # create a venv + install deps
-    #   (activate it, then:)
-    python run.py smoke                 # 30-sec sanity check on synthetic data
-    python run.py all                   # full pipeline (precompute -> ... -> eval)
+    python run.py setup            # create a venv and install dependencies
+    python run.py test             # unit + invariant tests (no data needed)
+    python run.py all              # the whole pipeline, end to end
 
-Individual stages
------------------
-    python run.py precompute
-    python run.py splits
-    python run.py stability        [--no-ablation] [--sweep-eps-delta] [--back-translate]
-    python run.py pathogenicity
-    python run.py idr
-    python run.py baseline
-    python run.py contacts              # geometric-track sanity (Q2)
-    python run.py evaluate
-    python run.py test                  # run unit tests
+Individual stages, in dependency order::
 
-Common overrides (work on any stage)
-------------------------------------
-    --config configs/run.yaml
-    --esm-model facebook/esm2_t33_650M_UR50D --cache cache/emb_650M
-    --device cuda|cpu
-    --stability-data PATH --clinvar-data PATH --clinvar-ddg PATH
-    --epochs N            (sets all epochs)  | --epochs-stability N etc.
-    --batch N             | --split-method mmseqs|group --identity 0.30
-    --max-seqs N --max-rows N --out-root runs/
-    --back-translate      (proxy transcript when stability data has no coding DNA)
-    --sweep-eps-delta     (probe E_mech threshold sensitivity)
+    python run.py etl              # attach real coding sequences (enables E_mech)
+    python run.py precompute       # frozen ESM-2 pass -> encoding cache
+    python run.py splits           # identity-clustered, leakage-controlled splits
+    python run.py train            # the multi-task model
+    python run.py baselines        # substitution frequency, ESM-only MLP, zero-shot
+    python run.py ablations        # one component removed at a time
+    python run.py calibration      # sigma coverage/ECE + reversibility
+    python run.py contacts         # geometric-edge sanity
+    python run.py results          # collect everything into results/
+
+Configuration lives in ``configs/run.yaml`` and ``configs/data.yaml``; both are
+read, and any value can be overridden on the command line (CLI wins).
+
+Stages are resumable: each checks for its own output and skips work that is
+already complete, so re-running after an interruption continues rather than
+restarting.
 """
-import os
-import sys
+from __future__ import annotations
+
 import argparse
+import os
 import subprocess
+import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
 
-DEFAULTS = {
-    "esm_model": "facebook/esm2_t30_150M_UR50D",
-    "cache": "cache/emb_150M",
-    "device": "cuda",
-    "max_length": 256,
-    "out_root": "runs",
-    "stability_data": "data/megascale_ddg_pairs.parquet",
-    "clinvar_data": "data/clinvar_protein_pairs.parquet",
-    "clinvar_ddg": "data/clinvar_protein_pairs.parquet.ddg_w49.npy",
-    "split_method": "mmseqs",
-    "identity": 0.30,
-    "epochs_stability": 8,
-    "epochs_pathogenicity": 6,
-    "epochs_idr": 5,
-    "batch_stability": 16,
-    "batch_pathogenicity": 32,
-    "cv_folds": 3,
-    "lr": 3e-4,
-    "run_ablation": True,
-    "run_idr": True,
-    "run_baseline": True,
-    "run_contacts": True,
-    "back_translate": False,
-    "sweep_eps_delta": False,
-    "max_seqs": None,
-    "max_rows": None,
-}
+from src.config import load_config  # noqa: E402
+
+
+def sh(cmd: list) -> None:
+    printable = " ".join(str(c) for c in cmd)
+    print(f"\n$ {printable}")
+    subprocess.run([str(c) for c in cmd], cwd=ROOT, check=True)
+
+
+def py(module: str, *a) -> None:
+    sh([sys.executable, "-m", module, *a])
+
+
+def _abs(path: str) -> str:
+    return path if os.path.isabs(path) else os.path.join(ROOT, path)
+
+
+def done(path: str) -> bool:
+    return os.path.exists(_abs(path))
+
+
+def venv_python(venv: str) -> str:
+    return os.path.join(venv, "Scripts", "python.exe") if os.name == "nt" \
+        else os.path.join(venv, "bin", "python")
 
 
 # ---------------------------------------------------------------------------
-# helpers
+# Stages
 # ---------------------------------------------------------------------------
-def load_yaml(path):
-    if not path or not os.path.exists(path):
-        return {}
-    try:
-        import yaml
-    except ImportError:
-        print("! PyYAML not installed; ignoring config file. (pip install pyyaml)")
-        return {}
-    with open(path, encoding="utf-8") as fh:
-        return yaml.safe_load(fh) or {}
-
-
-def effective_config(args):
-    cfg = dict(DEFAULTS)
-    cfg.update(load_yaml(args.config))
-    # CLI overrides (only those the user actually set)
-    o = {
-        "esm_model": args.esm_model, "cache": args.cache, "device": args.device,
-        "max_length": args.max_length, "out_root": args.out_root,
-        "stability_data": args.stability_data, "clinvar_data": args.clinvar_data,
-        "clinvar_ddg": args.clinvar_ddg, "split_method": args.split_method,
-        "identity": args.identity, "batch_stability": args.batch,
-        "batch_pathogenicity": args.batch, "lr": args.lr,
-        "max_seqs": args.max_seqs, "max_rows": args.max_rows,
-    }
-    for k, v in o.items():
-        if v is not None:
-            cfg[k] = v
-    if args.epochs is not None:
-        cfg["epochs_stability"] = cfg["epochs_pathogenicity"] = cfg["epochs_idr"] = args.epochs
-    for k in ("epochs_stability", "epochs_pathogenicity", "epochs_idr"):
-        v = getattr(args, k, None)
-        if v is not None:
-            cfg[k] = v
-    if args.no_ablation:
-        cfg["run_ablation"] = False
-    if args.no_idr:
-        cfg["run_idr"] = False
-    if args.back_translate:
-        cfg["back_translate"] = True
-    if args.sweep_eps_delta:
-        cfg["sweep_eps_delta"] = True
-    return cfg
-
-
-def sh(cmd):
-    print("\n$ " + " ".join(str(c) for c in cmd))
-    subprocess.run(cmd, cwd=ROOT, check=True)
-
-
-def py(module, *a):
-    sh([sys.executable, "-m", module, *[str(x) for x in a]])
-
-
-def venv_python(venv):
-    if os.name == "nt":
-        return os.path.join(venv, "Scripts", "python.exe")
-    return os.path.join(venv, "bin", "python")
-
-
-def _done(path):
-    """True if a stage output file already exists (resolved relative to ROOT).
-    Lets `run.py all` resume after an interruption by skipping finished stages."""
-    p = path if os.path.isabs(path) else os.path.join(ROOT, path)
-    return os.path.exists(p)
-
-
-# ---------------------------------------------------------------------------
-# stages
-# ---------------------------------------------------------------------------
-def stage_setup(args, cfg):
+def stage_setup(args, cfg) -> None:
     venv = args.venv or os.path.join(ROOT, ".venv")
     if not os.path.exists(venv_python(venv)):
-        print(f"Creating venv at: {venv}")
         sh([sys.executable, "-m", "venv", venv])
-    else:
-        print(f"Using existing venv: {venv}")
     vpy = venv_python(venv)
     sh([vpy, "-m", "pip", "install", "--upgrade", "pip"])
     if args.torch_index_url:
         sh([vpy, "-m", "pip", "install", "torch", "--index-url", args.torch_index_url])
     sh([vpy, "-m", "pip", "install", "-r", os.path.join(ROOT, "requirements.txt")])
-    act = (f"{venv}\\Scripts\\activate" if os.name == "nt" else f"source {venv}/bin/activate")
-    print("\n" + "=" * 64)
-    print("Setup done. Activate the venv, then run the pipeline:")
-    print(f"    {act}")
-    print("    python run.py smoke      # quick sanity check")
-    print("    python run.py all        # full train/test/eval")
-    print("Note: for an NVIDIA GPU, install the CUDA torch wheel, e.g.:")
-    print("    python run.py setup --torch-index-url https://download.pytorch.org/whl/cu121")
-    print("Optional: install MMseqs2 for strict splits (conda install -c bioconda mmseqs2).")
-    print("=" * 64)
+    activate = (f"{venv}\\Scripts\\activate" if os.name == "nt"
+                else f"source {venv}/bin/activate")
+    print("\n" + "=" * 70)
+    print("Setup complete. Activate the environment, then run the pipeline:")
+    print(f"    {activate}")
+    print("    python run.py test")
+    print("    python run.py all")
+    print()
+    print("RTX 50-series (Blackwell, sm_120 — e.g. 5070 Ti): install the CUDA 12.8")
+    print("wheel first, or the GPU will error or silently fall back to CPU:")
+    print("    python run.py setup --torch-index-url https://download.pytorch.org/whl/cu128")
+    print()
+    print("MMseqs2 is a separate binary and is needed for identity-clustered")
+    print("splits:  conda install -c bioconda mmseqs2")
+    print("=" * 70)
 
 
-def stage_precompute(args, cfg):
-    extra = []
-    if cfg["max_seqs"]:
-        extra += ["--max-seqs", cfg["max_seqs"]]
-    py("scripts.precompute_embeddings", "--data", cfg["stability_data"], cfg["clinvar_data"],
-       "--esm-model", cfg["esm_model"], "--cache", cfg["cache"],
-       "--max-length", cfg["max_length"], "--device", cfg["device"], *extra)
+def stage_inspect(args, cfg) -> None:
+    for path in (cfg.stability_data, cfg.clinvar_data):
+        if done(path):
+            py("scripts.inspect_data", "--data", path)
 
 
-def _splits_paths(cfg):
-    sm = os.path.join("data", "splits_megascale.parquet")
-    sc = os.path.join("data", "splits_clinvar.parquet")
-    return sm, sc
-
-
-def stage_splits(args, cfg):
-    sm, sc = _splits_paths(cfg)
-    if _done(sm) and _done(sc):
-        print(f"[skip] splits already exist ({sm}, {sc})")
+def stage_etl(args, cfg) -> None:
+    if not args.cds_source:
+        print("[etl] no --cds-source given. Skipping.\n"
+              "      Without a real coding sequence the mechanistic channels stay "
+              "masked (mech_valid = 0) and E_mech is empty. That is the honest\n"
+              "      state, not a failure — but the mechanistic stream then has "
+              "nothing to contribute and its ablation will read ~0.")
         return
-    py("scripts.make_splits", "--data", cfg["stability_data"], "--kind", "stability",
-       "--method", cfg["split_method"], "--identity", cfg["identity"], "--out", sm)
-    py("scripts.make_splits", "--data", cfg["clinvar_data"], "--kind", "pathogenicity",
-       "--method", "group", "--out", sc)
-
-
-def stage_stability(args, cfg):
-    sm, _ = _splits_paths(cfg)
-    out = os.path.join(cfg["out_root"], "stability")
-    main_done = _done(os.path.join(out, "stability_metrics.json"))
-    nomech_done = (not cfg["run_ablation"]) or _done(os.path.join(out + "_nomech", "stability_metrics.json"))
-    if main_done and nomech_done:
-        print("[skip] stability stage already complete")
+    out = cfg.stability_data.replace(".parquet", "_cds.parquet")
+    if done(out):
+        print(f"[skip] etl already produced {out}")
         return
-    common = ["--splits", sm, "--cache", cfg["cache"], "--esm-model", cfg["esm_model"],
-              "--epochs", cfg["epochs_stability"], "--batch", cfg["batch_stability"],
-              "--lr", cfg["lr"], "--device", cfg["device"]]
-    if cfg["max_rows"]:
-        common += ["--max-rows", cfg["max_rows"]]
-    if cfg.get("back_translate"):
-        common += ["--back-translate"]
-    main_extra = ["--sweep"] if cfg.get("sweep_eps_delta") else []
-    py("scripts.train_stability", *common, *main_extra, "--out", out)
-    if cfg["run_ablation"]:
-        py("scripts.train_stability", *common, "--no-mech-track",
-           "--out", out + "_nomech")
+    py("scripts.etl_cds", "--table", cfg.stability_data,
+       "--source", *args.cds_source, "--out", out)
+    print(f"[etl] set stability_data: {out} in configs/run.yaml to use it.")
 
 
-def stage_pathogenicity(args, cfg):
-    out = os.path.join(cfg["out_root"], "pathogenicity")
-    if _done(os.path.join(out, "pathogenicity_metrics.json")):
-        print("[skip] pathogenicity stage already complete")
+def stage_precompute(args, cfg) -> None:
+    a = ["--data", cfg.stability_data, cfg.clinvar_data,
+         "--esm-model", cfg.esm_model, "--cache", cfg.cache, "--device", cfg.device]
+    if args.max_seqs:
+        a += ["--max-seqs", args.max_seqs]
+    if args.max_cache_gb:
+        a += ["--max-cache-gb", args.max_cache_gb]
+    py("scripts.precompute_embeddings", *a)
+
+
+def _split_paths() -> tuple[str, str]:
+    return (os.path.join("data", "splits_megascale.parquet"),
+            os.path.join("data", "splits_clinvar.parquet"))
+
+
+def stage_splits(args, cfg) -> None:
+    stability, clinvar = _split_paths()
+    if not done(stability):
+        py("scripts.make_splits", "--data", cfg.stability_data,
+           "--kind", "stability", "--out", stability)
+    else:
+        print(f"[skip] {stability} exists")
+    if done(cfg.clinvar_data) and not done(clinvar):
+        py("scripts.make_splits", "--data", cfg.clinvar_data,
+           "--kind", "pathogenicity", "--out", clinvar)
+    elif done(clinvar):
+        print(f"[skip] {clinvar} exists")
+
+
+def stage_train(args, cfg) -> None:
+    out = os.path.join(cfg.out_root, "main")
+    if done(os.path.join(out, "metrics.json")):
+        print(f"[skip] training already complete ({out}/metrics.json)")
         return
-    a = ["--data", cfg["clinvar_data"], "--cache", cfg["cache"],
-         "--esm-model", cfg["esm_model"], "--epochs", cfg["epochs_pathogenicity"],
-         "--batch", cfg["batch_pathogenicity"], "--lr", cfg["lr"],
-         "--cv-folds", cfg.get("cv_folds", 3),
-         "--device", cfg["device"], "--out", out]
-    if cfg["clinvar_ddg"] and os.path.exists(os.path.join(ROOT, cfg["clinvar_ddg"])):
-        a += ["--ddg", cfg["clinvar_ddg"]]
-    if cfg["max_rows"]:
-        a += ["--max-rows", cfg["max_rows"]]
-    py("scripts.train_pathogenicity", *a)
+    stability, clinvar = _split_paths()
+    py("scripts.train", "--stability-splits", stability,
+       "--pathogenicity-splits", clinvar, "--out", out)
 
 
-def stage_idr(args, cfg):
-    if _done(os.path.join(cfg["out_root"], "idr", "idr_metrics.json")):
-        print("[skip] idr stage already complete")
+def stage_baselines(args, cfg) -> None:
+    out = os.path.join(cfg.out_root, "baselines")
+    if done(os.path.join(out, "baselines.json")):
+        print("[skip] baselines already complete")
         return
-    py("scripts.train_idr", "--data", cfg["clinvar_data"], "--cache", cfg["cache"],
-       "--esm-model", cfg["esm_model"], "--epochs", cfg["epochs_idr"],
-       "--device", cfg["device"], "--out", os.path.join(cfg["out_root"], "idr"))
+    stability, _ = _split_paths()
+    a = ["--splits", stability, "--out", out]
+    if args.skip_zero_shot:
+        a.append("--skip-zero-shot")
+    py("scripts.baselines", *a)
 
 
-def stage_baseline(args, cfg):
-    if _done(os.path.join(cfg["out_root"], "baseline_esm_zeroshot.json")):
-        print("[skip] baseline stage already complete")
+def stage_ablations(args, cfg) -> None:
+    out = os.path.join(cfg.out_root, "ablations")
+    if done(os.path.join(out, "ablations.json")):
+        print("[skip] ablations already complete")
         return
-    sm, _ = _splits_paths(cfg)
-    py("scripts.baselines", "--splits", sm, "--esm-model", cfg["esm_model"],
-       "--split", "test", "--device", cfg["device"])
+    stability, clinvar = _split_paths()
+    py("scripts.ablations", "--stability-splits", stability,
+       "--pathogenicity-splits", clinvar, "--out", out)
 
 
-def stage_contacts(args, cfg):
-    if _done(os.path.join("results", "contacts", "contact_sanity.json")):
-        print("[skip] contacts stage already complete")
+def stage_calibration(args, cfg) -> None:
+    run_dir = os.path.join(cfg.out_root, "main")
+    ckpt = os.path.join(run_dir, "model_best.pt")
+    if not done(ckpt):
+        print(f"[calibration] no checkpoint at {ckpt}; run `python run.py train` first")
         return
-    a = ["--cache", cfg["cache"], "--max-seqs", 300]
-    tcd = cfg.get("true_contacts_dir")
-    if tcd:
-        a += ["--true-contacts-dir", tcd]
-    py("scripts.contact_sanity", *a)
+    if done(os.path.join(run_dir, "calibration.json")):
+        print("[skip] calibration already complete")
+        return
+    stability, _ = _split_paths()
+    a = ["--checkpoint", ckpt, "--splits", stability, "--out", run_dir]
+    if args.encode_mutants:
+        a.append("--encode-mutants")
+    py("scripts.calibration", *a)
 
 
-def stage_evaluate(args, cfg):
-    runs = [os.path.join(cfg["out_root"], "stability"),
-            os.path.join(cfg["out_root"], "pathogenicity")]
-    if cfg["run_ablation"]:
-        runs.append(os.path.join(cfg["out_root"], "stability_nomech"))
-    py("scripts.evaluate", "--runs", *runs, "--out", os.path.join(cfg["out_root"], "figures"))
+def stage_contacts(args, cfg) -> None:
+    if done(os.path.join("results", "contacts", "contact_sanity.json")):
+        print("[skip] contact sanity already complete")
+        return
+    py("scripts.contact_sanity", "--cache", cfg.cache, "--max-seqs", 300)
 
 
-def stage_results(args, cfg):
-    py("scripts.collect_results")
+def stage_results(args, cfg) -> None:
+    py("scripts.collect_results", "--runs", os.path.join(cfg.out_root, "main"),
+       "--baselines", os.path.join(cfg.out_root, "baselines", "baselines.json"),
+       "--ablations", os.path.join(cfg.out_root, "ablations", "ablations.json"))
 
 
-def stage_smoke(args, cfg):
-    py("tests.test_model_smoke")
+def stage_test(args, cfg) -> None:
+    py("tests.run_all")
 
 
-def stage_test(args, cfg):
-    py("tests.test_features_graph")
-    py("tests.test_splits_idr")
-    py("tests.test_model_smoke")
-
-
-def stage_all(args, cfg):
+def stage_all(args, cfg) -> None:
+    stage_etl(args, cfg)
     stage_precompute(args, cfg)
     stage_splits(args, cfg)
-    stage_stability(args, cfg)
-    stage_pathogenicity(args, cfg)
-    if cfg["run_idr"]:
-        stage_idr(args, cfg)
-    if cfg["run_baseline"]:
-        stage_baseline(args, cfg)
-    if cfg.get("run_contacts", True):
-        stage_contacts(args, cfg)
-    stage_evaluate(args, cfg)
+    stage_train(args, cfg)
+    stage_baselines(args, cfg)
+    stage_ablations(args, cfg)
+    stage_calibration(args, cfg)
+    stage_contacts(args, cfg)
     stage_results(args, cfg)
-    print("\n[done] Pipeline complete. See results/SUMMARY.md and results/CLAIMS.md.")
+    print("\n[done] pipeline complete. See results/SUMMARY.md")
 
 
 STAGES = {
-    "setup": stage_setup, "smoke": stage_smoke, "test": stage_test,
-    "precompute": stage_precompute, "splits": stage_splits,
-    "stability": stage_stability, "pathogenicity": stage_pathogenicity,
-    "idr": stage_idr, "baseline": stage_baseline, "contacts": stage_contacts,
-    "evaluate": stage_evaluate, "results": stage_results, "all": stage_all,
+    "setup": stage_setup, "test": stage_test, "inspect": stage_inspect,
+    "etl": stage_etl, "precompute": stage_precompute, "splits": stage_splits,
+    "train": stage_train, "baselines": stage_baselines, "ablations": stage_ablations,
+    "calibration": stage_calibration, "contacts": stage_contacts,
+    "results": stage_results, "all": stage_all,
 }
 
 
-def main():
-    # Force UTF-8 for this process and every spawned stage. On Windows the default
-    # console codec is cp1252, which raises UnicodeEncodeError on non-ASCII prints
-    # (emoji/±/Δ/Å) when stdout is redirected to a file — that would crash a stage.
+def main() -> None:
+    # Force UTF-8 everywhere: the Windows console default (cp1252) raises on the
+    # non-ASCII characters these stages print, which used to crash a stage
+    # outright when its output was redirected to a file.
     os.environ.setdefault("PYTHONUTF8", "1")
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
 
-    ap = argparse.ArgumentParser(description="HoloGNN single-file runner.")
+    ap = argparse.ArgumentParser(description="Holo-GeoN pipeline runner.")
     ap.add_argument("stage", choices=list(STAGES))
     ap.add_argument("--config", default="configs/run.yaml")
-    # env / venv
-    ap.add_argument("--venv", default=None, help="venv location (default: ./.venv)")
-    ap.add_argument("--torch-index-url", default=None, help="e.g. CUDA wheel index")
-    # shared overrides
+    ap.add_argument("--venv", default=None)
+    ap.add_argument("--torch-index-url", default=None)
     ap.add_argument("--esm-model", default=None)
     ap.add_argument("--cache", default=None)
     ap.add_argument("--device", default=None)
-    ap.add_argument("--max-length", type=int, default=None)
     ap.add_argument("--out-root", default=None)
-    ap.add_argument("--stability-data", default=None)
-    ap.add_argument("--clinvar-data", default=None)
-    ap.add_argument("--clinvar-ddg", default=None)
-    ap.add_argument("--split-method", default=None, choices=[None, "mmseqs", "group"])
-    ap.add_argument("--identity", type=float, default=None)
-    ap.add_argument("--epochs", type=int, default=None, help="set all epochs")
-    ap.add_argument("--epochs-stability", type=int, default=None)
-    ap.add_argument("--epochs-pathogenicity", type=int, default=None)
-    ap.add_argument("--epochs-idr", type=int, default=None)
-    ap.add_argument("--batch", type=int, default=None)
-    ap.add_argument("--lr", type=float, default=None)
-    ap.add_argument("--max-seqs", type=int, default=None)
+    ap.add_argument("--epochs", type=int, default=None)
+    ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--max-rows", type=int, default=None)
-    ap.add_argument("--no-ablation", action="store_true")
-    ap.add_argument("--no-idr", action="store_true")
-    ap.add_argument("--back-translate", action="store_true",
-                    help="usage-weighted proxy transcript when stability data has no coding DNA")
-    ap.add_argument("--sweep-eps-delta", action="store_true",
-                    help="probe E_mech eps/delta sensitivity in the stability stage (Q9)")
+    ap.add_argument("--max-seqs", type=int, default=None)
+    ap.add_argument("--max-cache-gb", type=float, default=None)
+    ap.add_argument("--cds-source", nargs="+", default=None,
+                    help="raw table(s) carrying a nucleotide column, for the etl stage")
+    ap.add_argument("--encode-mutants", action="store_true",
+                    help="calibration: embed mutants for the reversibility check")
+    ap.add_argument("--skip-zero-shot", action="store_true",
+                    help="baselines: skip the slow masked-LM baseline")
     args = ap.parse_args()
 
-    cfg = effective_config(args)
+    cfg = load_config(args.config, overrides={
+        "esm_model": args.esm_model, "cache": args.cache, "device": args.device,
+        "out_root": args.out_root, "epochs": args.epochs,
+        "batch_size": args.batch_size, "max_rows": args.max_rows,
+    })
     if args.stage != "setup":
-        print(f"[run.py] stage={args.stage} esm={cfg['esm_model']} device={cfg['device']} "
-              f"cache={cfg['cache']}")
+        print(f"[run] stage={args.stage}  esm={cfg.esm_model}  device={cfg.device}  "
+              f"cache={cfg.cache}")
     STAGES[args.stage](args, cfg)
 
 

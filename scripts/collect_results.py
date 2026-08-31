@@ -1,128 +1,258 @@
 """
 scripts/collect_results.py
 ==========================
-Sort everything produced by a run into results/, organised by task. Reads
-runs/*/*.json (+ split parquet) and writes:
+Gather whatever the pipeline actually produced into ``results/``.
 
-    results/SUMMARY.md                      consolidated metric table
-    results/stability/                      ΔΔG metrics (strict split)
-    results/ablation/                       dual-track vs single-track + eps/delta sweep
-    results/pathogenicity/                  random vs gene-disjoint AUROC + CV
-    results/baselines/                      ESM zero-shot ΔΔG
-    results/idr/                            physics-prior Rg MAE
-    results/contacts/                       geometric-track sanity (long-range signal)
-    results/splits/leakage_report.txt       leakage check + group counts
+The one rule this script enforces: **a number appears only if a run produced
+it.** Every stage is reported as either a measured value with a path to the
+artifact it came from, or the literal string ``not run``. There is no default,
+no cached constant, and no reconstruction.
 
-It also writes the component -> evidence map referenced by results/CLAIMS.md.
+That rule exists because the previous figure generator did the opposite. Its
+demo path synthesised the published Results figures from hardcoded targets —
+``_STABILITY_R = 0.7644``, and a routine that searched for the class means
+making ``roc_auc_score`` land on 0.84 — and those reconstructions were the
+images behind the paper's results section. Nothing in this repository
+regenerates a figure or a table from a remembered number.
+
+Example
+-------
+python -m scripts.collect_results --runs runs/main --out results
 """
-import os, sys, json, glob, shutil
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import sys
+from typing import Any
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RESULTS = os.path.join(ROOT, "results")
-SUBDIRS = ["stability", "ablation", "pathogenicity", "baselines", "idr",
-           "splits", "contacts", "figures"]
+NOT_RUN = "not run"
 
 
-def jload(p):
+def read_json(path: str) -> dict | None:
+    if not os.path.exists(path):
+        return None
     try:
-        return json.load(open(p))
-    except Exception:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception as exc:
+        print(f"[collect] could not read {path}: {exc}")
         return None
 
 
-def copy(src, sub, name=None):
-    if src and os.path.exists(src):
-        os.makedirs(os.path.join(RESULTS, sub), exist_ok=True)
-        shutil.copy(src, os.path.join(RESULTS, sub, name or os.path.basename(src)))
+def fmt(value: Any, digits: int = 4) -> str:
+    if value is None:
+        return NOT_RUN
+    if isinstance(value, float):
+        return f"{value:.{digits}f}"
+    return str(value)
 
 
-def leakage_report(runs_root):
-    out = []
-    try:
-        import pandas as pd
-        from src.splits import verify_no_leakage
-        for f in glob.glob(os.path.join(ROOT, "data", "splits_*.parquet")):
-            df = pd.read_parquet(f)
-            gk = df["group_used"].tolist() if "group_used" in df else df["group"].tolist()
-            ok = verify_no_leakage(gk, df["split"].tolist())
-            counts = df["split"].value_counts().to_dict()
-            out.append(f"{os.path.basename(f)}: no_leakage={ok} | splits={counts} | "
-                       f"unique_groups={len(set(gk))} | rows={len(df)}")
-    except Exception as e:
-        out.append(f"(leakage report skipped: {e})")
-    return "\n".join(out) if out else "(no split files found in data/)"
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--runs", default="runs/main", help="main training run directory")
+    ap.add_argument("--baselines", default="runs/baselines/baselines.json")
+    ap.add_argument("--ablations", default="runs/ablations/ablations.json")
+    ap.add_argument("--contacts", default="results/contacts/contact_sanity.json")
+    ap.add_argument("--splits-dir", default="data")
+    ap.add_argument("--out", default="results")
+    args = ap.parse_args()
 
+    os.makedirs(args.out, exist_ok=True)
 
-def main():
-    runs = os.path.join(ROOT, "runs")
-    os.makedirs(RESULTS, exist_ok=True)
-    for d in SUBDIRS:
-        os.makedirs(os.path.join(RESULTS, d), exist_ok=True)
+    main_metrics = read_json(os.path.join(args.runs, "metrics.json"))
+    calibration = read_json(os.path.join(args.runs, "calibration.json"))
+    baselines = read_json(args.baselines)
+    ablations = read_json(args.ablations)
+    contacts = read_json(args.contacts)
+    leakage = {
+        os.path.basename(p): read_json(p)
+        for p in sorted(glob.glob(os.path.join(args.splits_dir, "leakage_report_*.json")))
+    }
 
-    stab = jload(os.path.join(runs, "stability", "stability_metrics.json"))
-    nomech = jload(os.path.join(runs, "stability_nomech", "stability_metrics.json"))
-    path = jload(os.path.join(runs, "pathogenicity", "pathogenicity_metrics.json"))
-    idr = jload(os.path.join(runs, "idr", "idr_metrics.json"))
-    base = jload(os.path.join(runs, "baseline_esm_zeroshot.json"))
-    sweep = jload(os.path.join(runs, "stability", "eps_delta_sweep.json"))
-    contacts = jload(os.path.join(RESULTS, "contacts", "contact_sanity.json"))
+    lines: list[str] = []
+    add = lines.append
 
-    copy(os.path.join(runs, "stability", "stability_metrics.json"), "stability")
-    copy(os.path.join(runs, "stability", "eps_delta_sweep.json"), "ablation")
-    copy(os.path.join(runs, "stability_nomech", "stability_metrics.json"), "ablation", "stability_nomech_metrics.json")
-    copy(os.path.join(runs, "pathogenicity", "pathogenicity_metrics.json"), "pathogenicity")
-    copy(os.path.join(runs, "idr", "idr_metrics.json"), "idr")
-    copy(os.path.join(runs, "baseline_esm_zeroshot.json"), "baselines")
-    for png in glob.glob(os.path.join(runs, "figures", "*.png")):
-        copy(png, "figures")
+    add("# Holo-GeoN — results summary")
+    add("")
+    add("Auto-generated by `scripts/collect_results.py`. Every value below comes "
+        "from a run artifact on this machine, or reads `not run`. Nothing here is "
+        "a remembered or reconstructed number.")
+    add("")
 
-    # leakage report
-    with open(os.path.join(RESULTS, "splits", "leakage_report.txt"), "w") as fh:
-        fh.write(leakage_report(runs) + "\n")
+    # --- provenance --------------------------------------------------------
+    add("## Provenance")
+    add("")
+    add("| Stage | Artifact | Status |")
+    add("|---|---|---|")
+    for label, path, obj in (
+        ("Training", os.path.join(args.runs, "metrics.json"), main_metrics),
+        ("Calibration", os.path.join(args.runs, "calibration.json"), calibration),
+        ("Baselines", args.baselines, baselines),
+        ("Ablations", args.ablations, ablations),
+        ("Contact sanity", args.contacts, contacts),
+    ):
+        add(f"| {label} | `{path}` | {'present' if obj else NOT_RUN} |")
+    add("")
 
-    # SUMMARY.md
-    L = ["# HoloGNN — Results Summary (auto-generated)\n",
-         "Numbers below are produced by this run on YOUR data and splits.\n",
-         "| Task | Metric | Value | Regime |", "|---|---|---|---|"]
-    if stab and stab.get("best"):
-        b = stab["best"]
-        L += [f"| Stability | Pearson r | {b['pearson_r']:.4f} | 30% protein-disjoint |",
-              f"| Stability | MAE | {b['mae']:.3f} | |",
-              f"| Stability | RMSE | {b['rmse']:.3f} | |",
-              f"| Stability | Mean antisymmetry violation | {b['mean_antisymmetry_violation']:.3f} | |"]
-    if stab and nomech and stab.get("best") and nomech.get("best"):
-        d = stab["best"]["pearson_r"] - nomech["best"]["pearson_r"]
-        L += [f"| Ablation | Δr from E_mech track | {d:+.4f} | dual − single track (measured) |"]
-    if path and path.get("results"):
-        r = path["results"]
-        if "random_split" in r:
-            L += [f"| Pathogenicity | AUROC | {r['random_split']['auroc']:.3f} | random split (optimistic) |"]
-        if "gene_disjoint_split" in r:
-            L += [f"| Pathogenicity | AUROC | {r['gene_disjoint_split']['auroc']:.3f} | gene-disjoint |"]
-        if "gene_disjoint_cv" in r:
-            cv = r["gene_disjoint_cv"]
-            L += [f"| Pathogenicity | AUROC (CV) | {cv['mean']:.3f} ± {cv['std']:.3f} | gene-disjoint GroupKFold |"]
-    if base:
-        L += [f"| Baseline | ESM zero-shot \\|r\\| | {base.get('abs_pearson_r', float('nan')):.3f} | same stability test split |"]
-    if idr:
-        L += [f"| IDR | Rg MAE vs physics prior | {idr.get('rg_mae_vs_prior', float('nan')):.2f} Å | disclosed prior (not experimental) |"]
-    if contacts and contacts.get("esm_contacts"):
-        ec = contacts["esm_contacts"]["long_range_fraction_topL"]
-        lc = contacts["linear_baseline"]["long_range_fraction_topL"]
-        L += [f"| Contacts (Q2) | Long-range fraction (top-L) | {ec:.3f} vs {lc:.3f} | ESM E_geo vs linear baseline |"]
-        if contacts.get("precision_vs_structure"):
-            pv = contacts["precision_vs_structure"]
-            L += [f"| Contacts (Q2) | Precision@L/5 | {pv['esm_precision_at_L5']:.3f} vs {pv['linear_precision_at_L5']:.3f} | ESM vs linear (with structures) |"]
-    if sweep and sweep.get("points"):
-        pts = ", ".join(f"{p['eps']}:{p['pearson_r']:.3f}" for p in sweep["points"])
-        L += [f"| Ablation (Q9) | eps/delta sweep (r) | {pts} | E_mech threshold sensitivity |"]
+    # --- headline ----------------------------------------------------------
+    add("## Model")
+    add("")
+    if not main_metrics:
+        add(f"**{NOT_RUN}** — no `metrics.json` under `{args.runs}`. "
+            "Run `python run.py all` to populate this section.")
+    else:
+        cfg = main_metrics.get("config", {})
+        add(f"- Encoder: `{cfg.get('esm_model', NOT_RUN)}` (frozen, cached)")
+        add(f"- Window: {cfg.get('window', NOT_RUN)} residues, mutation-centered")
+        add(f"- Parameters: {main_metrics.get('parameters', NOT_RUN)}")
+        add(f"- Best epoch: {main_metrics.get('best_epoch', NOT_RUN)}")
+        add(f"- Wall clock: {fmt(main_metrics.get('wall_clock_hours'), 2)} h")
+        add(f"- Trained tasks: {main_metrics.get('trained_tasks', NOT_RUN)}")
+        untrained = main_metrics.get("untrained_heads") or []
+        if untrained:
+            add(f"- **Untrained heads (no data supplied): {untrained}** — these are "
+                "not capabilities and must not be reported as results.")
+        add("")
+        add("### Test-split metrics")
+        add("")
+        add("| Task | Metric | Value |")
+        add("|---|---|---:|")
+        for task, metrics in sorted((main_metrics.get("test") or {}).items()):
+            for key, value in metrics.items():
+                if isinstance(value, (int, float)):
+                    add(f"| {task} | {key} | {fmt(value)} |")
+        if not main_metrics.get("test"):
+            add(f"| — | — | {NOT_RUN} |")
+    add("")
 
-    with open(os.path.join(RESULTS, "SUMMARY.md"), "w", encoding="utf-8") as fh:
-        fh.write("\n".join(L) + "\n")
+    # --- baselines ---------------------------------------------------------
+    add("## Baselines (same split, same target)")
+    add("")
+    if not baselines:
+        add(f"**{NOT_RUN}** — run `python run.py baselines`.")
+    else:
+        add("| Baseline | Metric | Value |")
+        add("|---|---|---:|")
+        for name, metrics in (baselines.get("baselines") or {}).items():
+            for key, value in metrics.items():
+                if isinstance(value, (int, float)):
+                    add(f"| {name} | {key} | {fmt(value)} |")
+        add("")
+        add("`esm_mlp` is the control that matters: a supervised MLP on the same "
+            "cached embeddings with no graph. The gap between it and the model is "
+            "the message-passing contribution.")
+    add("")
 
-    print("Wrote results/ (SUMMARY.md + sorted metric files). Key numbers:")
-    print("\n".join(L[4:]) if len(L) > 4 else "  (no run outputs found yet - run the pipeline first)")
+    # --- ablations ---------------------------------------------------------
+    add("## Ablations")
+    add("")
+    if not ablations:
+        add(f"**{NOT_RUN}** — run `python run.py ablations`.")
+    else:
+        add("| Arm | Task | Metric | Delta vs full |")
+        add("|---|---|---|---:|")
+        for arm, tasks in (ablations.get("delta_vs_full") or {}).items():
+            for task, metrics in tasks.items():
+                for key, value in metrics.items():
+                    add(f"| {arm} | {task} | {key} | {fmt(value)} |")
+        add("")
+        add("Delta is (ablated − full). A component earns its place when removing "
+            "it makes the metric worse.")
+    add("")
+
+    # --- calibration -------------------------------------------------------
+    add("## Uncertainty calibration")
+    add("")
+    if not calibration:
+        add(f"**{NOT_RUN}** — run `python run.py calibration`. Until this exists "
+            "the interface must not present a confidence interval as calibrated.")
+    else:
+        cal = calibration.get("calibration", {})
+        add("| Nominal coverage | Observed |")
+        add("|---|---:|")
+        for key, nominal in (cal.get("coverage_nominal") or {}).items():
+            add(f"| {key} | {fmt((cal.get('coverage_observed') or {}).get(key))} |")
+        add("")
+        add(f"- Expected calibration error: {fmt(cal.get('expected_calibration_error'))}")
+        add(f"- Mean predicted sigma: {fmt(cal.get('mean_predicted_sigma'))} "
+            f"(residual std {fmt(cal.get('residual_std'))})")
+        rev = calibration.get("reversibility", {})
+        add(f"- Reversibility (mutant re-encoded as its own parent): "
+            f"mean violation {fmt(rev.get('mean_violation_kcal_per_mol'))} kcal/mol "
+            f"over n={rev.get('n', NOT_RUN)}")
+    add("")
+
+    # --- leakage -----------------------------------------------------------
+    add("## Split integrity")
+    add("")
+    if not leakage:
+        add(f"**{NOT_RUN}** — run `python run.py splits`.")
+    else:
+        for name, rep in leakage.items():
+            if not rep:
+                continue
+            grouping = rep.get("grouping", {})
+            add(f"**{name}** — {grouping.get('clustering', NOT_RUN)}; "
+                f"{grouping.get('n_groups', NOT_RUN)} groups over "
+                f"{grouping.get('n_parent_sequences', NOT_RUN)} parent sequences; "
+                f"gene relation merged: {grouping.get('gene_relation_used', NOT_RUN)}")
+            add("")
+            add("| Split | n | target std / positive fraction |")
+            add("|---|---:|---:|")
+            for split, stats in (rep.get("per_split") or {}).items():
+                spread = stats.get("target_std", stats.get("positive_fraction"))
+                add(f"| {split} | {stats.get('n', NOT_RUN)} | {fmt(spread)} |")
+            add("")
+            load = rep.get("load_report", {})
+            add(f"Rows kept {load.get('rows_out', NOT_RUN)} / "
+                f"{load.get('rows_in', NOT_RUN)}; dropped by reason: "
+                f"{load.get('dropped_by_reason', NOT_RUN)}")
+            add("")
+
+    # --- contacts ----------------------------------------------------------
+    add("## Geometric-edge sanity")
+    add("")
+    if not contacts:
+        add(f"**{NOT_RUN}** — run `python run.py contacts`.")
+    else:
+        head = contacts.get("contact_head", {})
+        base = contacts.get("sequence_proximity_baseline", {})
+        add(f"- Long-range fraction (top-L): "
+            f"**{fmt(head.get('long_range_fraction_topL'))}** for the contact head "
+            f"vs {fmt(base.get('long_range_fraction_topL'))} for a sequence-proximity "
+            f"baseline, over {contacts.get('n_sequences', NOT_RUN)} sequences.")
+        if "precision_vs_structure" in contacts:
+            p = contacts["precision_vs_structure"]
+            add(f"- Precision@L: {fmt(p.get('contact_head_precision_at_L'))} vs "
+                f"{fmt(p.get('baseline_precision_at_L'))} baseline "
+                f"(n={p.get('n_with_structure')})")
+    add("")
+
+    summary_path = os.path.join(args.out, "SUMMARY.md")
+    with open(summary_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+    machine = {
+        "training": main_metrics or NOT_RUN,
+        "calibration": calibration or NOT_RUN,
+        "baselines": baselines or NOT_RUN,
+        "ablations": ablations or NOT_RUN,
+        "contacts": contacts or NOT_RUN,
+        "splits": {k: (v or NOT_RUN) for k, v in leakage.items()} or NOT_RUN,
+    }
+    with open(os.path.join(args.out, "results.json"), "w", encoding="utf-8") as fh:
+        json.dump(machine, fh, indent=2)
+
+    missing = [k for k, v in machine.items() if v == NOT_RUN]
+    print(f"[collect] wrote {summary_path}")
+    if missing:
+        print(f"[collect] stages not yet run: {missing}")
 
 
 if __name__ == "__main__":
