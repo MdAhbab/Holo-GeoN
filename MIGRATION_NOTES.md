@@ -237,15 +237,15 @@ CPU.
 
 ## Adversarial review record
 
-Phase 2 of this migration is a hostile-reviewer audit: a separate agent, given
-no stake in the code, executes every claim the repository makes and writes up
+Phase 2 of this migration is a hostile-reviewer audit: an independent pass with
+no stake in the code executes every claim the repository makes and writes up
 what it can break. Each round is committed as `REVIEW_ROUND_<n>.md` so the
 findings stay in the history rather than being quietly absorbed into a fix.
 
 The bar for stopping is a round that raises no new BLOCKER or MAJOR — not a
 fixed number of rounds.
 
-### Round 1 — `REVIEW_ROUND_1.md` (commit `03d6145`)
+### Round 1 — `REVIEW_ROUND_1.md` (commit `773ed30`)
 
 **Verdict: reject in current form.** 27 findings: 5 BLOCKER, 15 MAJOR, 7 MINOR.
 
@@ -267,7 +267,7 @@ the three-state head, padding invariance across heterogeneous batch lengths
 chunk-stitching, union-find grouping, the parameter count, and the absence of any
 demo-mode path in the interface.
 
-**Fixed in commit `102262c`** — all 27, each named in the commit message.
+**Fixed in commit `fc8e86e`** — all 27, each named in the commit message.
 `tests/test_round1_fixes.py` reproduces the original defect for the findings that
 can be exercised without data or a GPU, so none of them can return silently:
 seeding determinism, the bounded multi-task objective (the reviewer's probe drove
@@ -280,11 +280,48 @@ and they are the ones that matter most for the paper:
 
 - **`cds_coverage` is now a recorded number.** The encoder cache carries a
   manifest, `train.py` copies it into `metrics.json`, and training warns when the
-  mechanistic stream is enabled against a cache with zero coverage. A claim about
-  E_mech can now be checked against the cache the run actually read.
+  mechanistic stream is enabled against a cache with zero coverage.
+  **Round 2 showed this does not yet do what this paragraph claims** — the number
+  is counted from the input table rather than from the cache, and the warning is
+  skipped for any cache written before manifests existed (R2-01). Until that is
+  fixed, `cds_coverage` is not evidence about E_mech.
 - **`scripts/budget.py` refuses to print an unmeasured estimate.** See above.
 - **`validated_by_real_run` is deleted.** A flag that asserts validation is worse
   than no flag when nothing checks it.
 
-### Round 2 — pending
+### Round 2 — `REVIEW_ROUND_2.md`
+
+**Verdict: major revision.** 17 new findings: 3 BLOCKER, 6 MAJOR, 8 MINOR, plus a
+row-by-row re-test of all 27 round-1 fixes (12 verified, 9 partial, 3 not fixed
+at all, 1 relocated rather than removed).
+
+The most important result of this round is not a new finding. It is that the
+round-1 fix commit asserted all 27 were "executed, not reasoned about" and three
+were not: the deep mutational scan still makes one encoder call per position
+(60 positions, 60 calls, one distinct sequence), the chunk-selection clamp is a
+provable no-op, and the mechanistic-coverage warning is gated so that it never
+fires for any cache that currently exists. A commit message is not evidence.
+
+| ID | Finding | Consequence if shipped |
+|---|---|---|
+| R2-01 | `cds_coverage` counts rows in the input table, not records in the cache | Reports `1.0` for a cache in which every record has `mech_valid = 0`. The one number introduced to make an empty E_mech impossible to miss would itself have concealed it |
+| R2-02 | Whole-sequence graphs grew 256 → 2048 nodes against one shared `batch_size: 64` | 33 GB analytic lower bound on the documented 16 GB card, so the fix for R1-07 makes those three heads untrainable |
+| R2-03 | `IdrTab.tsx` ships `μ / L^0.33 < 2.5 → "Globular / compact"`, in source and in the checked-in `dist/` | A hardcoded biophysical classifier displayed as a model result — the predecessor's exact pathology, in the component this document singles out as cleaned |
+
+Six majors follow from two themes. The whole-sequence "leakage control" groups
+on exact sequence, so it returns "no leakage" on a DMS-shaped table where every
+test row has a training row one or two residues away. And `separable_from_noise`
+(`|Δ| > sd_a + sd_b`) has an 8.3% per-comparison false-positive rate at the three
+seeds the code recommends; the shipped grid writes 80 uncorrected comparisons, so
+P(at least one spurious "this component matters") is 0.999 under the global null.
+No ablation table can be written until both are fixed.
+
+Confirmed sound under direct test, and not to be churned: run-to-run determinism
+is now bit-identical on CPU (R1-01 genuinely closed), `_cap_degree` correctness
+and its 35.3 → 2.81 ms fix, exclusion accounting on the primary tasks, both
+no-val-split refusals, the CLNSIG vocabulary, fp16 `logaddexp`, the bounded
+objective, degenerate-input robustness, and the absence of any demo path in the
+backend.
+
+### Round 3 — pending
 

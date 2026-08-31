@@ -1,7 +1,7 @@
 # Review round 2
 
-Repository: `Holo-GeoN`, branch `version-2`, HEAD `427f1fa`.
-Prior round: `REVIEW_ROUND_1.md` (commit `03d6145`), fixes claimed in `102262c`.
+Repository: `Holo-GeoN`, branch `version-2`, HEAD `680f90e`.
+Prior round: `REVIEW_ROUND_1.md` (commit `773ed30`), fixes claimed in `fc8e86e`.
 
 **Environment.** Python 3.11.15, torch 2.13.0+cu130 (CPU only), torch_geometric
 2.8.0, numpy 2.4.6, pandas 3.0.5, scikit-learn 1.9.0, scipy 1.17.1. No GPU, no
@@ -810,7 +810,7 @@ round.
   `a["test"] == b["test"] -> True`. R1-01's 0.030 spread is gone on this path.
   (`/tmp/p2/p2 run a/b`, logs in `/tmp/p2/w1/log_a.txt`, `log_b.txt`.)
 * **`_cap_degree` correctness and its performance fix.** I reimplemented the
-  pre-fix greedy loop from `03d6145` and compared at realistic densities. At the
+  pre-fix greedy loop from `773ed30` and compared at realistic densities. At the
   shipped pipeline's density (cache top-24, threshold 0.30, `graph_top_k = 16`)
   the vectorised version keeps 89–98% of the greedy version's edges, the max
   degree is exactly 16 in both, no node is isolated, and the long-range fraction
