@@ -207,12 +207,21 @@ framing are gone. This is one codebase, not a changelog.
 
 Built for an RTX 5070 Ti (16 GB, sm_120), 32 GB RAM, over 2–3 days.
 
-Measured from real tensor shapes (`python -m scripts.budget`):
+Counted from the constructed model and computed from real tensor shapes
+(`python -m scripts.budget`):
 
-- Trainable parameters: 20,601,900 (~79 MiB fp32, ~236 MiB with AdamW states).
+- Trainable parameters: 20,607,788 (~79 MiB fp32, ~236 MiB with AdamW states).
 - One batch of 64 at window 256 with the 650M encoder: ~80 MiB of node features,
-  estimated ~0.8 GB peak. There is substantial headroom — larger batches are
-  available if throughput needs them.
+  ~1.23 GB of GATv2 edge tensors and ~2.50 GB of SSM scan buffers, giving an
+  analytic **lower bound** of 4.12 GB.
+- **There is no peak-memory estimate here.** The first version of this section
+  carried one, derived from a `6×` constant multiplier applied to the node
+  features; the round-1 review measured that it under-stated the real peak by an
+  order of magnitude, and this hardware plan had been written on top of it.
+  `scripts/budget.py` now refuses to print an activation figure that is not a
+  `torch.cuda.max_memory_allocated()` measurement. Run it on the 5070 Ti to get
+  the real number before committing to a batch size; 64 fits the lower bound
+  with room, but the lower bound is not the peak.
 - Encoder cache: `unique_residues × (2·d + 24·10)` bytes. At 12M residues with
   the 650M encoder that is ~31 GB. `precompute` prints the projection before
   writing and `--max-cache-gb` aborts rather than filling the disk. The 150M
@@ -223,3 +232,59 @@ during training — only precompute and the interface load it.
 
 Install the cu128 wheel first, or the card will error or silently fall back to
 CPU.
+
+---
+
+## Adversarial review record
+
+Phase 2 of this migration is a hostile-reviewer audit: a separate agent, given
+no stake in the code, executes every claim the repository makes and writes up
+what it can break. Each round is committed as `REVIEW_ROUND_<n>.md` so the
+findings stay in the history rather than being quietly absorbed into a fix.
+
+The bar for stopping is a round that raises no new BLOCKER or MAJOR — not a
+fixed number of rounds.
+
+### Round 1 — `REVIEW_ROUND_1.md` (commit `03d6145`)
+
+**Verdict: reject in current form.** 27 findings: 5 BLOCKER, 15 MAJOR, 7 MINOR.
+
+The five blockers, and why they mattered:
+
+| ID | Finding | Consequence if shipped |
+|---|---|---|
+| R1-01 | Nothing in the training path was seeded | Two runs of one command differed by 0.030 test Pearson — larger than most ablation effects, so every single-run `delta_vs_full` was uninterpretable |
+| R1-02 | Unreachable checkpoint guard | A run could select no checkpoint and still print test metrics, under a flag literally named `validated_by_real_run` |
+| R1-03 | `itertools.cycle` over the loader | Retained a whole epoch of batches and re-served one frozen shuffle order |
+| R1-04 | Substring matching on ClinVar CLNSIG | `Conflicting_interpretations_of_pathogenicity` and `non-pathogenic` both read as pathogenic |
+| R1-05 | The CDS-joined table was written but never read downstream | `mech_valid` 0 everywhere, `E_mech` self-loops only — the `no_mech_stream` ablation would have measured a stream that was never fed, and a ~0 delta would have been written up as "the mechanistic stream does not contribute" |
+
+The reviewer also confirmed what holds, and those parts were deliberately left
+alone: exact head antisymmetry in both train and eval mode, swap-equivariance of
+the three-state head, padding invariance across heterogeneous batch lengths
+(2.98e-07), the parallel associative scan against the sequential recurrence
+(≤4.8e-07), mutation windowing at both termini, `_cap_degree` correctness,
+chunk-stitching, union-find grouping, the parameter count, and the absence of any
+demo-mode path in the interface.
+
+**Fixed in commit `102262c`** — all 27, each named in the commit message.
+`tests/test_round1_fixes.py` reproduces the original defect for the findings that
+can be exercised without data or a GPU, so none of them can return silently:
+seeding determinism, the bounded multi-task objective (the reviewer's probe drove
+the total to -1.9e19; it now converges), the CLNSIG vocabulary, full-length
+whole-sequence coverage, ddG sign normalisation, unknown-residue handling, the
+no-val-split refusal, and cache-manifest CDS coverage.
+
+Three round-1 fixes changed what gets recorded rather than what gets computed,
+and they are the ones that matter most for the paper:
+
+- **`cds_coverage` is now a recorded number.** The encoder cache carries a
+  manifest, `train.py` copies it into `metrics.json`, and training warns when the
+  mechanistic stream is enabled against a cache with zero coverage. A claim about
+  E_mech can now be checked against the cache the run actually read.
+- **`scripts/budget.py` refuses to print an unmeasured estimate.** See above.
+- **`validated_by_real_run` is deleted.** A flag that asserts validation is worse
+  than no flag when nothing checks it.
+
+### Round 2 — pending
+
