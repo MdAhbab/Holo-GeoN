@@ -1,36 +1,44 @@
-# --- Datasets (already on the training machine; never committed) ---
+# --- data & caches (never commit datasets or embeddings) ---
 data/
-CLEANED_DATA/
-*.parquet
-*.csv
-*.tsv
-*.vcf
-*.fasta
-*.fastq
-*.sptxt
-*.gz
-*.zip
-*.npy
-*.sig
-
-# --- Precomputed ESM cache + training outputs + weights ---
 cache/
 runs/
+*.parquet
+*.npy
+*.npz
+*.csv
+*.tsv
+*.fasta
+*.gz
+*.zip
+*.vcf
+
+# --- trained weights ---
 *.pt
 *.pth
 *.ckpt
-.mmseqs_tmp/
 
-# --- Python ---
+# --- app runtime ---
+*.db
+*.sqlite
+*.sqlite3
+
+# --- python ---
 __pycache__/
-*.pyc
-.ipynb_checkpoints/
+*.py[cod]
 .venv/
 venv/
+env/
+*.egg-info/
+.ipynb_checkpoints/
 
-# --- OS / editor ---
+# --- node / vite ---
+node_modules/
+app/frontend/dist/
+npm-debug.log*
+
+# --- os / editor ---
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
-
+.claude/

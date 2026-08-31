@@ -1,23 +1,34 @@
 """
 src/backbone.py
 ===============
-HoloGNN backbone — now genuinely dual-track.
+The trainable backbone: two GATv2 message-passing streams over a windowed
+protein graph, on top of cached frozen-encoder features.
 
-Two decoupled pieces:
+Input is a dense padded batch — ``(B, L, ...)`` with a validity mask — because
+every window has the same maximum length and the sequence mixer wants a real
+sequence axis. The GATv2 layers operate on the flattened ``(B*L, C)`` node
+tensor with edge indices offset by ``b * L``, which is standard mini-batching
+for graphs of equal node capacity.
 
-1. ``EsmEncoder`` — a FROZEN ESM-2 wrapper used by scripts/precompute_embeddings.py
-   to produce per-residue embeddings AND a validated contact-probability map
-   (ESM-2 contact head). Freezing + caching keeps training on a single consumer
-   GPU light (the ESM forward is removed from the training loop). The checkpoint
-   is selectable via ``--esm-model``.
+Pipeline
+--------
+1. **Sequence mixing.** A selective state-space mixer runs over the residue
+   axis in linear time, giving every residue a cheap view of the whole window
+   before any graph structure is imposed.
+2. **Fusion.** Cross-attention between the language-model embeddings (queries)
+   and the mechanistic channels (keys/values), so mechanistic context modulates
+   the evolutionary representation rather than being concatenated beside it.
+3. **Two streams.** GATv2 over E_geo (spatial contacts) and over E_mech
+   (translational coupling), each consuming the 3-channel edge features from
+   ``src/graphs.py``.
+4. **Fuse + residual.** Stream outputs are combined and the raw language-model
+   embedding is added back through a projection, then LayerNorm — the skip that
+   keeps residue identity intact against over-smoothing.
 
-2. ``DualTrackGNN`` — the trainable model. It consumes cached node embeddings +
-   4 mechanistic channels and runs TWO GATv2 tracks:
-        geo  track over E_geo  (spatial contacts)
-        mech track over E_mech (translational coupling)
-   then fuses them, adds a residual from the language-model embedding, and mean-
-   pools to a graph vector. When E_mech is empty (protein-only input), the mech
-   track degrades to a self-transform via self-loops.
+``torch_geometric`` is a hard requirement. v1 carried a silent fallback that
+bypassed the GAT layers with a plain linear projection when PyG was missing,
+which meant a "trained model" could quietly contain no message passing at all.
+A missing dependency now raises at construction.
 """
 
 from __future__ import annotations
@@ -25,144 +36,140 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-# ESM dims by checkpoint (HF names) — used to size projections without a forward.
-ESM_DIMS = {
-    "facebook/esm2_t6_8M_UR50D": 320,
-    "facebook/esm2_t12_35M_UR50D": 480,
-    "facebook/esm2_t30_150M_UR50D": 640,
-    "facebook/esm2_t33_650M_UR50D": 1280,
-    "facebook/esm2_t36_3B_UR50D": 2560,
-}
-DEFAULT_ESM = "facebook/esm2_t33_650M_UR50D"  # 1280-dim, fits 16 GB frozen
-N_MECH_CHANNELS = 4
+from src.features import N_MECH_CHANNELS
+from src.graphs import EDGE_DIM
+from src.sequence_mixers import CrossAttentionFusion, SelectiveSSM
 
 try:
     from torch_geometric.nn import GATv2Conv
     PYG_AVAILABLE = True
-except Exception:
+except Exception:  # pragma: no cover - environment dependent
     GATv2Conv = None
     PYG_AVAILABLE = False
 
 
-# ---------------------------------------------------------------------------
-# Frozen ESM encoder (used only for precompute / caching)
-# ---------------------------------------------------------------------------
-class EsmEncoder(nn.Module):
-    """Frozen ESM-2 wrapper: sequence -> (per-residue embedding, contact map)."""
+_PYG_HINT = (
+    "torch_geometric is required for the message-passing streams. "
+    "Install it with `pip install torch_geometric` (after installing torch). "
+    "There is deliberately no non-graph fallback: a model that silently skips "
+    "its GNN layers is not the model this repository evaluates."
+)
 
-    def __init__(self, esm_model_name: str = DEFAULT_ESM, device: str = "cpu"):
+
+class _Stream(nn.Module):
+    """One two-layer GATv2 message-passing stream with edge features."""
+
+    def __init__(self, in_dim: int, hidden: int, out_dim: int, heads: int = 4):
         super().__init__()
-        from transformers import AutoTokenizer, EsmModel
-        self.name = esm_model_name
-        self.tokenizer = AutoTokenizer.from_pretrained(esm_model_name)
-        # eager attention is required: ESM's predict_contacts() / output_attentions
-        # need real attention maps, which the default `sdpa` impl does not emit
-        # (transformers >=5 selects sdpa by default).
-        self.esm = EsmModel.from_pretrained(esm_model_name, add_pooling_layer=False,
-                                            attn_implementation="eager")
-        self.esm.eval()
-        for p in self.esm.parameters():
-            p.requires_grad = False
-        self.device = device
-        self.to(device)
+        self.conv1 = GATv2Conv(
+            in_dim, hidden, heads=heads, concat=False,
+            edge_dim=EDGE_DIM, add_self_loops=False,
+        )
+        self.conv2 = GATv2Conv(
+            hidden, out_dim, heads=heads, concat=False,
+            edge_dim=EDGE_DIM, add_self_loops=False,
+        )
+        self.act = nn.ReLU()
 
-    @torch.no_grad()
-    def embed(self, seq: str, max_length: int = 256):
-        """Return (L, esm_dim) residue embeddings (CLS/EOS stripped)."""
-        toks = self.tokenizer(seq, return_tensors="pt", truncation=True,
-                              max_length=max_length + 2)
-        toks = {k: v.to(self.device) for k, v in toks.items()}
-        out = self.esm(**toks)
-        h = out.last_hidden_state[0, 1:-1]  # strip CLS/EOS
-        return h.cpu()
-
-    @torch.no_grad()
-    def contacts(self, seq: str, max_length: int = 256):
-        """
-        Return (L, L) contact probabilities from ESM-2's contact head.
-        Falls back to symmetrised last-layer attention if the contact head is
-        unavailable in the loaded checkpoint.
-        """
-        toks = self.tokenizer(seq, return_tensors="pt", truncation=True,
-                              max_length=max_length + 2)
-        toks = {k: v.to(self.device) for k, v in toks.items()}
-        try:
-            cm = self.esm.predict_contacts(toks["input_ids"], toks["attention_mask"])
-            return cm[0].float().cpu()  # (L, L), CLS/EOS already removed by HF
-        except Exception:
-            out = self.esm(**toks, output_attentions=True)
-            attn = out.attentions[-1][0].mean(0)        # (L+2, L+2) head-mean
-            attn = attn[1:-1, 1:-1]                      # strip CLS/EOS
-            return (attn + attn.t()).float().cpu()
+    def forward(self, x, edge_index, edge_attr):
+        x = self.act(self.conv1(x, edge_index, edge_attr))
+        return self.conv2(x, edge_index, edge_attr)
 
 
-# ---------------------------------------------------------------------------
-# Trainable dual-track GNN (operates on cached embeddings)
-# ---------------------------------------------------------------------------
-def _gat(in_dim: int, out_dim: int, heads: int = 4):
-    if PYG_AVAILABLE:
-        return GATv2Conv(in_dim, out_dim, heads=heads, concat=False, add_self_loops=True)
-    # Fallback (no PyG): a residual-friendly linear "message" so the module still
-    # runs for testing plumbing. Real runs require torch_geometric.
-    return nn.Linear(in_dim, out_dim)
+class DualStreamGNN(nn.Module):
+    """
+    Args:
+        esm_dim         : encoder hidden size (1280 for ESM-2 650M).
+        mech_dim        : mechanistic channels (7).
+        hidden, out_dim : GATv2 sizes.
+        heads           : GATv2 attention heads.
+        use_ssm         : run the selective state-space mixer.
+        use_mech_stream : enable the E_mech stream. The shipped model is
+                          dual-stream; this exists so the ablation runner can
+                          measure the mechanistic stream's contribution against
+                          an otherwise identical model.
+    """
 
-
-class _Track(nn.Module):
-    """One GATv2 (or linear-fallback) track."""
-    def __init__(self, in_dim, hidden, out_dim):
+    def __init__(
+        self,
+        esm_dim: int,
+        mech_dim: int = N_MECH_CHANNELS,
+        hidden: int = 256,
+        out_dim: int = 256,
+        heads: int = 4,
+        use_ssm: bool = True,
+        use_mech_stream: bool = True,
+        dropout: float = 0.1,
+    ):
         super().__init__()
-        self.g1 = _gat(in_dim, hidden)
-        self.g2 = _gat(hidden, out_dim)
-        self.relu = nn.ReLU()
+        if not PYG_AVAILABLE:
+            raise ImportError(_PYG_HINT)
 
-    def forward(self, x, edge_index):
-        if PYG_AVAILABLE:
-            x = self.relu(self.g1(x, edge_index))
-            x = self.g2(x, edge_index)
-        else:
-            x = self.relu(self.g1(x))
-            x = self.g2(x)
-        return x
+        self.esm_dim = esm_dim
+        self.mech_dim = mech_dim
+        self.out_dim = out_dim
+        self.use_mech_stream = use_mech_stream
 
+        self.ssm = SelectiveSSM(dim=esm_dim) if use_ssm else None
+        self.fusion = CrossAttentionFusion(esm_dim=esm_dim, mech_dim=mech_dim, heads=heads)
 
-class DualTrackGNN(nn.Module):
-    def __init__(self, esm_dim: int = ESM_DIMS[DEFAULT_ESM], hidden: int = 256,
-                 out_dim: int = 256, use_mech_track: bool = True):
-        super().__init__()
-        self.use_mech_track = use_mech_track
-        node_dim = esm_dim + N_MECH_CHANNELS
-        self.geo_track = _Track(node_dim, hidden, out_dim)
-        if use_mech_track:
-            self.mech_track = _Track(node_dim, hidden, out_dim)
+        node_dim = esm_dim + mech_dim
+        self.geo_stream = _Stream(node_dim, hidden, out_dim, heads)
+        if use_mech_stream:
+            self.mech_stream = _Stream(node_dim, hidden, out_dim, heads)
             self.fuse = nn.Linear(2 * out_dim, out_dim)
+
         self.residual_proj = nn.Linear(esm_dim, out_dim, bias=False)
         self.norm = nn.LayerNorm(out_dim)
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, esm_emb, mech_feats, edge_geo, edge_mech, batch=None):
+    def forward(
+        self,
+        esm: torch.Tensor,
+        mech: torch.Tensor,
+        mask: torch.Tensor,
+        edge_geo: torch.Tensor,
+        attr_geo: torch.Tensor,
+        edge_mech: torch.Tensor,
+        attr_mech: torch.Tensor,
+    ) -> torch.Tensor:
         """
-        esm_emb    : (N, esm_dim) cached per-residue embeddings (N = sum of L).
-        mech_feats : (N, 4) mechanistic channels.
-        edge_geo   : (2, Eg)  geometric edges (global node ids).
-        edge_mech  : (2, Em)  mechanistic edges (global node ids).
-        batch      : (N,) graph id per node for pooling (None => single graph).
-        Returns    : (G, out_dim) graph embeddings.
+        Args:
+            esm       : (B, L, esm_dim) cached per-residue embeddings.
+            mech      : (B, L, mech_dim) mechanistic channels.
+            mask      : (B, L) 1 for a real residue, 0 for padding.
+            edge_geo  : (2, E)  flattened-node indices into B*L.
+            attr_geo  : (E, 3)  edge features.
+            edge_mech : (2, E') flattened-node indices into B*L.
+            attr_mech : (E', 3) edge features.
+        Returns:
+            (B, L, out_dim) node embeddings.
         """
-        x = torch.cat([esm_emb, mech_feats], dim=-1)
-        g = self.geo_track(x, edge_geo)
-        if self.use_mech_track:
-            m = self.mech_track(x, edge_mech)
-            fused = self.fuse(torch.cat([g, m], dim=-1))
+        B, L, _ = esm.shape
+        pad = mask == 0
+
+        # 1. sequence mixing (padding zeroed so it cannot leak into the scan)
+        x_esm = esm.masked_fill(pad.unsqueeze(-1), 0.0)
+        if self.ssm is not None:
+            x_esm = self.ssm(x_esm)
+            x_esm = x_esm.masked_fill(pad.unsqueeze(-1), 0.0)
+
+        # 2. cross-attention fusion of the two feature tracks
+        nodes = self.fusion(x_esm, mech, key_padding_mask=pad)      # (B, L, esm+mech)
+
+        # 3. message passing over each stream
+        x_flat = nodes.reshape(B * L, -1)
+        g = self.geo_stream(x_flat, edge_geo, attr_geo)
+        if self.use_mech_stream:
+            m = self.mech_stream(x_flat, edge_mech, attr_mech)
+            h = self.fuse(torch.cat([g, m], dim=-1))
         else:
-            fused = g
-        h = self.norm(fused + self.residual_proj(esm_emb))
-        return _mean_pool(h, batch)
+            h = g
+
+        # 4. language-model residual + norm
+        h = self.norm(h + self.residual_proj(x_esm.reshape(B * L, -1)))
+        h = self.dropout(h)
+        return h.view(B, L, self.out_dim).masked_fill(pad.unsqueeze(-1), 0.0)
 
 
-def _mean_pool(x, batch):
-    if batch is None:
-        return x.mean(dim=0, keepdim=True)
-    G = int(batch.max().item()) + 1
-    out = torch.zeros(G, x.size(-1), device=x.device, dtype=x.dtype)
-    out.index_add_(0, batch, x)
-    counts = torch.bincount(batch, minlength=G).clamp(min=1).unsqueeze(-1)
-    return out / counts
+__all__ = ["DualStreamGNN", "PYG_AVAILABLE"]

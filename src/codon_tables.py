@@ -17,8 +17,6 @@ w_i = f_i / max_j(f_j) over the synonymous family of codon i (Sharp & Li, 1987).
 
 from __future__ import annotations
 
-import hashlib
-import random
 
 # Standard genetic code: codon (DNA, T not U) -> amino acid one-letter ('*' = stop)
 GENETIC_CODE: dict[str, str] = {
@@ -106,55 +104,3 @@ def get_cai_weights(organism: str = "human") -> dict[str, float]:
 # ---------------------------------------------------------------------------
 # Back-translation (usage-weighted proxy transcript)
 # ---------------------------------------------------------------------------
-def _codons_by_aa(fraction_table: dict[str, float]) -> dict[str, list[tuple[str, float]]]:
-    """amino acid -> [(codon, usage_fraction), ...], stop codons excluded."""
-    by_aa: dict[str, list[tuple[str, float]]] = {}
-    for codon, aa in GENETIC_CODE.items():
-        if aa == "*":
-            continue
-        by_aa.setdefault(aa, []).append((codon, fraction_table.get(codon, 0.0)))
-    return by_aa
-
-
-HUMAN_CODONS_BY_AA: dict[str, list[tuple[str, float]]] = _codons_by_aa(HUMAN_CODON_FRACTION)
-
-# Registry mirroring CODON_WEIGHT_TABLES so a --organism flag can select either.
-CODONS_BY_AA_TABLES: dict[str, dict[str, list[tuple[str, float]]]] = {
-    "human": HUMAN_CODONS_BY_AA,
-}
-
-
-def back_translate(protein_seq: str, organism: str = "human", seed: int | None = None) -> str:
-    """
-    Usage-weighted back-translation: assign each residue a codon sampled from the
-    organism's synonymous codon-usage distribution.
-
-    This is an EXPLICIT codon-usage proxy transcript, NOT a real coding sequence —
-    used only as a fallback so the mechanistic (CAI / mRNA-folding) track is
-    defined when no experimental CDS is available. Sampling is weighted by the
-    reference usage fractions (so high-usage codons dominate, giving per-residue
-    CAI/folding variation rather than a degenerate constant), and is seeded
-    deterministically from the sequence itself, so a given protein always yields
-    the same proxy transcript across runs and machines.
-
-    Non-standard residues (X, B, Z, U, O, gaps) map to 'NNN'.
-    """
-    if organism not in CODONS_BY_AA_TABLES:
-        raise KeyError(
-            f"Unknown organism '{organism}'. Available: {list(CODONS_BY_AA_TABLES)}"
-        )
-    table = CODONS_BY_AA_TABLES[organism]
-    if seed is None:
-        # stable hash (Python's hash() is salted per-process; md5 is reproducible)
-        seed = int(hashlib.md5(protein_seq.encode()).hexdigest()[:8], 16)
-    rng = random.Random(seed)
-    out: list[str] = []
-    for aa in protein_seq.upper():
-        choices = table.get(aa)
-        if not choices:
-            out.append("NNN")
-            continue
-        codons = [c for c, _ in choices]
-        weights = [max(w, 1e-6) for _, w in choices]
-        out.append(rng.choices(codons, weights=weights, k=1)[0])
-    return "".join(out)
