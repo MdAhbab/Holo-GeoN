@@ -176,9 +176,12 @@ def load_config(
         for key, block in data_cfg.items():
             if key == "graph" and isinstance(block, dict):
                 values.update(block)
-            elif isinstance(block, dict):
-                # A per-dataset column map, e.g. megascale_ddg_pairs: {wt_seq: ...}
-                columns[key] = {k: v for k, v in block.items() if v is not None}
+            elif isinstance(block, dict) or block is None:
+                # A per-dataset column map, e.g. megascale_ddg_pairs: {wt_seq: ...}.
+                # A block whose entries are all commented out parses as None; that
+                # is an empty override map, not a config value called
+                # "megascale_ddg_pairs".
+                columns[key] = {k: v for k, v in (block or {}).items() if v is not None}
             else:
                 values[key] = block
 
