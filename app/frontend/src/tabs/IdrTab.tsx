@@ -126,39 +126,7 @@ export default function IdrTab() {
     annotations: gaussianAnnotations,
   }
 
-  const perResData = result
-    ? [
-        {
-          type: 'scatter',
-          x: Array.from({ length: result.per_residue.length }, (_, i) => i + 1),
-          y: result.per_residue,
-          mode: 'lines',
-          fill: 'tozeroy',
-          fillcolor: 'rgba(0,128,128,0.18)',
-          line: { color: '#008080', width: 2 },
-          name: 'Per-residue disorder',
-          hovertemplate: 'Residue %{x}<br>Score: %{y:.4f}<extra></extra>',
-        },
-      ]
-    : []
 
-  const perResLayout = {
-    height: 220,
-    margin: { l: 55, r: 20, t: 30, b: 50 },
-    xaxis: { title: 'Residue index', gridcolor: '#f1f5f9' },
-    yaxis: { title: 'Disorder score (0–1)', range: [0, 1], gridcolor: '#f1f5f9' },
-    paper_bgcolor: 'transparent',
-    plot_bgcolor: 'transparent',
-    font: { family: 'Inter, system-ui, sans-serif', size: 12 },
-    shapes: [
-      {
-        type: 'line',
-        x0: 0, x1: result ? result.per_residue.length + 1 : 1,
-        y0: 0.5, y1: 0.5,
-        line: { color: '#94a3b8', width: 1, dash: 'dot' },
-      },
-    ],
-  }
 
   return (
     <div>
@@ -196,6 +164,10 @@ export default function IdrTab() {
               <div className="stat-chip">μ(Rg): <strong>{result.mu.toFixed(3)} Å</strong></div>
               <div className="stat-chip">σ(Rg): <strong>{result.sigma.toFixed(3)} Å</strong></div>
               <div className="stat-chip">
+                95% interval:{' '}
+                <strong>{result.ci_low.toFixed(2)} – {result.ci_high.toFixed(2)} Å</strong>
+              </div>
+              <div className="stat-chip">
                 Character:{' '}
                 <strong>
                   {result.mu / Math.pow(result.length, 0.33) < 2.5 ? 'Globular / compact' : 'Extended / disordered'}
@@ -217,21 +189,6 @@ export default function IdrTab() {
             </div>
           </div>
 
-          <div className="card">
-            <div className="card-title">Per-Residue Disorder / Compaction Profile</div>
-            <div style={{ fontSize: '0.82rem', color: 'var(--text-muted)', marginBottom: 8 }}>
-              Values above 0.5 (dashed line) indicate higher local disorder or solvent exposure.
-            </div>
-            <div className="plot-wrap">
-              <Plot
-                data={perResData}
-                layout={perResLayout}
-                config={{ displayModeBar: false, responsive: true }}
-                style={{ width: '100%' }}
-                useResizeHandler
-              />
-            </div>
-          </div>
         </>
       )}
     </div>

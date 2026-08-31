@@ -1,8 +1,14 @@
 """
-HOLOGNN_APP/backend/app.py
-==========================
-FastAPI HTTP layer for the Holo-GNN web application.
-Inference logic lives entirely in inference.py — this file is the HTTP layer only.
+app/backend/app.py
+==================
+FastAPI HTTP layer for the Holo-GeoN web interface.
+
+Inference lives entirely in inference.py; this file is HTTP only.
+
+Every prediction endpoint requires a loaded model. There is no demo mode and no
+heuristic fallback, so a request made without a trained checkpoint returns 503
+with the reason rather than a plausible-looking number. `demo_mode` has been
+removed from the API contract, the database schema and the frontend types.
 """
 
 from __future__ import annotations
@@ -20,7 +26,7 @@ from fastapi.responses import PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from inference import get_engine
+from inference import ModelUnavailable, get_engine
 from db import (
     init_db,
     insert_prediction,
@@ -33,7 +39,7 @@ from db import (
 # ---------------------------------------------------------------------------
 # Application setup
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Holo-GNN API", version="1.0")
+app = FastAPI(title="Holo-GeoN API", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -102,6 +108,11 @@ def _as_dict(model: BaseModel) -> Dict[str, Any]:
     return model.model_dump() if hasattr(model, "model_dump") else model.dict()
 
 
+def _unavailable(exc: ModelUnavailable) -> Response:
+    """503 with the reason. Never a substitute prediction."""
+    return _error(503, str(exc))
+
+
 # ---------------------------------------------------------------------------
 # API endpoints
 # ---------------------------------------------------------------------------
@@ -117,6 +128,8 @@ def ddg(req: DdgRequest):
     eng = get_engine()
     try:
         result = eng.predict_ddg(req.wt_sequence, req.mutation)
+    except ModelUnavailable as exc:
+        return _unavailable(exc)
     except ValueError as exc:
         return _error(400, str(exc))
     summary = (f"ΔΔG {result['mutation']} = {result['ddg']:+.2f} kcal/mol "
@@ -130,6 +143,8 @@ def scan(req: ScanRequest):
     eng = get_engine()
     try:
         result = eng.mutation_scan(req.sequence, req.start, req.end)
+    except ModelUnavailable as exc:
+        return _unavailable(exc)
     except ValueError as exc:
         return _error(400, str(exc))
     pos = result["positions"]
@@ -144,6 +159,8 @@ def idr(req: IdrRequest):
     eng = get_engine()
     try:
         result = eng.idr_ensemble(req.sequence)
+    except ModelUnavailable as exc:
+        return _unavailable(exc)
     except ValueError as exc:
         return _error(400, str(exc))
     summary = (f"IDR ensemble · L={result['length']} · "
@@ -156,6 +173,8 @@ def idr(req: IdrRequest):
 def compare(req: CompareRequest):
     """Fetch AlphaFold2 structure + PAE, run Holo-GNN scan, return combined payload."""
     eng = get_engine()
+    if not eng.ready:
+        return _error(503, eng.health()["error"] or "model unavailable")
     uid = req.uniprot_id.strip().upper()
 
     try:
@@ -209,8 +228,8 @@ def compare(req: CompareRequest):
                 pae_downsampled = True
             pae_matrix = [[float(v) for v in row] for row in raw_pae]
 
-        # 5. Holo-GNN mutation scan for per-position min ΔΔG
-        holognn_min_ddg: List[float] = []
+        # 5. Deep mutational scan -> per-position most-destabilising ddG
+        min_ddg_per_position: List[float] = []
         if sequence:
             scan_end = min(len(sequence), 400)
             try:
@@ -219,9 +238,9 @@ def compare(req: CompareRequest):
                 n_cols = len(scan_result["positions"])
                 for col in range(n_cols):
                     col_vals = [matrix[row][col] for row in range(len(matrix))]
-                    holognn_min_ddg.append(round(min(col_vals), 4))
-            except ValueError:
-                holognn_min_ddg = []
+                    min_ddg_per_position.append(round(min(col_vals), 4))
+            except (ValueError, ModelUnavailable):
+                min_ddg_per_position = []
 
         result = {
             "uniprot_id": uid,
@@ -230,8 +249,7 @@ def compare(req: CompareRequest):
             "plddt": plddt,
             "pae": pae_matrix,
             "pae_downsampled": pae_downsampled,
-            "holognn_min_ddg": holognn_min_ddg,
-            "demo_mode": eng.demo_mode,
+            "min_ddg_per_position": min_ddg_per_position,
         }
         summary = f"AlphaFold compare · {uid} · {len(sequence)} residues"
         insert_prediction("compare", summary, _as_dict(req), result)
@@ -253,7 +271,7 @@ def export(req: ExportRequest):
 
     # ------------------------------------------------------------------ JSON
     if fmt == "json":
-        fname = req.filename or "holognn_results.json"
+        fname = req.filename or "holo_geon_results.json"
         content = json.dumps(data, indent=2)
         return Response(
             content=content,
@@ -263,7 +281,7 @@ def export(req: ExportRequest):
 
     # ------------------------------------------------------------------ CSV
     elif fmt == "csv":
-        fname = req.filename or "holognn_results.csv"
+        fname = req.filename or "holo_geon_results.csv"
         buf = io.StringIO()
 
         is_scan = ("matrix" in data and "positions" in data and "aa_order" in data)
@@ -296,7 +314,7 @@ def export(req: ExportRequest):
 
     # ------------------------------------------------------------------ PDB
     elif fmt == "pdb":
-        fname = req.filename or "holognn_annotated.pdb"
+        fname = req.filename or "holo_geon_annotated.pdb"
 
         # Determine sequence
         sequence: str = ""

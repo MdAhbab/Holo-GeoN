@@ -67,7 +67,7 @@ from src.losses import (
     three_state_loss,
 )
 from src.metrics import classification_metrics, regression_metrics
-from src.model import HoloGeoN
+from src.model import HoloGeoN, model_kwargs_from_config
 
 # Tasks the multi-task loss knows about. A task appears in a step only when its
 # loader yields a batch.
@@ -284,15 +284,12 @@ def main() -> None:
 
     # --- model -------------------------------------------------------------
     esm_dim = ESM_DIMS.get(cfg.esm_model, 1280)
-    model = HoloGeoN(
-        esm_dim=esm_dim,
-        hidden=cfg.hidden,
-        out_dim=cfg.out_dim,
-        gat_heads=cfg.gat_heads,
-        dropout=cfg.dropout,
+    model_kwargs = model_kwargs_from_config(
+        cfg, esm_dim,
         use_ssm=cfg.use_ssm and not args.no_ssm,
         use_mech_stream=cfg.use_mech_stream and not args.no_mech_stream,
-    ).to(device)
+    )
+    model = HoloGeoN(**model_kwargs).to(device)
     print(f"[train] parameters: {model.parameter_count()}")
 
     active_loss_terms = list(
@@ -403,6 +400,10 @@ def main() -> None:
             best_score, best_epoch, patience = score, epoch, 0
             torch.save(
                 {"model": model.state_dict(),
+                 # The checkpoint carries exactly how the model was built, so
+                 # loading never has to re-derive constructor arguments from
+                 # loose config keys and cannot drift out of sync with them.
+                 "model_kwargs": model_kwargs,
                  "config": cfg.as_dict(),
                  "esm_dim": esm_dim,
                  "epoch": epoch,
@@ -448,6 +449,7 @@ def main() -> None:
         },
         "trained_tasks": trained_tasks,
         "untrained_heads": untrained,
+        "model_kwargs": model_kwargs,
         "parameters": model.parameter_count(),
         "best_epoch": best_epoch,
         f"best_val_{primary}_{primary_metric}": best_score,

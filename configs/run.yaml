@@ -57,6 +57,7 @@ neighborhood_hops: 2
 hidden: 256
 out_dim: 256
 gat_heads: 4
+aa_dim: 32
 dropout: 0.1
 use_ssm: true
 use_mech_stream: true

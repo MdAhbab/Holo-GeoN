@@ -37,24 +37,6 @@ function KindChip({ kind }: { kind: string }) {
   )
 }
 
-function DemoBadge() {
-  return (
-    <span style={{
-      display: 'inline-block',
-      padding: '2px 8px',
-      borderRadius: 12,
-      fontSize: '0.75rem',
-      fontWeight: 700,
-      background: 'var(--amber-bg)',
-      color: '#92400e',
-      border: '1px solid var(--amber-border)',
-      marginLeft: 6,
-    }}>
-      demo
-    </span>
-  )
-}
-
 function KindSummary({ record }: { record: HistoryRecord }) {
   const { kind, response } = record
 
@@ -141,7 +123,7 @@ function DetailPanel({ item, onClose, onDeleted }: DetailPanelProps) {
     if (!record) return
     setExporting(true)
     try {
-      await downloadExport('json', record.response, `holognn_${record.kind}_${record.id}.json`)
+      await downloadExport('json', record.response, `holo_geon_${record.kind}_${record.id}.json`)
     } catch {
       // silently ignore — download errors are uncommon and non-critical
     } finally {
@@ -258,7 +240,6 @@ function HistoryRow({ item, onDeleted }: RowProps) {
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
         <KindChip kind={item.kind} />
-        {item.demo_mode && <DemoBadge />}
         <span style={{ fontSize: '0.82rem', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
           {new Date(item.created_at * 1000).toLocaleString()}
         </span>

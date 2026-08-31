@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # DB file lives next to this module (gitignored via *.db).  Overridable for tests.
-DB_PATH = Path(os.environ.get("HOLOGNN_DB", Path(__file__).resolve().parent / "holognn_history.db"))
+DB_PATH = Path(os.environ.get("HOLOGEON_DB", Path(__file__).resolve().parent / "holo_geon_history.db"))
 
 # Allowed prediction kinds (also used to validate the ?kind= filter).
 KINDS = ("ddg", "scan", "idr", "compare")
@@ -50,8 +50,7 @@ def init_db() -> None:
                 created_at    REAL    NOT NULL,
                 summary       TEXT    NOT NULL,
                 request_json  TEXT    NOT NULL,
-                response_json TEXT    NOT NULL,
-                demo_mode     INTEGER NOT NULL DEFAULT 0
+                response_json TEXT    NOT NULL
             )
             """
         )
@@ -67,14 +66,13 @@ def insert_prediction(kind: str, summary: str, request: Dict[str, Any],
     log must not break the actual prediction response.
     """
     try:
-        demo = 1 if response.get("demo_mode") else 0
         with _connect() as conn:
             cur = conn.execute(
                 "INSERT INTO predictions "
-                "(kind, created_at, summary, request_json, response_json, demo_mode) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "(kind, created_at, summary, request_json, response_json) "
+                "VALUES (?, ?, ?, ?, ?)",
                 (kind, time.time(), summary,
-                 json.dumps(request), json.dumps(response), demo),
+                 json.dumps(request), json.dumps(response)),
             )
             return int(cur.lastrowid)
     except Exception:  # pragma: no cover - logging must not break predictions
@@ -88,7 +86,6 @@ def _row_summary(row: sqlite3.Row) -> Dict[str, Any]:
         "kind": row["kind"],
         "created_at": row["created_at"],
         "summary": row["summary"],
-        "demo_mode": bool(row["demo_mode"]),
     }
 
 
@@ -98,12 +95,12 @@ def list_predictions(kind: Optional[str] = None, limit: int = 50) -> List[Dict[s
     with _connect() as conn:
         if kind in KINDS:
             rows = conn.execute(
-                "SELECT id, kind, created_at, summary, demo_mode FROM predictions "
+                "SELECT id, kind, created_at, summary FROM predictions "
                 "WHERE kind = ? ORDER BY created_at DESC LIMIT ?", (kind, limit)
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT id, kind, created_at, summary, demo_mode FROM predictions "
+                "SELECT id, kind, created_at, summary FROM predictions "
                 "ORDER BY created_at DESC LIMIT ?", (limit,)
             ).fetchall()
     return [_row_summary(r) for r in rows]

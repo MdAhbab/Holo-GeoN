@@ -1,10 +1,21 @@
-// Health check
+// Health check.
+// There is no demo mode: without a trained checkpoint the backend reports
+// ready=false and every prediction endpoint returns 503 with a reason.
+export interface CalibrationInfo {
+  expected_calibration_error: number | null
+  observed_coverage: Record<string, number> | null
+  measured_on: string
+}
+
 export interface HealthResponse {
-  version: string
-  model_loaded: boolean
-  demo_mode: boolean
+  ready: boolean
+  error: string | null
   weights_path: string
-  load_note: string | null
+  esm_model: string | null
+  window: number | null
+  untrained_heads: string[]
+  uncertainty_calibrated: boolean
+  calibration: CalibrationInfo | null
 }
 
 // DDG predictor
@@ -19,11 +30,20 @@ export interface DdgResponse {
   wt_residue: string
   mut_residue: string
   ddg: number
+  // Predicted standard deviation from the model's own heteroscedastic head,
+  // trained under Gaussian NLL. The interval below is derived from it, not
+  // from a fixed-width formula.
+  sigma: number
   ci_low: number
   ci_high: number
-  stabilizing: boolean
+  ci_source: string
+  uncertainty_calibrated: boolean
+  three_state: {
+    destabilizing: number
+    neutral: number
+    stabilizing: number
+  }
   verdict: string
-  demo_mode: boolean
 }
 
 // Stability scan
@@ -38,7 +58,6 @@ export interface ScanResponse {
   wt_residues: string[]
   aa_order: string[]
   matrix: number[][]
-  demo_mode: boolean
 }
 
 // IDR ensemble
@@ -50,8 +69,8 @@ export interface IdrResponse {
   length: number
   mu: number
   sigma: number
-  per_residue: number[]
-  demo_mode: boolean
+  ci_low: number
+  ci_high: number
 }
 
 // AlphaFold Compare
@@ -66,8 +85,7 @@ export interface CompareResponse {
   plddt: number[]
   pae: number[][]
   pae_downsampled: boolean
-  holognn_min_ddg: number[]
-  demo_mode: boolean
+  min_ddg_per_position: number[]
 }
 
 // Export
@@ -83,7 +101,6 @@ export interface HistoryItem {
   kind: 'ddg' | 'scan' | 'idr' | 'compare'
   created_at: number
   summary: string
-  demo_mode: boolean
 }
 
 export interface HistoryRecord extends HistoryItem {

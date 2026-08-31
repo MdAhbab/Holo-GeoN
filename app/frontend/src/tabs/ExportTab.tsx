@@ -30,7 +30,7 @@ export default function ExportTab() {
       let filename: string
       if (format === 'csv') {
         data = store.scan ?? store.ddg ?? store.idr
-        filename = 'holognn_export.csv'
+        filename = 'holo_geon_export.csv'
       } else if (format === 'json') {
         data = {
           ddg: store.ddg,
@@ -38,11 +38,11 @@ export default function ExportTab() {
           idr: store.idr,
           compare: store.compare,
         }
-        filename = 'holognn_export.json'
+        filename = 'holo_geon_export.json'
       } else {
         // pdb — needs scan data with sequence
         data = store.scan
-        filename = 'holognn_export.pdb'
+        filename = 'holo_geon_export.pdb'
       }
       await downloadExport(format, data, filename)
       setSuccess(`Downloaded ${filename}`)

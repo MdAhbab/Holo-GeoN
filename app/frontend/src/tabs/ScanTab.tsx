@@ -11,7 +11,6 @@ interface ScanResult {
   wt_residues: string[]
   aa_order: string[]
   matrix: number[][]
-  demo_mode: boolean
   sequence?: string
 }
 

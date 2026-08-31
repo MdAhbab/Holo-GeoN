@@ -114,8 +114,8 @@ export default function CompareTab() {
     ? [
         {
           type: 'scatter',
-          x: Array.from({ length: result.holognn_min_ddg.length }, (_, i) => i + 1),
-          y: result.holognn_min_ddg,
+          x: Array.from({ length: result.min_ddg_per_position.length }, (_, i) => i + 1),
+          y: result.min_ddg_per_position,
           mode: 'lines',
           line: { color: '#dc2626', width: 2 },
           name: 'Holo-GNN min ΔΔG',

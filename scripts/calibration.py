@@ -53,7 +53,7 @@ from src.data import MutationDataset, build_sample_graph, collate_graphs, move_b
 from src.device import describe_device
 from src.encoder import ESM_DIMS, EncodingStore, EsmEncoder
 from src.features import mechanistic_features
-from src.model import HoloGeoN
+from src.model import HoloGeoN, model_kwargs_from_config
 from src.substitution import aa_index
 
 Z_FOR_NOMINAL = {0.50: 0.674490, 0.80: 1.281552, 0.90: 1.644854, 0.95: 1.959964}
@@ -193,16 +193,10 @@ def main() -> None:
 
     state = torch.load(args.checkpoint, map_location=device, weights_only=False)
     esm_dim = state.get("esm_dim", ESM_DIMS.get(cfg.esm_model, 1280))
-    saved = state.get("config", {})
-    model = HoloGeoN(
-        esm_dim=esm_dim,
-        hidden=saved.get("hidden", cfg.hidden),
-        out_dim=saved.get("out_dim", cfg.out_dim),
-        gat_heads=saved.get("gat_heads", cfg.gat_heads),
-        dropout=saved.get("dropout", cfg.dropout),
-        use_ssm=saved.get("use_ssm", cfg.use_ssm),
-        use_mech_stream=saved.get("use_mech_stream", cfg.use_mech_stream),
-    ).to(device)
+    kwargs = state.get("model_kwargs") or model_kwargs_from_config(
+        state.get("config", {}), esm_dim
+    )
+    model = HoloGeoN(**kwargs).to(device)
     model.load_state_dict(state["model"])
     model.eval()
 

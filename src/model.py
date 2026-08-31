@@ -189,4 +189,29 @@ class HoloGeoN(nn.Module):
         }
 
 
-__all__ = ["HoloGeoN"]
+def model_kwargs_from_config(cfg, esm_dim: int, **overrides) -> dict:
+    """
+    The single place a configuration becomes model constructor arguments.
+
+    Checkpoints store the result verbatim, so loading is
+    ``HoloGeoN(**state["model_kwargs"])`` and cannot drift from how the model was
+    built. Reconstructing from loose config keys is how a checkpoint becomes
+    unloadable when a constructor argument is added but not recorded.
+    """
+    get = cfg.get if hasattr(cfg, "get") else cfg.__getitem__
+    kwargs = {
+        "esm_dim": esm_dim,
+        "hidden": get("hidden", 256),
+        "out_dim": get("out_dim", 256),
+        "aa_dim": get("aa_dim", 32),
+        "gat_heads": get("gat_heads", 4),
+        "dropout": get("dropout", 0.1),
+        "use_ssm": get("use_ssm", True),
+        "use_mech_stream": get("use_mech_stream", True),
+        "num_species": get("num_species", 0),
+    }
+    kwargs.update({k: v for k, v in overrides.items() if v is not None})
+    return kwargs
+
+
+__all__ = ["HoloGeoN", "model_kwargs_from_config"]

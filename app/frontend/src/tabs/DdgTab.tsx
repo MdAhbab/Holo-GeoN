@@ -43,7 +43,7 @@ export default function DdgTab() {
     }
   }
 
-  const isStabilizing = result ? result.stabilizing : false
+  const isStabilizing = result ? result.ddg > 0 : false
   const verdictClass = isStabilizing ? 'verdict-stabilizing' : 'verdict-destabilizing'
   const markerColor = isStabilizing ? '#2563eb' : '#dc2626'
 

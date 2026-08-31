@@ -65,17 +65,30 @@ html, body {
   margin-top: 2px;
 }
 
-/* ---- Demo Banner ---- */
-.demo-banner {
-  background: var(--amber-bg);
-  border-bottom: 2px solid var(--amber-border);
-  color: #92400e;
+/* ---- Status banners ----
+   .error-banner: no model loaded, so nothing can be predicted at all.
+   .warn-banner : the model works but something about it is not yet verified
+                  (uncertainty uncalibrated, a head never trained). */
+.error-banner,
+.warn-banner {
   padding: 10px 32px;
   font-size: 0.87rem;
   display: flex;
   align-items: flex-start;
   gap: 8px;
   line-height: 1.5;
+}
+
+.error-banner {
+  background: #fef2f2;
+  border-bottom: 2px solid #fca5a5;
+  color: #991b1b;
+}
+
+.warn-banner {
+  background: var(--amber-bg);
+  border-bottom: 2px solid var(--amber-border);
+  color: #92400e;
 }
 
 /* ---- Tab Bar ---- */
@@ -293,7 +306,7 @@ input[type="number"]:focus {
   .tab-content { padding: 16px; }
   .app-header { padding: 14px 16px; }
   .tab-bar { padding: 0 16px; }
-  .demo-banner { padding: 10px 16px; }
+  .error-banner, .warn-banner { padding: 10px 16px; }
 }
 
 /* ---- Compare Tab Specific ---- */

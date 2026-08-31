@@ -73,6 +73,7 @@ DEFAULTS: dict[str, Any] = {
     "hidden": 256,
     "out_dim": 256,
     "gat_heads": 4,
+    "aa_dim": 32,
     "dropout": 0.1,
     "use_ssm": True,
     "use_mech_stream": True,   # ablation axis; the shipped model is dual-stream

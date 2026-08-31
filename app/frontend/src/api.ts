@@ -72,7 +72,7 @@ export async function downloadExport(
 
   // Try to get filename from Content-Disposition header, else fall back
   const disposition: string = res.headers['content-disposition'] ?? ''
-  let dlName = filename ?? `holognn_export.${format}`
+  let dlName = filename ?? `holo_geon_export.${format}`
   const match = disposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/)
   if (match?.[1]) {
     dlName = match[1].replace(/['"]/g, '')

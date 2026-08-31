@@ -63,18 +63,44 @@ export default function App() {
   return (
     <>
       <header className="app-header">
-        <h1>Holo-GNN</h1>
+        <h1>Holo-GeoN</h1>
         <p>Protein Stability, Interaction &amp; Expression — Graph Neural Network Predictions</p>
       </header>
 
-      {health?.demo_mode && (
-        <div className="demo-banner">
+      {health && !health.ready && (
+        <div className="error-banner">
           <span style={{ fontSize: '1.1rem' }}>⚠</span>
           <span>
-            <strong>Demo mode</strong> — no trained weights loaded. Predictions use a deterministic
-            biophysical heuristic. Place <code>holognn_stability_final.pth</code> in the model folder
-            for full Holo-GNN inference.
-            {health.load_note && <> &nbsp;({health.load_note})</>}
+            <strong>No model loaded — predictions are unavailable.</strong>{' '}
+            This interface does not approximate results when a checkpoint is
+            missing; every prediction endpoint will return an error until one is
+            present. Train with <code>python run.py train</code>, or set{' '}
+            <code>HOLOGEON_WEIGHTS</code> to an existing checkpoint.
+            {health.error && <> &nbsp;({health.error})</>}
+          </span>
+        </div>
+      )}
+
+      {health?.ready && !health.uncertainty_calibrated && (
+        <div className="warn-banner">
+          <span style={{ fontSize: '1.1rem' }}>⚠</span>
+          <span>
+            <strong>Uncertainty not calibrated.</strong> Confidence intervals come
+            from the model's predicted sigma, but no calibration run has measured
+            whether its coverage is correct. Run{' '}
+            <code>python run.py calibration</code> before treating an interval as
+            a 95% interval.
+          </span>
+        </div>
+      )}
+
+      {health?.ready && health.untrained_heads.length > 0 && (
+        <div className="warn-banner">
+          <span style={{ fontSize: '1.1rem' }}>⚠</span>
+          <span>
+            <strong>Untrained heads:</strong> {health.untrained_heads.join(', ')}.
+            No data was supplied for these tasks, so they were never trained and
+            their endpoints are disabled.
           </span>
         </div>
       )}
