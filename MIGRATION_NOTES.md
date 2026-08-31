@@ -260,12 +260,19 @@ The five blockers, and why they mattered:
 | R1-05 | The CDS-joined table was written but never read downstream | `mech_valid` 0 everywhere, `E_mech` self-loops only — the `no_mech_stream` ablation would have measured a stream that was never fed, and a ~0 delta would have been written up as "the mechanistic stream does not contribute" |
 
 The reviewer also confirmed what holds, and those parts were deliberately left
-alone: exact head antisymmetry in both train and eval mode, swap-equivariance of
-the three-state head, padding invariance across heterogeneous batch lengths
+alone: exact head antisymmetry **under `eval()`**, swap-equivariance of the
+three-state head, padding invariance across heterogeneous batch lengths
 (2.98e-07), the parallel associative scan against the sequential recurrence
 (≤4.8e-07), mutation windowing at both termini, `_cap_degree` correctness,
 chunk-stitching, union-find grouping, the parameter count, and the absence of any
 demo-mode path in the interface.
+
+(That first item read "in both train and eval mode" until the round-2 fixes.
+It was the same over-claim R1-23 was raised for, restated in the document
+recording R1-23 — R2-17. Under `train()` dropout is active and two independent
+forward passes differ by ~8e-2, which is dropout, not a broken constraint: the
+antisymmetry is a property of the head's form, not of a particular stochastic
+pass.)
 
 **Fixed in commit `fc8e86e`** — all 27, each named in the commit message.
 `tests/test_round1_fixes.py` reproduces the original defect for the findings that

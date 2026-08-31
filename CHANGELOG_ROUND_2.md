@@ -5,9 +5,14 @@ a session starting cold can pick up without re-deriving anything: what was
 wrong, what the code does now, which files moved, and how it was checked.
 
 **Status: all 17 round-2 findings addressed, plus the 4 round-1 items round 2
-re-opened and the documentation contradictions.** Test suite 177 → 267 checks,
+re-opened and the documentation contradictions.** Test suite 177 → 288 checks,
 0 failed. `tests/test_round2_fixes.py` is new and every check in it fails
 against the pre-fix code at `bbae5e7`.
+
+A self-audit after the first fix commit (`934111c`) found three items I had
+recorded as done that were not fully done. They are fixed in the follow-up
+commit and listed in §4a below. Everything else in this document was verified
+by re-reading the tree, not from memory.
 
 **Environment this was done in:** Windows 11, Python 3.13.7, torch 2.10.0+cpu,
 no NVIDIA GPU (the machine has an Intel Arc), no ESM-2 weights, no MMseqs2, no
@@ -232,6 +237,35 @@ Verified on the reviewer's constructed case: flag `True` → `False`, reported E
 
 ---
 
+## 4a. Gaps found in my own first pass (fixed in the follow-up commit)
+
+Three items I had marked done and had not finished. Found by walking the report
+against the tree rather than trusting the previous summary.
+
+- **R2-17, row 2 — missed entirely.** `MIGRATION_NOTES.md:263` still restated
+  "exact head antisymmetry in both train and eval mode" — the same over-claim
+  R1-23 was raised for, in the document that records R1-23. I had fixed the
+  README line and not this one. Now corrected, with the dropout explanation
+  attached.
+- **R1-11 residual — still undisclosed.** The reversibility check substituted
+  `preferred_codon(mt_aa)`, whose CAI weight is **1.0 by definition** (it is the
+  arg-max of a table normalised so the most-used codon scores 1). Measured here:
+  a **+0.273** one-sided CAI shift at the one site the check is about. New
+  `cai_matched_codon()` picks the synonymous codon nearest the parent codon's own
+  weight, cutting the mean shift to **+0.089**, and the residual is now reported
+  as `induced_cai_shift_at_mutated_site` rather than assumed to be zero. It
+  cannot be driven to zero — the amino acid changed, so the reachable codon
+  weights changed with it — which is exactly why it is reported.
+- **R2-16, second clause — done weaker than asked.** The finding asked to
+  "either match parameter count or report both a matched-capacity and a
+  matched-budget variant". I had done neither, only disclosed the 14.1× gap.
+  `scripts/baselines.py` now runs **both**: `esm_mlp` (matched budget, narrow)
+  and `esm_mlp_matched_capacity`, sized by `mlp_width_for()` to the full model's
+  own parameter count — 20,604,300 against the model's 20,607,788 (1.00×). If
+  the model beats the narrow MLP but not the wide one, the gap was capacity.
+
+---
+
 ## 5. Files
 
 **New:** `src/provenance.py`, `tests/test_round2_fixes.py`, this file.
@@ -288,7 +322,7 @@ Unchanged from §5 of `REVIEW_ROUND_2.md`. Nothing below could be checked here.
 ## 8. How to re-check any of this
 
 ```bash
-python -m tests.run_all          # 267 checks, 0 failed
+python -m tests.run_all          # 288 checks, 0 failed
 python -m tests.test_round2_fixes # just the round-2 regressions
 python -m scripts.budget --device cpu   # the memory table above
 ```

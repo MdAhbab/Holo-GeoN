@@ -734,6 +734,136 @@ def test_r2_whole_sequence_path_end_to_end() -> None:
 
 
 # ---------------------------------------------------------------------------
+def test_r2_16_matched_capacity_control() -> None:
+    section("R2-16: the MLP control comes in matched-budget AND matched-capacity")
+    import inspect
+
+    import scripts.baselines as B
+    from src.config import load_config
+    from src.model import HoloGeoN, model_kwargs_from_config
+
+    cfg = load_config()
+    full = HoloGeoN(**model_kwargs_from_config(cfg, 1280))
+    target = full.parameter_count()["total"]
+
+    feat_dim = 2 * 1280 + 40          # pooled window + site embedding + 2 one-hots
+    narrow = sum(p.numel() for p in B._mlp(feat_dim, 512).parameters())
+    width = B.mlp_width_for(feat_dim, target)
+    matched = sum(p.numel() for p in B._mlp(feat_dim, width).parameters())
+
+    check(target / narrow > 10,
+          f"the narrow control really is far smaller than the model "
+          f"({target/narrow:.1f}x) - the confound R2-16 named")
+    check(0.9 <= matched / target <= 1.1,
+          f"the matched-capacity control lands within 10% of the model's "
+          f"parameter count ({matched:,} vs {target:,})")
+
+    source = inspect.getsource(B.main)
+    check("esm_mlp_matched_capacity" in source,
+          "and both variants are actually run and reported")
+
+    mlp_source = inspect.getsource(B.esm_mlp_baseline)
+    for knob in ("sched.step()", "clip_grad_norm_", "early_stop_patience"):
+        check(knob in mlp_source,
+              f"the control shares the model's {knob.split('(')[0]}")
+
+
+# ---------------------------------------------------------------------------
+def test_r1_11_codon_substitution_is_unbiased() -> None:
+    section("R1-11 residual: the substituted codon no longer always improves CAI")
+    from src.codon_tables import (
+        cai_matched_codon,
+        get_cai_weights,
+        preferred_codon,
+        synonymous_codons,
+    )
+
+    weights = get_cai_weights("human")
+
+    # The defect: preferred_codon is the arg-max of a table normalised to 1.
+    pref = [weights[preferred_codon(a)] for a in AA]
+    check(all(abs(w - 1.0) < 1e-9 for w in pref),
+          "preferred_codon has CAI weight 1.0 for every residue, by definition")
+
+    # Shift induced across every (parent codon, target residue) pair.
+    old_shifts, new_shifts = [], []
+    for a in AA:
+        for _, parent_w in synonymous_codons(a):
+            for mt in AA:
+                old_shifts.append(weights[preferred_codon(mt)] - parent_w)
+                _, w = cai_matched_codon(mt, parent_w)
+                new_shifts.append(w - parent_w)
+
+    old_mean = sum(old_shifts) / len(old_shifts)
+    new_mean = sum(new_shifts) / len(new_shifts)
+    check(old_mean > 0.2,
+          f"the old substitution shifted CAI by {old_mean:+.3f} on average - "
+          f"one-sided, at the one site the reversibility check is about")
+    check(abs(new_mean) < abs(old_mean) / 2,
+          f"the CAI-matched codon cuts that to {new_mean:+.3f}")
+
+    # It must still encode the residue it was asked for.
+    from src.codon_tables import GENETIC_CODE
+
+    ok = True
+    for mt in AA:
+        codon, _ = cai_matched_codon(mt, 0.5)
+        ok = ok and codon is not None and GENETIC_CODE[codon] == mt
+    check(ok, "and still returns a codon that encodes the requested residue")
+
+    import inspect
+
+    import scripts.calibration as C
+
+    check("induced_cai_shift_at_mutated_site" in inspect.getsource(C.reversibility_check),
+          "the residual shift is reported, not assumed to be zero")
+
+
+# ---------------------------------------------------------------------------
+def test_r2_17_documentation_matches_the_code() -> None:
+    section("R2-17: the documented claims match what the code does")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def read(name):
+        with open(os.path.join(root, name), encoding="utf-8") as fh:
+            return fh.read()
+
+    notes, readme = read("MIGRATION_NOTES.md"), read("README.md")
+
+    # The over-claim R1-23 was raised for, restated in the document that
+    # records R1-23.
+    claim = "antisymmetry in both train and eval mode"
+    check(claim not in notes,
+          "MIGRATION_NOTES no longer claims antisymmetry holds in train mode")
+    check(claim not in readme, "nor does the README")
+
+    check("room to spare" not in readme,
+          "the README no longer says the run fits 16 GB 'with room to spare'")
+    check("message-passing contribution" not in readme,
+          "nor attributes the whole esm_mlp gap to message passing")
+
+    for name in ("src/features.py", "src/backbone.py",
+                 "scripts/precompute_embeddings.py"):
+        body = read(name)
+        check("seven mechanistic" not in body and "channels (7)" not in body
+              and "(length, 7)" not in body,
+              f"{name} does not say 7 mechanistic channels (N_MECH_CHANNELS is 8)")
+
+    mixers = read("src/sequence_mixers.py")
+    # The finding was about the section HEADERS, not about the docstring's
+    # historical note recording that the "paper §8.2" framing was removed.
+    check("# §8.2-i" not in mixers and "# §8.2-ii" not in mixers,
+          "the §8.2 scaffolding headers MIGRATION_NOTES says are gone, are gone")
+
+    check("no such file" not in read("src/splits.py")
+          and "tests/test_splits.py" not in read("src/splits.py"),
+          "src/splits.py no longer cites a test file that does not exist")
+
+    check("REMARK 999" in read("app/backend/app.py"),
+          "the PDB export disclaims its invented geometry inside the file")
+
+
+# ---------------------------------------------------------------------------
 TESTS = [
     test_r2_01_cds_coverage_measured_from_the_cache,
     test_r2_02_node_budget_caps_whole_sequence_batches,
@@ -752,6 +882,9 @@ TESTS = [
     test_r1_07_truncation_is_reported,
     test_r1_17_record_cache_is_real_or_absent,
     test_r2_whole_sequence_path_end_to_end,
+    test_r2_16_matched_capacity_control,
+    test_r1_11_codon_substitution_is_unbiased,
+    test_r2_17_documentation_matches_the_code,
 ]
 
 

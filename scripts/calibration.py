@@ -52,7 +52,7 @@ from src.config import load_config
 from src.data import MutationDataset, build_sample_graph, collate_graphs, move_batch
 from src.device import describe_device
 from src.encoder import ESM_DIMS, EncodingStore, EsmEncoder
-from src.codon_tables import preferred_codon
+from src.codon_tables import cai_matched_codon, get_cai_weights
 from src.features import mechanistic_features
 from src.model import HoloGeoN, model_kwargs_from_config
 from src.seeding import seed_everything
@@ -70,20 +70,37 @@ def _normal_cdf(x: np.ndarray) -> np.ndarray:
     return 0.5 * (1.0 + np.vectorize(math.erf)(x / math.sqrt(2.0)))
 
 
-def _substituted_cds(parent_rec: dict, site: int, mt_aa: str) -> str | None:
+def _substituted_cds(
+    parent_rec: dict, site: int, mt_aa: str
+) -> tuple[str | None, float]:
     """
     The parent's coding sequence with the codon at ``site`` replaced.
 
-    Returns None when the parent carries no CDS, in which case both directions
-    are mech-free and the comparison stays symmetric anyway.
+    The replacement is the synonymous codon whose CAI weight is closest to the
+    codon it replaces (:func:`cai_matched_codon`). Round-2 review, R1-11
+    residual: this used ``preferred_codon``, whose weight is 1.0 by definition,
+    so every mutant gained a systematically better codon than a real variant
+    would carry - a one-sided ~+0.215 CAI shift at the one site the
+    reversibility check is about.
+
+    Returns ``(cds, induced_cai_shift)``. The shift is returned rather than
+    assumed to be zero, because it cannot be driven to zero in general: the
+    amino acid changed, so the reachable codon weights changed with it. The
+    caller reports the residual.
+
+    ``cds`` is None when the parent carries no CDS, in which case both
+    directions are mech-free and the comparison stays symmetric anyway.
     """
     cds = parent_rec.get("cds")
     if not cds or len(cds) < (site + 1) * 3:
-        return None
-    codon = preferred_codon(mt_aa)
+        return None, 0.0
+    parent_codon = cds[site * 3: (site + 1) * 3].upper()
+    weights = get_cai_weights("human")
+    parent_weight = weights.get(parent_codon, 0.0)
+    codon, weight = cai_matched_codon(mt_aa, parent_weight)
     if codon is None:
-        return None
-    return cds[: site * 3] + codon + cds[(site + 1) * 3:]
+        return None, 0.0
+    return cds[: site * 3] + codon + cds[(site + 1) * 3:], weight - parent_weight
 
 
 def calibration_report(mu: np.ndarray, sigma: np.ndarray, y: np.ndarray) -> dict:
@@ -187,6 +204,7 @@ def reversibility_check(
     forward, reverse = [], []
     skipped = 0
     mech_matched = 0
+    cai_shifts: list[float] = []
     cfg_d = cfg.as_dict()
     scratch = scratch or store
 
@@ -203,9 +221,10 @@ def reversibility_check(
         elif encoder is not None:
             mut_rec = encoder.encode(mutant, top_k=cfg.contact_top_k,
                                      min_sep=cfg.contact_min_sep)
-            mut_cds = _substituted_cds(parent_rec, site, row["mt_aa"])
+            mut_cds, cai_shift = _substituted_cds(parent_rec, site, row["mt_aa"])
             if mut_cds is not None:
                 mech_matched += 1
+                cai_shifts.append(cai_shift)
             mut_rec["mech"] = mechanistic_features(
                 mutant, mut_cds, len(mutant)
             ).half()
@@ -237,6 +256,16 @@ def reversibility_check(
         "n": int(len(f)),
         "skipped_no_cached_mutant": skipped,
         "mutants_with_matched_cds": mech_matched,
+        # The CAI change the codon substitution itself introduces at the mutated
+        # site, which is a property of this check rather than of the model. It
+        # was ~+0.215 and one-sided while the substituted codon was always the
+        # most-preferred one; a CAI-matched codon should leave it near zero and
+        # unbiased, and reporting it is what makes that checkable (R1-11).
+        "induced_cai_shift_at_mutated_site": {
+            "mean": float(np.mean(cai_shifts)) if cai_shifts else 0.0,
+            "mean_abs": float(np.mean(np.abs(cai_shifts))) if cai_shifts else 0.0,
+            "n": len(cai_shifts),
+        },
         "mean_violation_kcal_per_mol": float(violation.mean()),
         "median_violation_kcal_per_mol": float(np.median(violation)),
         "max_violation_kcal_per_mol": float(violation.max()),

@@ -136,3 +136,40 @@ def preferred_codon(aa: str, organism: str = "human") -> str | None:
         if w > best_w:
             best, best_w = codon, w
     return best
+
+
+def synonymous_codons(aa: str, organism: str = "human") -> list[tuple[str, float]]:
+    """``(codon, CAI weight)`` for every codon encoding ``aa``, best first."""
+    weights = get_cai_weights(organism)
+    out = [(c, weights.get(c, 0.0)) for c, coded in GENETIC_CODE.items()
+           if coded == aa.upper()]
+    return sorted(out, key=lambda cw: -cw[1])
+
+
+def cai_matched_codon(
+    aa: str, reference_weight: float, organism: str = "human"
+) -> tuple[str | None, float]:
+    """
+    The codon for ``aa`` whose CAI weight is closest to ``reference_weight``.
+
+    Round-2 review, R1-11 residual: the reversibility check substituted
+    :func:`preferred_codon`, whose CAI weight is **1.0 by definition** - it is
+    the arg-max of a table normalised so the most-used codon scores 1 - against
+    a mean of about 0.785 over synonymous codons. Every mutant therefore gained
+    a systematically more-optimal codon than a real variant would carry, a
+    one-sided ~+0.215 shift in the CAI channel at exactly the site the check is
+    about, and nothing recorded it.
+
+    Matching the parent codon's own weight keeps the local codon-usage character
+    across the substitution, so the mechanistic channels differ because the
+    amino acid changed rather than because the codon got better. The real
+    variant's codon is unknowable from protein-level data either way; this
+    choice is unbiased where the previous one was not.
+
+    Returns ``(codon, weight)``, or ``(None, 0.0)`` for an unencodable residue.
+    """
+    options = synonymous_codons(aa, organism)
+    if not options:
+        return None, 0.0
+    codon, weight = min(options, key=lambda cw: abs(cw[1] - reference_weight))
+    return codon, weight

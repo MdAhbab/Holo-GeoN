@@ -28,9 +28,15 @@ Three controls, in increasing strength:
    gap the paper's central empirical claim rests on conflated the graph with a
    3x training budget and a 14x capacity difference. It now takes the model's
    epoch count, warmup+cosine schedule, gradient clipping and early-stopping
-   patience from the same config. Capacity is still not matched, and that is
-   reported rather than hidden: ``parameters`` and ``training_budget`` travel
-   with the metrics so the remaining confound is legible.
+   patience from the same config, and runs in TWO variants:
+
+     * ``esm_mlp`` — matched training budget, the original narrow width.
+     * ``esm_mlp_matched_capacity`` — the same, widened to the full model's own
+       parameter count.
+
+   Reporting both is what makes the comparison interpretable. If the model beats
+   the narrow MLP but not the wide one, the gap was capacity; if it beats both by
+   the same margin, capacity is not the explanation and the architecture is.
 
    The gap between this and the full model is the contribution of everything the
    full model adds — the graph, the site-anchored readout, the SSM, the
@@ -62,7 +68,7 @@ from tqdm import tqdm
 
 from src.config import load_config
 from src.device import describe_device
-from src.encoder import EncodingStore, EsmEncoder
+from src.encoder import ESM_DIMS, EncodingStore, EsmEncoder
 from src.metrics import classification_metrics, regression_metrics
 from src.provenance import provenance
 from src.seeding import loader_kwargs, seed_everything
@@ -176,9 +182,31 @@ class _EsmFeatureDataset(Dataset):
         return torch.cat([feats, aa]), torch.tensor(float(row[self.target]))
 
 
+def mlp_width_for(in_dim: int, target_params: int) -> int:
+    """
+    Hidden width making a ``[in -> h -> h/2 -> 1]`` MLP hold ~``target_params``.
+
+    Round-2 review, R2-16 asked for a matched parameter count OR both a
+    matched-capacity and a matched-budget variant. Solving
+    ``h^2/2 + h*(in_dim + 2) ~= target`` gives the width; the caller reports the
+    count it actually achieved rather than claiming the match.
+    """
+    a, b, c = 0.5, float(in_dim + 2), -float(target_params)
+    h = (-b + (b * b - 4 * a * c) ** 0.5) / (2 * a)
+    return max(16, int(round(h)))
+
+
+def _mlp(in_dim: int, hidden: int) -> nn.Module:
+    return nn.Sequential(
+        nn.Linear(in_dim, hidden), nn.ReLU(), nn.Dropout(0.1),
+        nn.Linear(hidden, hidden // 2), nn.ReLU(),
+        nn.Linear(hidden // 2, 1),
+    )
+
+
 def esm_mlp_baseline(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame,
                      store: EncodingStore, cfg, device, target: str,
-                     epochs: int, batch_size: int) -> dict:
+                     epochs: int, batch_size: int, hidden: int = 512) -> dict:
     """
     Train an MLP on cached embeddings only, then score the test split.
 
@@ -200,11 +228,7 @@ def esm_mlp_baseline(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame,
     in_dim = sets["train"][0][0].numel()
     # Seeded so the control is as reproducible as the model it is compared with.
     torch.manual_seed(cfg.seed)
-    model = nn.Sequential(
-        nn.Linear(in_dim, 512), nn.ReLU(), nn.Dropout(0.1),
-        nn.Linear(512, 256), nn.ReLU(),
-        nn.Linear(256, 1),
-    ).to(device)
+    model = _mlp(in_dim, hidden).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     classification = target == "label"
     loss_fn = (nn.BCEWithLogitsLoss() if classification else nn.MSELoss())
@@ -287,7 +311,8 @@ def esm_mlp_baseline(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame,
         "training budget. The gap to the full model is the joint contribution of "
         "the graph, the site-anchored readout, the SSM, the cross-attention "
         "fusion and the mechanistic channels; scripts/ablations.py separates "
-        "them. Capacity is NOT matched - see `parameters`."
+        "them. Compare against esm_mlp_matched_capacity before attributing any "
+        "of it to the architecture rather than to parameter count."
     )
     return metrics
 
@@ -308,6 +333,9 @@ def main() -> None:
     ap.add_argument("--zero-shot-limit", type=int, default=None,
                     help="cap rows scored by the masked-LM baseline (it is slow)")
     ap.add_argument("--skip-zero-shot", action="store_true")
+    ap.add_argument("--skip-matched-capacity", action="store_true",
+                    help="skip the second MLP variant sized to the model's own "
+                         "parameter count (R2-16)")
     args = ap.parse_args()
 
     cfg = load_config(args.config, overrides={
@@ -347,6 +375,32 @@ def main() -> None:
           f"{cfg.grad_clip} - matched to scripts/train.py")
     results["esm_mlp"] = esm_mlp_baseline(
         train, val, test, store, cfg, device, target, epochs, cfg.batch_size)
+
+    # Round-2 review, R2-16: a matched TRAINING budget still leaves a 14x
+    # capacity gap, so the remaining difference could be either the architecture
+    # or the parameter count. The second variant closes the capacity gap and
+    # keeps everything else identical, which is what makes the pair
+    # interpretable: if both land in the same place, capacity is not the
+    # explanation.
+    if not args.skip_matched_capacity:
+        from src.model import HoloGeoN, model_kwargs_from_config
+
+        esm_dim = ESM_DIMS.get(cfg.esm_model, 1280)
+        full = HoloGeoN(**model_kwargs_from_config(cfg, esm_dim))
+        target_params = full.parameter_count()["total"]
+        del full
+        feat_dim = _EsmFeatureDataset(train.head(1), store, cfg.window,
+                                      target)[0][0].numel()
+        width = mlp_width_for(feat_dim, target_params)
+        print(f"[baselines] matched-capacity MLP: hidden {width} targeting the "
+              f"model's {target_params:,} parameters ...")
+        results["esm_mlp_matched_capacity"] = esm_mlp_baseline(
+            train, val, test, store, cfg, device, target, epochs,
+            cfg.batch_size, hidden=width)
+        results["esm_mlp_matched_capacity"]["training_budget"]["matched_capacity"] = {
+            "model_parameters": int(target_params),
+            "hidden_width": width,
+        }
 
     if not args.skip_zero_shot:
         print("[baselines] ESM zero-shot ...")
