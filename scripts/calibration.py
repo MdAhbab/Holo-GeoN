@@ -55,6 +55,7 @@ from src.encoder import ESM_DIMS, EncodingStore, EsmEncoder
 from src.codon_tables import cai_matched_codon, get_cai_weights
 from src.features import mechanistic_features
 from src.model import HoloGeoN, model_kwargs_from_config
+from src.provenance import provenance
 from src.seeding import seed_everything
 from src.substitution import aa_index
 

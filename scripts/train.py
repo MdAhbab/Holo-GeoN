@@ -83,6 +83,11 @@ from src.model import HoloGeoN, model_kwargs_from_config
 # loader yields a batch.
 ALL_TASKS = ["stability", "three_state", "pathogenicity", "idr", "mfi", "proteomics"]
 
+#: Rows of the TRAINING split scored each epoch to measure the train/val gap.
+#: Fixed and deterministic, so the series is comparable across epochs; a
+#: subsample because the point is the gap, not a precise training score.
+TRAIN_EVAL_ROWS = 20000
+
 #: Consecutive non-finite primary-metric epochs tolerated before aborting.
 MAX_NAN_EPOCHS = 3
 
@@ -139,7 +144,17 @@ def endless(loader):
 # ---------------------------------------------------------------------------
 def _loader(dataset, batch_size: int, shuffle: bool, workers: int,
             seed: int = 42) -> DataLoader:
-    """A DataLoader whose shuffle order and worker RNG are reproducible."""
+    """A DataLoader whose shuffle order and worker RNG are reproducible.
+
+    Only the SHUFFLED (training) loaders keep their workers alive between
+    epochs. An evaluation loader is drained once per epoch and then sits idle,
+    but ``persistent_workers`` kept its whole worker pool resident for the rest
+    of the run: with two tasks each holding a train, a val and a test loader,
+    the process ended up carrying up to 6 x num_workers live worker processes.
+    At num_workers=8 that exhausted 33.9 GB of RAM and the run died with a
+    MemoryError while unpickling a worker's state - after training had finished
+    two clean epochs.
+    """
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -147,7 +162,7 @@ def _loader(dataset, batch_size: int, shuffle: bool, workers: int,
         num_workers=workers,
         collate_fn=collate_graphs,
         drop_last=False,
-        persistent_workers=workers > 0,
+        persistent_workers=workers > 0 and shuffle,
         **loader_kwargs(seed, workers),
     )
 
@@ -219,9 +234,23 @@ def build_split_loaders(
         counts[split] = int(len(part))
         if part.empty:
             continue
-        ds = MutationDataset(part, store, cfg, target=target)
+        # Embedding noise is a TRAINING-time perturbation. It must never touch
+        # val or test: adding it there would change what is being measured, not
+        # how the model is fit.
+        noise = float(cfg.get("embed_noise_std", 0.0)) if split == "train" else 0.0
+        ds = MutationDataset(part, store, cfg, target=target, noise_std=noise)
         out[split] = _loader(ds, batch_size, split == "train",
                              cfg.num_workers, cfg.seed)
+        if split == "train":
+            # A FIXED subsample of the training split, scored each epoch with
+            # the same function used for validation, so the train/val gap is a
+            # recorded number instead of something to be inferred afterwards.
+            # Deterministic sample, unshuffled: the same rows every epoch.
+            n = min(TRAIN_EVAL_ROWS, len(part))
+            sub = part.sample(n=n, random_state=int(cfg.seed))
+            out["train_eval"] = _loader(
+                MutationDataset(sub, store, cfg, target=target),
+                batch_size, False, cfg.num_workers, cfg.seed)
     info = report.as_dict()
     info["split_counts"] = counts
     info["window_coverage"] = window_coverage(df, int(cfg.window))
@@ -411,14 +440,41 @@ def band_sensitivity(df: pd.DataFrame, fallback_sigma: float) -> dict:
     else:
         sigma = torch.full_like(y, float("nan"))
 
-    out: dict = {}
+    # Scale the EFFECTIVE band, not the fallback.
+    #
+    # This loop used to multiply `fallback_sigma` only. The fallback applies
+    # solely to rows whose own sigma is missing or non-positive - and on the
+    # shipped MegaScale table every one of the 389,068 rows carries a finite
+    # positive sigma (median 0.0513), so the fallback governs NO row and all
+    # three factors produced byte-identical fractions under three different
+    # `band_kcal_per_mol` labels. The table read as "the result is insensitive
+    # to the band" when the band had never been varied.
+    #
+    # Scaling the per-row sigma as well makes the factor mean what its name
+    # says, and the recorded band statistics say what the band actually was.
+    usable = torch.isfinite(sigma) & (sigma > 0)
+    effective = torch.where(usable, sigma, torch.full_like(sigma, fallback_sigma))
+
+    out: dict = {
+        "band_source": {
+            "rows_using_their_own_sigma": int(usable.sum()),
+            "rows_using_the_fallback": int((~usable).sum()),
+            "fallback_sigma_kcal_per_mol": round(float(fallback_sigma), 4),
+            "effective_band_median_kcal_per_mol": round(
+                float(effective.median()), 4),
+            "effective_band_p10_p90_kcal_per_mol": [
+                round(float(effective.quantile(0.10)), 4),
+                round(float(effective.quantile(0.90)), 4),
+            ],
+        }
+    }
     for factor in BAND_SENSITIVITY_FACTORS:
-        labels = three_state_labels({"y": y, "sigma": sigma},
-                                    fallback_sigma * factor)
+        band = effective * factor
+        labels = ThreeStateHead.labels_from_ddg(y, band)
         counts = np.bincount(labels.reshape(-1).numpy(), minlength=3)
         total = int(counts.sum()) or 1
         out[f"sigma_x{factor:g}"] = {
-            "band_kcal_per_mol": round(fallback_sigma * factor, 4),
+            "band_median_kcal_per_mol": round(float(band.median()), 4),
             "fraction_destabilizing": round(float(counts[0]) / total, 4),
             "fraction_neutral": round(float(counts[1]) / total, 4),
             "fraction_stabilizing": round(float(counts[2]) / total, 4),
@@ -522,27 +578,45 @@ def compute_class_weights(loaders: dict, device,
     """
     Inverse-frequency class weights from the training split.
 
-    Scans labels only - no model forward - so it is cheap even on a large table.
-    ``fallback_sigma`` is the three-state neutral band for rows with no reported
-    error; the weights inherit it, so it travels here too (R2-11).
+    Reads the labels straight off each dataset's dataframe. ``fallback_sigma``
+    is the three-state neutral band for rows with no reported error; the weights
+    inherit it, so it travels here too (R2-11).
+
+    This used to iterate the DataLoaders. That involves no model forward, which
+    is what its docstring claimed made it "cheap" - but iterating the loader
+    builds every batch in full: one cached parent record deserialised PER ROW
+    (~2.2 MB for a ClinVar-sized protein), windowed, with both edge sets
+    constructed. On the shipped tables that is a complete pass over ~460k rows,
+    close to a terabyte of reads, before the first training step - and it is
+    paid again by every baseline and by all 5 seeds x 5 arms of the ablation
+    grid.
+
+    Nothing in that work is used. The labels are columns on the dataframe the
+    dataset already holds, and the rows are the same rows in the same order, so
+    the counts are identical.
     """
     weights: dict = {}
 
+    def frame(task: str) -> pd.DataFrame:
+        return loaders[task]["train"].dataset.df
+
     if "stability" in loaders:
-        counts = np.zeros(3, dtype=np.int64)
-        for batch in loaders["stability"]["train"]:
-            labels = three_state_labels(batch, fallback_sigma).reshape(-1).numpy()
-            counts += np.bincount(labels, minlength=3)
+        df = frame("stability")
+        y = torch.as_tensor(df["target"].to_numpy(dtype=np.float32))
+        sigma = (torch.as_tensor(df["sigma"].to_numpy(dtype=np.float32))
+                 if "sigma" in df.columns
+                 else torch.full_like(y, float("nan")))
+        labels = three_state_labels({"y": y, "sigma": sigma},
+                                    fallback_sigma).reshape(-1).numpy()
+        counts = np.bincount(labels, minlength=3)
         if counts.sum() and (counts > 0).all():
             inv = counts.sum() / (3.0 * counts)
             weights["three_state"] = torch.tensor(inv, dtype=torch.float32, device=device)
 
     if "pathogenicity" in loaders:
-        pos = neg = 0
-        for batch in loaders["pathogenicity"]["train"]:
-            y = batch["y"].reshape(-1).numpy()
-            pos += int((y > 0.5).sum())
-            neg += int((y <= 0.5).sum())
+        y = frame("pathogenicity")["label"].to_numpy(dtype=np.float32)
+        pos = int((y > 0.5).sum())
+        neg = int((y <= 0.5).sum())
         if pos:
             weights["pathogenicity"] = torch.tensor(neg / pos, dtype=torch.float32,
                                                     device=device)
@@ -803,8 +877,40 @@ def main() -> None:
               + ", ".join(f"{k}={v.tolist() if v.numel() > 1 else float(v):.4}"
                           if v.numel() == 1 else f"{k}={[round(x, 3) for x in v.tolist()]}"
                           for k, v in class_weights.items()))
-    params = list(model.parameters()) + list(criterion.parameters())
-    opt = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    # Weight decay applies to WEIGHT MATRICES ONLY.
+    #
+    # This was one flat parameter group, so `weight_decay` also decayed every
+    # LayerNorm gain, every bias, and - worst - the Kendall & Gal `log_var`
+    # parameters in `criterion`. Decaying a loss-weight parameter pulls each
+    # task weight toward exp(0) = 1; there is no prior that justifies shrinking
+    # it, and it means the learned weighting is not the stationary point the
+    # method defines.
+    #
+    # At the old `weight_decay: 1e-4` the whole effect was a 0.8% shrink across
+    # 270k steps, so it changed nothing and hid the defect. That value was also
+    # not regularising anything: AdamW's decoupled decay is `p -= lr*wd*p`, i.e.
+    # 3e-8 per step at lr 3e-4. Raising it to a value that actually constrains a
+    # 20.6M-parameter model fitting only 322 distinct proteins is what makes
+    # this separation load-bearing rather than cosmetic.
+    decay, no_decay = [], []
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        (decay if p.ndim >= 2 else no_decay).append(p)
+    loss_weights = [p for p in criterion.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(
+        [
+            {"params": decay, "weight_decay": cfg.weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+            {"params": loss_weights, "weight_decay": 0.0},
+        ],
+        lr=cfg.lr,
+    )
+    # Gradient clipping still spans every trainable tensor.
+    params = decay + no_decay + loss_weights
+    print(f"[train] weight decay {cfg.weight_decay:g} on {len(decay)} weight "
+          f"tensors; 0.0 on {len(no_decay)} norm/bias tensors and "
+          f"{len(loss_weights)} task-weight parameters")
 
     # Round-1 review, R1-10: stepping every task every iteration, with
     # steps_per_epoch = max(len(loader)), forcibly equalised them - a 300-row
@@ -983,6 +1089,38 @@ def main() -> None:
             t: evaluate_task(model, t, v["val"], device, three_state_sigma)
             for t, v in loaders.items() if "val" in v
         }
+
+        # The train/val gap, measured rather than inferred.
+        #
+        # Nothing in this run's artifacts could show overfitting: the only
+        # training number recorded was a sum of three differently-scaled losses,
+        # one of them a Gaussian NLL that is unbounded below and log-scale, so
+        # "train loss fell 64%" was not comparable to any validation quantity.
+        # The gap had to be reverse-engineered from the predicted sigma after
+        # the fact. This scores the SAME metric on a fixed subsample of the
+        # training split, so train and val sit side by side in `history`.
+        #
+        # A fixed subsample (not the full split) keeps the cost to a few percent
+        # of an epoch; the same rows every epoch, so the series is comparable.
+        if primary in loaders and "train_eval" in loaders[primary]:
+            train_metrics = evaluate_task(model, primary,
+                                          loaders[primary]["train_eval"],
+                                          device, three_state_sigma)
+            train_log["eval_on_train_subsample"] = train_metrics
+            v_rmse = val.get(primary, {}).get("rmse")
+            t_rmse = train_metrics.get("rmse")
+            if v_rmse and t_rmse:
+                train_log["generalisation_gap_rmse"] = round(v_rmse / t_rmse, 4)
+
+        # Is the predicted uncertainty honest on held-out data? sigma is fit on
+        # TRAINING residuals, so this ratio grows as the mean channel memorises:
+        # it went 1.30 -> 2.39 over 11 epochs of the previous run while nothing
+        # in the log said so. mu +/- 1.96*sigma is only a real interval near 1.0.
+        v_stab = val.get("stability", {})
+        if v_stab.get("mean_predicted_sigma"):
+            v_stab["rmse_over_predicted_sigma"] = round(
+                v_stab["rmse"] / v_stab["mean_predicted_sigma"], 4)
+
         primary_val = val.get(primary, {})
         if primary_metric not in primary_val:
             raise KeyError(
@@ -1036,11 +1174,24 @@ def main() -> None:
                   "lr": sched.get_last_lr()[0]}
         history.append(record)
 
-        summary = "  ".join(
-            f"{t}:{primary_metric if t == primary else 'n'}="
-            f"{val[t].get(primary_metric if t == primary else 'n', float('nan'))}"
-            for t in sorted(val)
-        )
+        # Every task reports ITS OWN headline metric. This line used to print
+        # the primary task's metric for the primary task and the literal row
+        # count `n` for every other one, so a ClinVar AUROC of 0.95 was computed
+        # each epoch, written into `history` and metrics.json, and never shown -
+        # the second of the two trained tasks looked like it was reporting
+        # nothing. The per-task metric is the one already declared in
+        # `ablation_metrics`, so the log agrees with what the ablation grid
+        # compares.
+        headline = cfg.get("ablation_metrics", {}) or {}
+        parts = []
+        for t in sorted(val):
+            key = primary_metric if t == primary else headline.get(t, "n")
+            value = val[t].get(key)
+            if value is None:                       # metric absent for this task
+                key, value = "n", val[t].get("n", float("nan"))
+            parts.append(f"{t}:{key}={value:.4f}" if isinstance(value, float)
+                         else f"{t}:{key}={value}")
+        summary = "  ".join(parts)
         print(f"[train] epoch {epoch}/{cfg.epochs}  "
               f"loss={sum(v for k, v in train_log.items() if isinstance(v, float) and not k.endswith('_weight')):.4f}  "
               f"{primary}.{primary_metric}={score:.4f}  | {summary}")

@@ -42,7 +42,7 @@ import torch
 from tqdm import tqdm
 
 from src.config import load_config
-from src.data import detect_columns
+from src.data import clean_cds, detect_columns
 from src.device import describe_device
 from src.encoder import ESM_DIMS, EncodingStore, EsmEncoder
 from src.features import VIENNA_AVAILABLE, mechanistic_features
@@ -68,14 +68,16 @@ def collect_parents(paths: list[str], cfg) -> dict[str, str | None]:
             print(f"[precompute] {path}: no wild-type sequence column; skipped")
             continue
         seqs = df[col["wt_seq"]].astype(str).str.upper()
-        cds = df[col["cds"]].astype(str) if col["cds"] else None
+        cds = df[col["cds"]] if col["cds"] else None
         for i, s in enumerate(seqs):
             if not s or s == "NAN" or len(s) > cfg.max_protein_length:
                 continue
-            dna = None
-            if cds is not None:
-                v = cds.iat[i]
-                dna = v if v and v.lower() != "nan" else None
+            # clean_cds, not str(): a missing cell must read as "no CDS" rather
+            # than as the truthy string "nan". Under pandas 3 astype(str) keeps
+            # missing values as NA instead of stringifying them, so the old
+            # `v.lower()` raised AttributeError on any partially-populated CDS
+            # column; under pandas 2 it silently produced a "nan" sequence.
+            dna = clean_cds(cds.iat[i]) if cds is not None else None
             # A real CDS wins over a None seen earlier for the same protein.
             if s not in parents or (parents[s] is None and dna):
                 parents[s] = dna

@@ -1,0 +1,25 @@
+{
+  "n_sequences": 300,
+  "min_separation": 6,
+  "contact_head": {
+    "long_range_fraction_topL": 0.3661321983124561,
+    "medium_range_fraction_topL": 0.2641804483422004
+  },
+  "sequence_proximity_baseline": {
+    "long_range_fraction_topL": 0.0
+  },
+  "random_edge_control": {
+    "long_range_fraction_topL": 0.8895142964221243
+  },
+  "interpretation": "The long-range fraction is a NECESSARY check, not a sufficient one. Beating the sequence-proximity baseline is arithmetic - its long-range fraction is 0 by construction - and a uniformly random edge set scores near the random_edge_control figure here without carrying any structure. Read the head against the RANDOM control, and treat even that as evidence only that the edges are non-local. Whether they are CORRECT needs precision_vs_structure, which requires --true-contacts-dir (R2-13).",
+  "supports_structural_claim": true,
+  "precision_vs_structure": {
+    "n_with_structure": 10,
+    "contact_head_precision_at_L": 0.7292590406828934,
+    "contact_head_precision_at_L5": 0.9264335664335664,
+    "baseline_precision_at_L": 0.08032836193824604,
+    "baseline_precision_at_L5": 0.08232905982905983,
+    "random_precision_at_L": 0.0773516764735582,
+    "random_precision_at_L5": 0.06075757575757575
+  }
+}

@@ -69,6 +69,32 @@ _CANDIDATES: dict[str, list[str]] = {
 }
 
 
+def clean_cds(value) -> str | None:
+    """
+    Normalise a coding-sequence cell to a real sequence or None.
+
+    ``str(value)`` on a missing cell yields the literal ``"nan"`` (or
+    ``"None"``), and that string is TRUTHY. ``src/features.mechanistic_features``
+    treats any truthy ``dna_seq`` as a real coding sequence: it would stamp
+    ``mech_valid = 1`` and fill the CAI and mRNA-folding channels from a
+    three-character non-sequence, for a row that has no CDS at all. The run
+    would then report mechanistic coverage it does not have, and the
+    ``no_mech_stream`` ablation would be measured against partly fabricated
+    channels.
+
+    A row with no coding sequence must read as having no coding sequence.
+    """
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):      # arrays and other non-scalars
+        pass
+    text = str(value).strip()
+    return text if text and text.lower() not in ("nan", "none", "<na>") else None
+
+
 def detect_columns(df: pd.DataFrame, overrides: dict[str, str] | None = None) -> dict:
     """Map canonical names to actual columns, honouring config overrides."""
     overrides = overrides or {}
@@ -249,7 +275,7 @@ def load_mutation_table(
                 continue
             rec["group"] = str(df[col["gene"]].iat[i]) if col["gene"] else w
 
-        rec["cds"] = str(df[col["cds"]].iat[i]) if col["cds"] else None
+        rec["cds"] = clean_cds(df[col["cds"]].iat[i]) if col["cds"] else None
         records.append(rec)
 
     out = pd.DataFrame.from_records(records)
@@ -452,7 +478,7 @@ def load_sequence_table(
                     declared = f"{key}:{value}"
                     break
         rec = {"parent_seq": s, "target": v, "group": declared or s}
-        rec["cds"] = str(df[col["cds"]].iat[i]) if col["cds"] else None
+        rec["cds"] = clean_cds(df[col["cds"]].iat[i]) if col["cds"] else None
         if col["species"] is not None:
             try:
                 rec["species_id"] = int(df[col["species"]].iat[i])
@@ -589,14 +615,38 @@ class MutationDataset(Dataset):
         store  : encoding cache.
         cfg    : graph/window settings (a :class:`src.config.Config` or a dict).
         target : ``"target"`` for regression, ``"label"`` for classification.
+        noise_std : standard deviation of Gaussian noise added to the cached
+            embeddings. TRAINING SPLIT ONLY — pass 0.0 for val and test.
+
+    On ``noise_std``
+    ----------------
+    The encoder is frozen and its output is cached, so row *i* presents the model
+    with a byte-identical input at every epoch. The readout then anchors on the
+    mutated site, which makes (parent, site) a stable key: 17,071 distinct values
+    over 305,995 training rows. A network with 20.6M parameters can store a
+    response per key, and measurement says it does - train Pearson reaches 0.954
+    against 0.758 on held-out proteins, and the fitted sigma is honest on train
+    (1.12x) while being 2.5x overconfident on test.
+
+    Raising weight decay 100x did not touch this, and could not: weight decay
+    constrains the MAP, not the keys. Perturbing the embedding is the one cheap
+    change that attacks the precondition instead - row *i* is a different input
+    each epoch, so there is no fixed table to memorise.
+
+    The noise is drawn ONCE per sample, before the backbone, so the context
+    vector ``z`` is a single draw shared by both ``s()`` calls in the
+    substitution head. ``ddG = s(z, e_mt) - s(z, e_wt)`` therefore stays exactly
+    antisymmetric.
     """
 
-    def __init__(self, df: pd.DataFrame, store: EncodingStore, cfg, target: str = "target"):
+    def __init__(self, df: pd.DataFrame, store: EncodingStore, cfg,
+                 target: str = "target", noise_std: float = 0.0):
         self.df = df.reset_index(drop=True)
         self.store = store
         self.cfg = cfg if isinstance(cfg, dict) else cfg.as_dict()
         self.window = int(self.cfg.get("window", 256))
         self.target = target
+        self.noise_std = float(noise_std)
 
     def __len__(self) -> int:
         return len(self.df)
@@ -605,6 +655,8 @@ class MutationDataset(Dataset):
         row = self.df.iloc[i]
         rec = self.store.get(row["parent_seq"])
         g = build_sample_graph(rec, int(row["site"]), self.window, self.cfg)
+        if self.noise_std > 0.0:
+            g["esm"] = g["esm"] + self.noise_std * torch.randn_like(g["esm"])
         g["wt_idx"] = aa_index(row["wt_aa"])
         g["mt_idx"] = aa_index(row["mt_aa"])
         g["y"] = float(row[self.target])
@@ -842,6 +894,7 @@ def move_batch(batch: dict, device) -> dict:
 __all__ = [
     "LoadReport",
     "NodeBudgetBatchSampler",
+    "clean_cds",
     "detect_columns",
     "load_mutation_table",
     "load_sequence_table",

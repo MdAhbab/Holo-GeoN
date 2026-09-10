@@ -139,11 +139,51 @@ homologs; the leakage report records which was used.
 
 ## Reproducing
 
+### 1. Build the tables
+
+The pipeline reads normalised parquet tables. The raw releases are not those
+tables, so they are built first — once — from `dataset/`:
+
+```bash
+python -m scripts.build_megascale_table   # -> data/megascale_ddg_pairs.parquet
+python -m scripts.build_contact_maps      # -> data/true_contacts/  (precision@L)
+python -m scripts.build_clinvar_table     # -> data/clinvar_protein_pairs.parquet
+python -m scripts.build_fireprot_table    # -> data/fireprotdb_holdout.parquet
+```
+
+Each script refuses rather than guesses where guessing would be silent. Between
+them they check the ΔΔG **sign convention** against the source's own
+stabilising flag, the CDS **reading frame** by translating it back to the
+protein, the contact map's **alignment** to the encoded sequence, and every
+ClinVar variant's **reference residue** against the MANE protein. Those four are
+the failure modes that produce wrong numbers without producing an error.
+
+`build_clinvar_table` and `build_fireprot_table` need network access on first
+run: ClinVar's `variant_summary.txt.gz`, three MANE Select files, and UniProt
+sequences by accession. The ClinVar **VCF is not usable** for this — it carries
+genomic coordinates only, and A/C/G/T are valid amino-acid letters, so a
+protein language model accepts a nucleotide string silently and learns nothing.
+
+Not every head has data. `dataset/` supports the stability and pathogenicity
+heads; the IDR, MFI and proteomics heads have no table, stay untrained, and are
+recorded as untrained in the run manifest.
+
+### 2. Run the pipeline
+
 ```bash
 python run.py test          # unit + invariant tests, no data or network needed
-python run.py all           # etl → precompute → splits → train → baselines →
-                            # ablations → calibration → contacts → results
+python run.py all           # precompute → splits → train → baselines →
+                            # ablations → calibration → external → contacts →
+                            # results
 ```
+
+`external` scores the trained checkpoint on `data/fireprotdb_holdout.parquet` —
+FireProtDB with all MegaScale-sourced rows removed, so it shares no measurement
+with the training table. It is the only number in the run computed on
+full-length proteins from outside the training distribution. It is also
+**destabilizing-positive** where the training table is stabilizing-positive;
+`configs/data.yaml` declares that, and the applied sign is echoed into the
+report, because Pearson r is invariant to the flip and would not reveal it.
 
 Stages are individually runnable and resumable. Check your data first:
 

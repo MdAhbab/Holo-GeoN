@@ -11,7 +11,14 @@
 # Frozen throughout. 650M is the shipped default; 150M (facebook/esm2_t30_150M_UR50D,
 # 640-d) roughly halves the cache and the precompute pass if disk is tight.
 esm_model: facebook/esm2_t33_650M_UR50D
-cache: cache/esm2_650M
+# The encoder cache is read RANDOMLY - one record per training ROW, ~155k rows
+# per epoch for ClinVar spread over 15k files - so where it lives dominates
+# training throughput. On this machine the repo sits on a SATA HDD (Toshiba
+# HDWT720) and a ClinVar batch took 1.8-2.3 s against a stability batch's 31 ms,
+# leaving the GPU idle at 0-5%. Moved to the NVMe SSD it is random-access
+# friendly. Rebuild it anywhere with:
+#     python run.py precompute --cache <path>
+cache: C:/Users/User/AppData/Local/holo-geon/cache/esm2_650M
 device: cuda
 
 # Mutation-centered window length, in residues. The window is always placed
@@ -27,6 +34,12 @@ contact_min_sep: 3
 out_root: runs
 stability_data: data/megascale_ddg_pairs.parquet
 clinvar_data: data/clinvar_protein_pairs.parquet
+
+# Independent stability test set: FireProtDB with every MegaScale-sourced row
+# removed, so it shares no measurement with stability_data. Scored by
+# `python run.py external`, never trained on. Built by
+# `python -m scripts.build_fireprot_table`. Set to null to skip.
+external_data: data/fireprotdb_holdout.parquet
 
 # Optional tables. A head whose table is absent stays untrained, is recorded as
 # untrained in the run manifest, and must not be described as a capability.
@@ -88,14 +101,39 @@ site_anchored_readout: true
 # That is the correct 60 passes rather than 37.7, but if the wall-clock budget
 # is fixed, lower this to ~38 to match what the previous configuration actually
 # did. scripts/train.py prints steps_per_epoch and how it was derived.
-epochs: 60
+# A1 (OVERFITTING_FIX.md section 3). Was 33. Validation Pearson saturates at
+# epoch ~6 (0.7532); the selected epoch 15 scored 0.7616, a +0.0084 gain over
+# nine further epochs and well inside the +/-0.035 cluster CI - i.e. noise. Those
+# epochs took the train/val RMSE ratio from 1.56 to 2.05 and the sigma/error
+# ratio from 1.91x to 2.49x, so they bought memorisation and nothing else.
+#
+# It also fixes the schedule. total_steps = steps_per_epoch * epochs, so with
+# epochs: 33 and early stopping the cosine never reached its tail: the shipped
+# checkpoint was taken at 62% of peak LR. At 12 the anneal completes inside the
+# budget actually run.
+epochs: 12
 batch_size: 64
 lr: 0.0003
-weight_decay: 0.0001
+# Raised from 1e-4 after an adversarial review measured what 1e-4 actually did:
+# AdamW's decoupled decay is p -= lr*wd*p, so at lr 3e-4 that is a 3e-8 relative
+# shrink per step and 0.81% across the WHOLE 270k-step run - decorative, not
+# regularisation. Meanwhile the model has 20.6M parameters and sees only 322
+# distinct training proteins (17,071 distinct site contexts), and its predicted
+# sigma drifted from 1.30x to 2.39x below its own held-out RMSE: memorisation.
+# Only weight MATRICES are decayed; norms, biases and the Kendall & Gal
+# log-variance parameters are excluded in scripts/train.py, which is what makes
+# a value this size safe to use.
+weight_decay: 0.01
 warmup_frac: 0.05
-early_stop_patience: 8
+early_stop_patience: 4
 grad_clip: 1.0
 amp: true
+# Measured on this machine with the cache on the SSD: pathogenicity batches run
+# 7.0/s at 4 workers and 13.9/s at 8, stability 38/s and 84/s, against a 33.8 ms
+# GPU step. 8 would keep the GPU better fed, but each worker holds a copy of the
+# dataset and 8 exhausted 33.9 GB of RAM (MemoryError while spawning the
+# evaluation workers). 4 leaves comfortable headroom for an unattended
+# multi-hour run; raise it only while watching RSS.
 num_workers: 4
 max_rows: null
 
@@ -136,7 +174,41 @@ three_state_sigma: 0.5
 # records costs roughly 50 MB per worker - times num_workers. Off by default:
 # round-1's commit message claimed a graph cache that did not exist (R1-17), and
 # the replacement should be enabled deliberately with the RAM cost in view.
-record_cache_size: 0
+record_cache_size: 512
+
+# Measured on this machine's tables: the 412 MegaScale parents are 0.15 MB each
+# (0.06 GB for ALL of them) and each recurs ~740x per epoch, so they stay
+# resident and are served from RAM; ClinVar's 15,177 parents are 1.95 MB each
+# (29.6 GB, uncacheable) and recur ~10x, so they cycle through the remaining
+# slots. Steady-state cost is therefore ~130-200 MB per worker, not the
+# 512 * 1.95 MB the capacity alone would suggest. Without this the GPU sat at
+# 0% between bursts, waiting on one deserialisation per ROW.
+
+# B1 (OVERFITTING_FIX.md section 3). Gaussian noise added to the cached ESM
+# embeddings, TRAINING SPLIT ONLY (src/data.MutationDataset).
+#
+# The encoder is frozen and its output cached, so every epoch shows the model a
+# byte-identical input for row i. The site-anchored readout then makes
+# (parent, site) a stable key - 17,071 distinct values over 305,995 training
+# rows - and a 20.6M-parameter network stores a response per key. Measured: train
+# Pearson 0.954 vs test 0.758, and the fitted sigma is honest on train (1.12x)
+# while 2.5x overconfident on test.
+#
+# Raising weight_decay 100x (1e-4 -> 1e-2) changed none of it, because weight
+# decay constrains the map and not the keys. This is the one cheap change that
+# removes the precondition: with noise, row i is a different input every epoch,
+# so there is no fixed table to memorise.
+#
+# Scale: per-dimension std ACROSS RESIDUES in the cache is ~0.17-0.20, so 0.10 is
+# roughly half the real variation - substantial without destroying the signal.
+# Antisymmetry is unaffected: the draw happens once per sample before the
+# backbone, so z is shared by both s() calls and ddG = s(z,e_mt) - s(z,e_wt)
+# stays exact.
+# MEASURED (runs/noise_sigma0.10): at sigma=0.10 the train/val gap was WORSE at
+# every matched epoch than without noise (ep2 1.201 vs 1.187, ep5 1.597 vs
+# 1.498) and val Pearson was ~0.02 lower. The gap reduction that run showed
+# came entirely from early stopping (A1 above), not from the noise. Off.
+embed_noise_std: 0.0
 
 # --- ablations -------------------------------------------------------------
 # The ONE metric per task the ablation grid compares, declared before any run.

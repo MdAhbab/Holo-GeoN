@@ -22,6 +22,7 @@ from tests import helpers
 def main() -> int:
     from tests import (
         test_app,
+        test_dataset_etl,
         test_invariants,
         test_pipeline,
         test_round1_fixes,
@@ -34,6 +35,7 @@ def main() -> int:
         ("web backend", test_app.TESTS),
         ("round-1 review regressions", test_round1_fixes.TESTS),
         ("round-2 review regressions", test_round2_fixes.TESTS),
+        ("dataset ETL regressions", test_dataset_etl.TESTS),
     ]
 
     errors: list[str] = []

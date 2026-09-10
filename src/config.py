@@ -49,6 +49,11 @@ DEFAULTS: dict[str, Any] = {
     "out_root": "runs",
     "stability_data": "data/megascale_ddg_pairs.parquet",
     "clinvar_data": "data/clinvar_protein_pairs.parquet",
+    # Independent stability table, scored but never trained on. Its proteins are
+    # encoded by the precompute stage so `external` can score them; without that
+    # the stage would silently report a metric for whatever subset happened to
+    # be cached.
+    "external_data": "data/fireprotdb_holdout.parquet",
     "idr_data": None,          # experimental Rg table; prior-only when absent
     "mfi_data": None,          # fluorescence table; head untrained when absent
     "proteomics_data": None,   # retention-time table; head untrained when absent
@@ -120,6 +125,11 @@ DEFAULTS: dict[str, Any] = {
     # `record_cache_size * L * dim * 2` bytes per worker for those reads. Off by
     # default because the RAM cost should be chosen, not inherited (R1-17).
     "record_cache_size": 0,
+    # Gaussian noise added to the cached ESM embeddings, TRAINING SPLIT ONLY.
+    # The encoder is frozen and cached, so without this every epoch presents row
+    # i with a byte-identical input and (parent, site) becomes a stable lookup
+    # key the model can memorise a response for. See src/data.MutationDataset.
+    "embed_noise_std": 0.0,
     "ablation_metrics": {
         "stability": "pearson",
         "pathogenicity": "auroc",

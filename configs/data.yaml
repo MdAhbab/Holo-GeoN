@@ -72,10 +72,36 @@ megascale_ddg_pairs:
   #                          # no information the embeddings lack.
 
 clinvar_protein_pairs:
+  # Built by `python -m scripts.build_clinvar_table` from ClinVar's
+  # variant_summary release plus MANE Select. Auto-detection finds every column
+  # (ref_protein / alt_protein / clinical_significance / gene_symbol / wt_dna),
+  # so nothing needs overriding here.
   # wt_seq: ref_protein
   # mt_seq: alt_protein
   # label:  clinical_significance
   # gene:   gene_symbol
+
+# Independent stability test set: FireProtDB minus the MegaScale rows that are
+# already the training set. Built by `python -m scripts.build_fireprot_table`.
+#
+# ddg_sign is LOAD-BEARING here and is not the default. The evidence, in full,
+# is in that script's docstring; in short, FireProtDB's non-MegaScale rows are
+# inverted relative to the training table:
+#
+#   - its MegaScale-sourced rows agree with megascale_ddg_pairs at r = +0.9995
+#     over 346,489 shared (PDB, substitution) pairs, sign agreement 1.000;
+#   - the non-MegaScale rows DISAGREE with those same MegaScale rows:
+#     r = -0.77 over the 51 mutations both measure, sign agreement 0.255;
+#   - and their raw mean ddG is +0.985, i.e. classical folding mutations coming
+#     out stabilising on average, which is not credible.
+#
+# Left at the default this table would still have produced a healthy Pearson r
+# - correlation is invariant to a global sign flip - while every stabilising /
+# destabilising verdict read from it was backwards.
+fireprotdb_holdout:
+  target: ddg
+  parent: parent
+  ddg_sign: destabilizing_positive
 
 # Whole-sequence tables (IDR / MFI / proteomics). Add a block per file, keyed by
 # its basename without the extension. `parent` is effectively required for any

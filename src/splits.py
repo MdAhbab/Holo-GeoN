@@ -96,31 +96,75 @@ def cluster_with_mmseqs(
     threads: int = 8,
 ) -> dict[str, str]:
     """
-    Cluster sequences with MMseqs2 easy-cluster at ``min_seq_id`` identity.
+    Cluster sequences with MMseqs2 at ``min_seq_id`` identity.
     Returns {sequence_id: cluster_representative_id}. Requires the mmseqs binary.
+
+    This runs ``createdb`` -> ``cluster`` -> ``createtsv`` rather than the
+    single ``easy-cluster`` convenience wrapper. Those are the same three steps
+    easy-cluster performs to produce the cluster assignment, and the assignment
+    is the only thing this function returns.
+
+    The two steps that are NOT run are ``result2repseq`` and ``result2flat``,
+    which build the ``_rep_seq.fasta`` and ``_all_seqs.fasta`` files. Nothing
+    here reads those, and ``result2flat`` segfaults intermittently in the
+    official Windows (cygwin) build - after the cluster TSV has already been
+    written, so easy-cluster would fail on a result that was complete and
+    correct. Not asking for the artifact is better than tolerating a crash while
+    producing it, because a real clustering failure must still be an error.
     """
     if not mmseqs_available():
         raise RuntimeError(
             "mmseqs not found on PATH. Install MMseqs2 (conda install -c bioconda "
-            "mmseqs2) or use the parent-sequence fallback (group_key_for_sequence)."
+            "mmseqs2, or the win64 build from the MMseqs2 releases page) or use "
+            "the parent-sequence fallback (group_key_for_sequence)."
         )
-    os.makedirs(tmp_dir, exist_ok=True)
+    # mmseqs refuses to overwrite an existing output database ("clu.dbtype
+    # exists already!"), so a second call with the same tmp_dir would fail on
+    # the leftovers of the first. easy-cluster hid this by generating a fresh
+    # hashed subdirectory per run; this scratch space belongs to this function,
+    # so clearing it is the equivalent.
+    work = os.path.join(tmp_dir, "work")
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work, exist_ok=True)
     fasta = os.path.join(tmp_dir, "input.fasta")
     with open(fasta, "w") as fh:
         for sid, seq in id_to_seq.items():
             fh.write(f">{sid}\n{seq}\n")
-    out_prefix = os.path.join(tmp_dir, "clu")
-    subprocess.run(
-        ["mmseqs", "easy-cluster", fasta, out_prefix, os.path.join(tmp_dir, "work"),
-         "--min-seq-id", str(min_seq_id), "-c", str(coverage),
-         "--cov-mode", "0", "--threads", str(threads)],
-        check=True,
-    )
+
+    db = os.path.join(work, "db")
+    clu = os.path.join(work, "clu")
+    tsv = os.path.join(tmp_dir, "clu_cluster.tsv")
+
+    def mmseqs(*argv: str) -> None:
+        # mmseqs reports its errors on stdout, not stderr, so a bare exit code
+        # would discard the one line that says what went wrong.
+        proc = subprocess.run(["mmseqs", *argv], capture_output=True, text=True)
+        if proc.returncode != 0:
+            tail = (proc.stdout or "").strip().splitlines()[-5:]
+            raise RuntimeError(
+                f"mmseqs {argv[0]} failed (exit {proc.returncode}): "
+                + " | ".join(tail)
+            )
+
+    mmseqs("createdb", fasta, db)
+    mmseqs("cluster", db, clu, os.path.join(work, "tmp"),
+           "--min-seq-id", str(min_seq_id), "-c", str(coverage),
+           "--cov-mode", "0", "--threads", str(threads))
+    mmseqs("createtsv", db, db, clu, tsv, "--threads", str(threads))
+
     clusters: dict[str, str] = {}
-    with open(out_prefix + "_cluster.tsv") as fh:
+    with open(tsv) as fh:
         for line in fh:
+            if not line.strip():
+                continue
             rep, member = line.rstrip("\n").split("\t")
             clusters[member] = rep
+    if len(clusters) != len(id_to_seq):
+        raise RuntimeError(
+            f"mmseqs clustered {len(clusters)} of {len(id_to_seq)} sequences. "
+            f"A partial clustering would silently drop proteins from the split, "
+            f"so this is an error rather than a warning."
+        )
     return clusters
 
 
@@ -277,7 +321,29 @@ def near_duplicate_audit(
             "note": "one side of the split is empty; nothing to compare",
         }
 
-    sampled = held_uniq[:max_held]
+    # A RANDOM sample, not an alphabetical prefix.
+    #
+    # This was `held_uniq[:max_held]`, and `held_uniq` is `sorted(set(...))` -
+    # so the "sample" was the alphabetically-first max_held amino-acid strings.
+    # On the shipped ClinVar split that silently skipped 984 of 2984 held-out
+    # proteins (33%), and the two proteins that DO have a near-identical
+    # training neighbour both sit in the unchecked tail. The audit reported
+    # 0.0 leakage, `NEAR_DUPLICATE_TOLERANCE` is 0.0, and the gate in
+    # scripts/make_splits.py raises on any positive value - so the split was
+    # written only because the check never looked at the rows that would have
+    # stopped it. A guard whose blind spot is a deterministic function of the
+    # data is not a guard.
+    #
+    # Seeded, so the audit stays reproducible.
+    if len(held_uniq) > max_held:
+        sampled = sorted(random.Random(0).sample(held_uniq, max_held))
+        sampling_note = (
+            f"random sample of {max_held} of {len(held_uniq)} held-out proteins "
+            f"(seeded); the reported fraction is an estimate"
+        )
+    else:
+        sampled = held_uniq
+        sampling_note = "every held-out protein was checked"
     sketches = [_kmer_sketch(s) for s in train_uniq]
     index: dict = defaultdict(list)
     for i, sk in enumerate(sketches):
@@ -317,6 +383,7 @@ def near_duplicate_audit(
         "jaccard_threshold": threshold,
         "kmer": KMER,
         "examples": examples,
+        "sampling": sampling_note,
         "method": (
             "bottom-32 MinHash over 8-mers; a held-out protein counts as leaked "
             "when its estimated k-mer Jaccard against some training protein is "

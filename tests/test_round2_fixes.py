@@ -411,10 +411,31 @@ def test_r2_11_three_state_band_is_declared() -> None:
     y = np.random.default_rng(0).normal(-1.0, 1.5, 4000)
     table = pd.DataFrame({"target": y, "sigma": [float("nan")] * len(y)})
     sens = band_sensitivity(table, 0.5)
-    neutral = [sens[k]["fraction_neutral"] for k in sorted(sens)]
+    bands = sorted(k for k in sens if k.startswith("sigma_x"))
+    neutral = [sens[k]["fraction_neutral"] for k in bands]
     check(len(set(neutral)) == len(neutral) and neutral == sorted(neutral),
           f"the neutral fraction rises with the band {neutral}, so the "
           f"sensitivity row is informative")
+    check(sens["band_source"]["rows_using_the_fallback"] == len(y),
+          "and the report says these rows used the fallback band")
+
+    # The case this test used to miss entirely. Every row here reports its OWN
+    # sigma, so the fallback governs nothing - which is the shipped MegaScale
+    # situation (all 389,068 rows carry a finite positive sigma). Scaling only
+    # the fallback produced three IDENTICAL rows under three different band
+    # labels, reading as "insensitive to the band" when the band never moved.
+    with_sigma = pd.DataFrame({"target": y,
+                               "sigma": np.full(len(y), 0.05)})
+    sens2 = band_sensitivity(with_sigma, 0.5)
+    bands2 = sorted(k for k in sens2 if k.startswith("sigma_x"))
+    neutral2 = [sens2[k]["fraction_neutral"] for k in bands2]
+    check(len(set(neutral2)) == len(neutral2) and neutral2 == sorted(neutral2),
+          f"the band still moves the labels when every row reports its own "
+          f"sigma {neutral2}")
+    check(sens2["band_source"]["rows_using_the_fallback"] == 0
+          and sens2["band_source"]["rows_using_their_own_sigma"] == len(y),
+          "and the report shows the fallback governed no row, so the declared "
+          "three_state_sigma cannot be mistaken for the band that was used")
 
 
 # ---------------------------------------------------------------------------
@@ -678,17 +699,36 @@ def test_r2_whole_sequence_path_end_to_end() -> None:
                         "--out", splits, "--config", write_cfg(grouped)],
                        cwd=root, capture_output=True, text=True)
 
-        def train(mfi_path, out):
+        def train(mfi_path, out, env=None):
             return subprocess.run(
                 [sys.executable, "-m", "scripts.train",
                  "--config", write_cfg(mfi_path),
                  "--stability-splits", splits,
                  "--pathogenicity-splits", os.path.join(data, "missing.parquet"),
                  "--out", out],
-                cwd=root, capture_output=True, text=True)
+                cwd=root, capture_output=True, text=True, env=env)
 
         # 1. The leaky table must be REFUSED.
-        bad = train(leaky, os.path.join(workdir, "run_leaky"))
+        #
+        # The blind spot R2-04 is about belongs to the FALLBACK grouping
+        # relation: with no mmseqs, grouping degrades to exact parent-sequence
+        # identity, every DMS variant becomes its own group, the group-key check
+        # passes, and every test row still sits one residue from a training row.
+        # The near-duplicate audit is the net under that, and the fallback is the
+        # configuration that exercises it.
+        #
+        # With mmseqs on PATH the leak cannot arise at all: identity clustering
+        # puts every variant of a construct in one cluster, whole constructs go
+        # to one side, and the run correctly proceeds - so asserting a refusal
+        # here would be asserting the absence of mmseqs. Checked separately
+        # below. Hiding mmseqs keeps this test about the audit, not the machine.
+        env_fallback = dict(os.environ)
+        env_fallback["PATH"] = os.pathsep.join(
+            p for p in env_fallback.get("PATH", "").split(os.pathsep)
+            if p and not any(os.path.exists(os.path.join(p, exe))
+                             for exe in ("mmseqs", "mmseqs.exe"))
+        )
+        bad = train(leaky, os.path.join(workdir, "run_leaky"), env=env_fallback)
         combined = bad.stdout + bad.stderr
         check(bad.returncode != 0,
               f"a DMS-shaped table with no grouping column is refused "
@@ -697,6 +737,31 @@ def test_r2_whole_sequence_path_end_to_end() -> None:
               "and the refusal names the near-duplicate overlap it measured")
         check("configs/data.yaml" in combined,
               "and tells the user how to fix it")
+
+        # 1b. The other half of the same claim: where mmseqs IS installed, the
+        # identity clustering must group those variants by construct on its own,
+        # so the situation the audit refuses never arises. Checked at the
+        # clustering level rather than by another training run.
+        from src.splits import cluster_with_mmseqs, mmseqs_available
+
+        if mmseqs_available():
+            variant_seqs = {f"v{i}": r["wt_seq"] for i, r in enumerate(rows)}
+            construct_of = {f"v{i}": r["construct"] for i, r in enumerate(rows)}
+            clustered = cluster_with_mmseqs(
+                variant_seqs, min_seq_id=0.30, coverage=0.80,
+                tmp_dir=os.path.join(workdir, "mmseqs_tmp"))
+            by_cluster: dict[str, set] = {}
+            for sid, rep in clustered.items():
+                by_cluster.setdefault(rep, set()).add(construct_of[sid])
+            check(len(by_cluster) == len({r["construct"] for r in rows}),
+                  f"mmseqs recovers one cluster per construct without a declared "
+                  f"column (got {len(by_cluster)} for "
+                  f"{len({r['construct'] for r in rows})} constructs)")
+            check(all(len(v) == 1 for v in by_cluster.values()),
+                  "and no cluster mixes variants of different constructs, so "
+                  "whole constructs go to one side of the split")
+        else:
+            print("    skip mmseqs identity-clustering checks (mmseqs not on PATH)")
 
         # 2. With a declared construct column it must TRAIN.
         good = train(grouped, os.path.join(workdir, "run_grouped"))

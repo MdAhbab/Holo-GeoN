@@ -129,7 +129,14 @@ def stage_etl(args, cfg) -> str | None:
 
 
 def stage_precompute(args, cfg) -> None:
-    a = ["--data", cfg.stability_data, cfg.clinvar_data,
+    # The external table's proteins are encoded here too: scripts/eval_external
+    # only scores rows that have a cached encoding, so leaving them out would
+    # turn "the model transfers this well" into a statement about whichever
+    # proteins happened to be in the cache.
+    tables = [cfg.stability_data, cfg.clinvar_data]
+    if cfg.values.get("external_data"):
+        tables.append(cfg.values["external_data"])
+    a = ["--data", *tables,
          "--esm-model", cfg.esm_model, "--cache", cfg.cache, "--device", cfg.device]
     if args.max_seqs:
         a += ["--max-seqs", args.max_seqs]
@@ -230,6 +237,15 @@ def stage_contacts(args, cfg) -> None:
         print("[skip] contact sanity already complete")
         return
     a = ["--cache", cfg.cache, "--max-seqs", 300]
+    # Default to the maps built from the release's own AlphaFold models. Without
+    # ground truth this stage can only report a long-range FRACTION, which
+    # uniformly random edges also score well on; with it, precision@L - the
+    # number the graph claim actually rests on.
+    if not args.true_contacts_dir:
+        built = os.path.join("data", "true_contacts")
+        if os.path.isdir(_abs(built)) and os.listdir(_abs(built)):
+            args.true_contacts_dir = built
+            print(f"[contacts] using ground-truth contact maps in {built}")
     if args.true_contacts_dir:
         a += ["--true-contacts-dir", args.true_contacts_dir, "--require-structure"]
     else:
@@ -253,6 +269,28 @@ def stage_results(args, cfg) -> None:
        "--ablations", os.path.join(cfg.out_root, "ablations", "ablations.json"))
 
 
+def stage_external(args, cfg) -> None:
+    """Score the trained checkpoint on a table it never saw."""
+    run_dir = os.path.join(cfg.out_root, "main")
+    ckpt = os.path.join(run_dir, "model_best.pt")
+    external = cfg.values.get("external_data")
+    if not external:
+        print("[external] no external_data configured; skipping.")
+        return
+    if not done(external):
+        print(f"[external] no table at {external}. Build it with "
+              f"`python -m scripts.build_fireprot_table`; skipping.")
+        return
+    if not done(ckpt):
+        print(f"[external] no checkpoint at {ckpt}; run `python run.py train` first")
+        return
+    if done(os.path.join(run_dir, "external_fireprotdb.json")):
+        print("[skip] external evaluation already complete")
+        return
+    py("scripts.eval_external", "--checkpoint", ckpt, "--data", external,
+       "--out", run_dir)
+
+
 def stage_test(args, cfg) -> None:
     py("tests.run_all")
 
@@ -269,6 +307,7 @@ def stage_all(args, cfg) -> None:
     stage_baselines(args, cfg)
     stage_ablations(args, cfg)
     stage_calibration(args, cfg)
+    stage_external(args, cfg)
     stage_contacts(args, cfg)
     stage_results(args, cfg)
     print("\n[done] pipeline complete. See results/SUMMARY.md")
@@ -279,6 +318,7 @@ STAGES = {
     "etl": stage_etl, "precompute": stage_precompute, "splits": stage_splits,
     "train": stage_train, "baselines": stage_baselines, "ablations": stage_ablations,
     "calibration": stage_calibration, "contacts": stage_contacts,
+    "external": stage_external,
     "results": stage_results, "all": stage_all,
 }
 

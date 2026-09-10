@@ -1,7 +1,9 @@
 # --- data & caches (never commit datasets or embeddings) ---
 data/
+dataset/
 cache/
 runs/
+.mmseqs_tmp/
 *.parquet
 *.npy
 *.npz

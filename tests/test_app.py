@@ -91,10 +91,18 @@ SEQ = "MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRL
 def test_backend_without_model() -> None:
     section("web backend — no checkpoint present")
 
-    with tempfile.TemporaryDirectory(prefix="holo_geon_app_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="holo_geon_app_",
+                                     ignore_cleanup_errors=True) as tmp:
         proc = _serve({
             "HOLOGEON_WEIGHTS": os.path.join(tmp, "does_not_exist.pt"),
             "HOLOGEON_DB": os.path.join(tmp, "history.db"),
+            # Point the calibration file INTO the temp dir. It defaults to
+            # runs/main/calibration.json, so on a machine that has actually done
+            # a calibration run the backend would load those real numbers and
+            # report `uncertainty_calibrated: true` - and this test, which is
+            # about the uncalibrated path, would fail for a reason that has
+            # nothing to do with the code under test.
+            "HOLOGEON_CALIBRATION": os.path.join(tmp, "no_calibration.json"),
         })
         try:
             if not _wait_ready(proc):
@@ -158,7 +166,8 @@ def _make_checkpoint(path: str) -> None:
 def test_backend_with_model() -> None:
     section("web backend — checkpoint loaded (random weights, stub encoder)")
 
-    with tempfile.TemporaryDirectory(prefix="holo_geon_app2_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="holo_geon_app2_",
+                                     ignore_cleanup_errors=True) as tmp:
         ckpt = os.path.join(tmp, "model_best.pt")
         _make_checkpoint(ckpt)
 
@@ -183,6 +192,8 @@ def test_backend_with_model() -> None:
         proc = _serve({
             "HOLOGEON_WEIGHTS": ckpt,
             "HOLOGEON_DB": os.path.join(tmp, "history.db"),
+            # As above: isolate from any real calibration artifact in runs/main.
+            "HOLOGEON_CALIBRATION": os.path.join(tmp, "no_calibration.json"),
             "PYTHONPATH": os.pathsep.join([tmp, str(ROOT)]),
         })
         try:

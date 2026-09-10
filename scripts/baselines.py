@@ -133,20 +133,50 @@ def esm_zero_shot_baseline(test: pd.DataFrame, cfg, device, limit: int | None) -
 
     p = np.asarray(scores)
     t = np.asarray(truth)
-    metrics = classification_metrics(t, p) if target == "label" else regression_metrics(t, p)
+    if target == "label":
+        # ORIENTATION. The score is a wild-type-marginal log-odds: HIGHER means
+        # the substitution is more tolerated, i.e. more likely BENIGN. The
+        # ClinVar label is 1 = PATHOGENIC. Scoring the raw margin against that
+        # label therefore measures the baseline upside down and returns an AUROC
+        # below 0.5 - reporting the single strongest control as worse than
+        # random, which silently inflates the model's apparent margin over it.
+        #
+        # The regression branch already had this guard as `abs_pearson`; the
+        # classification branch never did. Negating is the correct repair rather
+        # than an abs(): for a ranking score the direction is known a priori
+        # (tolerated = benign), so it is applied, recorded, and the raw value is
+        # kept alongside so the flip can be audited.
+        metrics = classification_metrics(t, -p)
+        raw = classification_metrics(t, p)
+        metrics["auroc_unoriented"] = raw.get("auroc")
+        metrics["orientation"] = (
+            "score negated: the wild-type marginal is a TOLERANCE score (higher "
+            "= more benign) while label 1 = pathogenic, so the two are "
+            "anti-correlated by construction"
+        )
+        metrics["note"] = (
+            "wild-type-marginal log-odds (Meier et al. 2021). Threshold-free "
+            "metrics (auroc, auprc) are the meaningful ones here. accuracy, f1, "
+            "precision and recall come from thresholding an UNBOUNDED log-odds "
+            "at 0.5 and are not interpretable for this baseline - it is a "
+            "ranking score, not a calibrated probability."
+        )
+    else:
+        metrics = regression_metrics(t, p)
+        if "pearson" in metrics:
+            metrics["abs_pearson"] = abs(metrics["pearson"])
+        metrics["note"] = (
+            "wild-type-marginal log-odds: a higher score means the substitution "
+            "is more tolerated. Under the internal convention (positive ddG is "
+            "STABILISING, see src/data.DDG_CONVENTION) a more-tolerated "
+            "substitution has a HIGHER ddG, so the expected correlation is "
+            "POSITIVE. Round-1 review, R1-19: this docstring previously asserted "
+            "the opposite, which would have made a correctly-signed result look "
+            "like a bug"
+        )
     metrics["n"] = int(len(p))
-    if "pearson" in metrics:
-        metrics["abs_pearson"] = abs(metrics["pearson"])
     metrics["scored_on_full_sequence"] = int(len(p) - truncated)
     metrics["scored_on_truncated_context"] = int(truncated)
-    metrics["note"] = (
-        "wild-type-marginal log-odds: a higher score means the substitution is "
-        "more tolerated. Under the internal convention (positive ddG is "
-        "STABILISING, see src/data.DDG_CONVENTION) a more-tolerated substitution "
-        "has a HIGHER ddG, so the expected correlation is POSITIVE. Round-1 "
-        "review, R1-19: this docstring previously asserted the opposite, which "
-        "would have made a correctly-signed result look like a bug"
-    )
     return metrics
 
 
