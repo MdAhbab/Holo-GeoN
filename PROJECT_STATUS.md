@@ -1,6 +1,19 @@
 # PROJECT_STATUS.md
 
-State of the Holo-GeoN benchmark as of **2026-11-04**, on `main` (`bbd620e` plus uncommitted work).
+## 0. Update — 2026-11-20 (`version-2` active branch, pre-v2 implementation checkpoint)
+
+* **Workspace scaffolded** into `project/` (Git repository only + gitignored `DATASETS/`), `paper/`, and `extras/` (non-Git notes, Zenodo staging, Kaggle account templates).
+* **Git synced:** Previous uncommitted benchmark/geometry/runner scaffolding reviewed, verified (`tests/test_remote_job.py` 52/52 passed), committed as `f083217`, pushed to `origin/main`, and fast-forwarded onto **`version-2`** (`origin/version-2`). All v2 implementation proceeds on `version-2` before merging back to `main`.
+* **Expanded compute pool:** 4 Kaggle accounts (2 weeks -> ~240h T4 GPU + 20 concurrent CPU workers) + ~200 CU (~20h) 95 GB G4 GPU (keep 20 CU safety reserve).
+* **Approved roadmap (details in `../extras/notes/HOLO_GEON_MASTER_PLAN.md` & `../extras/notes/HANDOFF.md`):**
+  1. **Block A (next):** Holo-GeoN v2 core — single-pass `EsmForMaskedLM` (fixing the duplicate 650M forward pass in `src/encoder.py` + extracting free WT-marginal log-odds, Shannon entropy, and multi-layer taps), parent graph cache + Protein-Batch training, `20.6M -> ~2.4M` compressed backbone (FiLM + compact bidirectional mixer + DropEdge + CDS modality dropout), evolutionary-anchored antisymmetric head + `beta-NLL` (`beta=0.5`), Contact-Gated Double-Mutant Epistasis head, upgraded `score_predictions.py` (pooled + per-protein median), and fixing the 6 pre-existing `tests/test_app.py` failures + `runapp.py`.
+  2. **Block B:** Cross-platform non-Linux CLI (`holo.py`/`hologe`), local `fetch_alphafold.py` (176 FireProtDB structures), and non-registration Kaggle CPU jobs (Foldseek/TM-align audit, MMseqs2 25% splits, S669/Domainome ETL, ViennaRNA/CAI, `src/geometry.py`).
+  3. **Block C:** User completes Zenodo `7844779` & Rocklin/OpenFold MGnify Stability registrations -> 4-account Kaggle T4 ablations + competitor adapters (ThermoMPNN, SPURS, RaSP, PROSTATA, optional DDGemb) -> Unified same-GPU 95 GB G4 headline runs -> Zenodo `Holo-StabBench v1.0` dataset & weights release.
+  4. **Block D (later):** Modern Web GUI redesign (`app/frontend/`) + live real-time CLI & tunneled GUI run on G4.
+
+---
+
+State of the Holo-GeoN benchmark as of **2026-11-04**, on `main` (`bbd620e` plus uncommitted work — now committed as `f083217`).
 Companions: `BENCHMARK_PLAN.md` (the benchmark), `GEOMETRIC_PLAN.md` (the coordinate question),
 `RUN_STATE.md` (the previous machine's completed run), `OVERFITTING_FIX.md`.
 
