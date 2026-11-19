@@ -4,9 +4,15 @@ A sequence-based (MSA-free, structure-free) graph neural network for **protein
 stability change (ΔΔG)**, **variant pathogenicity**, and related per-variant
 properties. Frozen ESM-2 embeddings supply residue representations and a
 contact-probability map; a dual-stream GATv2 backbone refines them over a
-spatial edge set and a translational-coupling edge set; a site-anchored readout
-and a substitution-conditioned head turn that into a prediction for one
+predicted-contact edge set and a translational-coupling edge set; a site-anchored
+readout and a substitution-conditioned head turn that into a prediction for one
 mutation.
+
+> **No 3D coordinates anywhere.** `E_geo` comes from ESM-2's contact head, and its
+> edge features (contact probability, log-scaled `|i - j|`, backbone flag) are all
+> functions of sequence position. The model is **not** SE(3)- or E(3)-equivariant;
+> the only equivariance in the code is wild-type/mutant *swap* equivariance in
+> `ThreeStateHead`. "Geo" names a contact-derived topology, not Euclidean geometry.
 
 > **Status: no results are reported here.** This branch is the rebuilt model,
 > ready to train. Nothing in this repository has been trained or evaluated yet,

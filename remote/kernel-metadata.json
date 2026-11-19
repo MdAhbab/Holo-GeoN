@@ -1,0 +1,16 @@
+{
+  "id": "YOUR_KAGGLE_USER/holo-geon-ablation-shard0",
+  "title": "holo-geon-ablation-shard0",
+  "code_file": "kaggle_kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "dataset_sources": [
+    "YOUR_KAGGLE_USER/holo-geon-data",
+    "YOUR_KAGGLE_USER/holo-geon-code"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

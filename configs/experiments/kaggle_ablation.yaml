@@ -1,0 +1,70 @@
+# Ablation grid on Kaggle T4 (free quota; ~30 GPU-h/week/account, 2 concurrent GPU sessions).
+#
+#   python -m scripts.remote_job --manifest configs/experiments/kaggle_ablation.yaml --plan
+#   python -m scripts.remote_job --manifest ... --shard 0/3 --persist /kaggle/working/packs_shard0
+#
+# NOT READY TO LAUNCH. Two prerequisites, both outside this file:
+#   1. The `holo-geon-data` Kaggle dataset (the 3 parquet files, 17 MB) does not
+#      exist yet, and remote/kernel-metadata.json still has no username.
+#   2. The weekly GPU quota has to be free. See the budget below: this grid is
+#      most of a week's quota, so it cannot share the week with other work.
+#
+# 4 arms x 3 seeds = 12 runs, the grid recommended in OVERFITTING_FIX.md A2.
+# Three seeds is the floor scripts/ablations.py itself sets for a paired test;
+# at three seeds only an effect larger than ~0.02 Pearson is detectable, so a null
+# here must be written up as "cannot tell", not "no effect" (the script's own
+# underpowered flag says so). Add seeds 45/46 only if the first pass is
+# informative.
+#
+# Sharding is by SEED, not round-robin over runs: `--shard k/3` is seed 42+k and
+# all four of its arms, so one finished shard already gives ablations.py a
+# complete paired block. More shards than seeds is refused by take_shard, because
+# a shard that splits a seed leaves no arm comparable if a session is lost.
+# Run two shards at once, the third after one ends.
+#
+# Budget. 6 epochs, not 8: OVERFITTING_FIX.md A1 measured val Pearson saturating
+# by epoch ~6, and the last two epochs cost 25% of the week's quota. Strict
+# determinism stays on (x1.3) so a rerun of one seed reproduces it.
+#   at the ASSUMED 0.100 s/step: 1.14 h a run, 5.6 h a shard, 16.7 h for the grid
+#   at 0.150 s/step:             1.71 h a run, 7.8 h a shard, 23.5 h for the grid
+# The second row is the one to plan against: the only cross-GPU ratio we have
+# (kaggle-colab-lessons.md, 72.5 ms T4 vs 24.7 ms G4, ~2.9x) applied to the G4
+# assumption of 40 ms gives ~0.117 s before the determinism factor. At 8 epochs
+# the 0.150 case was 30.4 h, i.e. over quota and past the 8.5 h safe session
+# length; at 6 epochs it fits with ~6 h spare for one retry.
+#
+# MEASURE FIRST. sec_per_step is ASSUMED. Run one short probe (a few hundred
+# steps) on a T4, put the measured value here, and re-run --plan before
+# committing the grid. Everything above is a projection off that one number.
+
+name: kaggle_ablation
+platform: kaggle_t4
+config: configs/benchmark.yaml
+cache: /tmp/holo/cache/esm2_650M
+out_root: /kaggle/working/runs/kaggle_ablation
+num_workers: 4
+
+cost:
+  gpu: T4
+  cu_per_hour: 0          # Kaggle is quota-limited in hours, not units
+  budget_cu: null
+
+sizing:
+  steps_per_epoch: 4782
+  epochs: 6               # val Pearson saturated by epoch ~6 in review (OVERFITTING_FIX A1)
+  sec_per_step: 0.100     # ASSUMED
+  eval_overhead: 0.10
+  strict_factor: 1.3
+  vm_overhead_h: 0.50     # pip installs, first slow reads of the input dataset
+  precompute_h: 0.30
+  external_h: 0.05
+
+items:
+  - {id: precompute, kind: precompute}
+  - {kind: train, arm: full,                seeds: [42, 43, 44], epochs: 6, strict: true}
+  - {kind: train, arm: no_mech_stream,      seeds: [42, 43, 44], epochs: 6, strict: true, flags: ["--no-mech-stream"]}
+  - {kind: train, arm: global_pool_readout, seeds: [42, 43, 44], epochs: 6, strict: true, flags: ["--global-pool-readout"]}
+  - {kind: train, arm: no_geo_stream,       seeds: [42, 43, 44], epochs: 6, strict: true, flags: ["--no-geo-stream"]}
+  # Optional, nearly free as a capacity probe (OVERFITTING_FIX C2/C3): +3 runs.
+  # - {kind: train, arm: no_ssm,            seeds: [42, 43, 44], epochs: 6, strict: true, flags: ["--no-ssm"]}
+  - {id: aggregate, kind: aggregate, phase: post}

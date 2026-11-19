@@ -1,4 +1,5 @@
 # --- data & caches (never commit datasets or embeddings) ---
+DATASETS/
 data/
 dataset/
 cache/
@@ -26,6 +27,7 @@ runs/
 
 # --- python ---
 __pycache__/
+.pytest_cache/
 *.py[cod]
 .venv/
 venv/

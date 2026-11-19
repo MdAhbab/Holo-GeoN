@@ -1,0 +1,76 @@
+# configs/benchmark.yaml - stability-only (DDG) configuration for Kaggle / Colab runs.
+#
+# Same tuned values as configs/run.yaml (A1 in OVERFITTING_FIX.md: epochs 12,
+# patience 4, weight decay 0.01), with three differences:
+#   * `cache` is a Linux scratch path; scripts/remote_job.py overrides it per
+#     platform with --cache, so this value is only a fallback.
+#   * `clinvar_data` is null and the runner passes `--pathogenicity-splits none`.
+#     The benchmark is DDG only. The second task would add ~15k parent proteins
+#     (25 GB of encoder cache, ~2 h of encoding) and ~40% of the training steps
+#     to every run, and OVERFITTING_FIX.md section 1.3 argues it also pushes the
+#     backbone toward protein-identity encoding.
+#   * num_workers is sized for a Colab/Kaggle VM (4-8 vCPUs), not a 32 GB desktop.
+#
+# Anything not listed falls back to src/config.py DEFAULTS, so every value that
+# differs from DEFAULTS in run.yaml is restated here on purpose.
+
+esm_model: facebook/esm2_t33_650M_UR50D
+cache: /tmp/holo/cache/esm2_650M
+device: cuda
+
+window: 256
+contact_top_k: 24
+contact_min_sep: 3
+
+out_root: runs
+stability_data: data/megascale_ddg_pairs.parquet
+clinvar_data: null
+external_data: data/fireprotdb_holdout.parquet
+idr_data: null
+mfi_data: null
+proteomics_data: null
+max_protein_length: 5000
+
+split_method: mmseqs
+identity: 0.30
+coverage: 0.80
+seed: 42
+strict_determinism: false
+
+graph_top_k: 16
+geo_threshold: 0.30
+eps: 0.10
+delta: 0.10
+mech_max_degree: 8
+neighborhood_hops: 2
+
+hidden: 256
+out_dim: 256
+gat_heads: 4
+aa_dim: 32
+dropout: 0.1
+use_ssm: true
+use_mech_stream: true
+use_geo_stream: true
+site_anchored_readout: true
+
+epochs: 12
+batch_size: 64
+lr: 0.0003
+weight_decay: 0.01
+warmup_frac: 0.05
+early_stop_patience: 4
+grad_clip: 1.0
+amp: true
+num_workers: 4
+max_rows: null
+task_sampling_temperature: 0.5
+max_sequence_nodes: 2048
+sequence_node_budget: null
+three_state_sigma: 0.5
+# The 412 MegaScale parents are 0.15 MB each, so all of them stay resident.
+record_cache_size: 512
+embed_noise_std: 0.0
+
+ablation_metrics:
+  stability: pearson
