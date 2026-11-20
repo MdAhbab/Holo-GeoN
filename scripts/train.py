@@ -52,8 +52,10 @@ from src.data import (
     LoadReport,
     MutationDataset,
     NodeBudgetBatchSampler,
+    ProteinBatchMutationDataset,
     SequenceDataset,
     collate_graphs,
+    collate_protein_batch,
     filter_to_cache,
     load_sequence_table,
     move_batch,
@@ -63,6 +65,7 @@ from src.encoder import ESM_DIMS, EncodingStore
 from src.heads import ThreeStateHead
 from src.losses import (
     UncertaintyWeightedLoss,
+    beta_gaussian_nll,
     gaussian_nll,
     pathogenicity_loss,
     sigma_gaussian_nll,
@@ -143,24 +146,14 @@ def endless(loader):
 # Loader construction
 # ---------------------------------------------------------------------------
 def _loader(dataset, batch_size: int, shuffle: bool, workers: int,
-            seed: int = 42) -> DataLoader:
-    """A DataLoader whose shuffle order and worker RNG are reproducible.
-
-    Only the SHUFFLED (training) loaders keep their workers alive between
-    epochs. An evaluation loader is drained once per epoch and then sits idle,
-    but ``persistent_workers`` kept its whole worker pool resident for the rest
-    of the run: with two tasks each holding a train, a val and a test loader,
-    the process ended up carrying up to 6 x num_workers live worker processes.
-    At num_workers=8 that exhausted 33.9 GB of RAM and the run died with a
-    MemoryError while unpickling a worker's state - after training had finished
-    two clean epochs.
-    """
+            seed: int = 42, collate_fn=collate_graphs) -> DataLoader:
+    """A DataLoader whose shuffle order and worker RNG are reproducible."""
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=workers,
-        collate_fn=collate_graphs,
+        collate_fn=collate_fn,
         drop_last=False,
         persistent_workers=workers > 0 and shuffle,
         **loader_kwargs(seed, workers),
@@ -229,30 +222,53 @@ def build_split_loaders(
 
     out: dict[str, DataLoader] = {}
     counts: dict[str, int] = {}
+    use_pb = bool(cfg.get("protein_batch", False)) and int(df["parent_seq"].str.len().max()) <= int(cfg.window)
+    pb_prots = int(cfg.get("proteins_per_batch", 8))
+    pb_muts = int(cfg.get("muts_per_protein", 64))
+
     for split in ("train", "val", "test"):
         part = df[df["split"] == split]
         counts[split] = int(len(part))
         if part.empty:
             continue
-        # Embedding noise is a TRAINING-time perturbation. It must never touch
-        # val or test: adding it there would change what is being measured, not
-        # how the model is fit.
         noise = float(cfg.get("embed_noise_std", 0.0)) if split == "train" else 0.0
-        ds = MutationDataset(part, store, cfg, target=target, noise_std=noise)
-        out[split] = _loader(ds, batch_size, split == "train",
-                             cfg.num_workers, cfg.seed)
+        cds_drop = float(cfg.get("cds_dropout", 0.0)) if split == "train" else 0.0
+        if use_pb:
+            ds = ProteinBatchMutationDataset(
+                part, store, cfg, target=target,
+                muts_per_protein=pb_muts, train=(split == "train"),
+                noise_std=noise, cds_dropout=cds_drop, seed=int(cfg.seed),
+            )
+            out[split] = _loader(
+                ds, pb_prots, split == "train", cfg.num_workers, cfg.seed,
+                collate_fn=collate_protein_batch,
+            )
+        else:
+            ds = MutationDataset(
+                part, store, cfg, target=target,
+                noise_std=noise, cds_dropout=cds_drop,
+            )
+            out[split] = _loader(ds, batch_size, split == "train",
+                                 cfg.num_workers, cfg.seed)
         if split == "train":
-            # A FIXED subsample of the training split, scored each epoch with
-            # the same function used for validation, so the train/val gap is a
-            # recorded number instead of something to be inferred afterwards.
-            # Deterministic sample, unshuffled: the same rows every epoch.
             n = min(TRAIN_EVAL_ROWS, len(part))
             sub = part.sample(n=n, random_state=int(cfg.seed))
-            out["train_eval"] = _loader(
-                MutationDataset(sub, store, cfg, target=target),
-                batch_size, False, cfg.num_workers, cfg.seed)
+            if use_pb:
+                sub_ds = ProteinBatchMutationDataset(
+                    sub, store, cfg, target=target,
+                    muts_per_protein=pb_muts, train=False, seed=int(cfg.seed),
+                )
+                out["train_eval"] = _loader(
+                    sub_ds, pb_prots, False, cfg.num_workers, cfg.seed,
+                    collate_fn=collate_protein_batch,
+                )
+            else:
+                out["train_eval"] = _loader(
+                    MutationDataset(sub, store, cfg, target=target),
+                    batch_size, False, cfg.num_workers, cfg.seed)
     info = report.as_dict()
     info["split_counts"] = counts
+    info["protein_batch_active"] = bool(use_pb)
     info["window_coverage"] = window_coverage(df, int(cfg.window))
     return out, info
 
@@ -484,13 +500,14 @@ def band_sensitivity(df: pd.DataFrame, fallback_sigma: float) -> dict:
 
 def task_losses(model: HoloGeoN, task: str, batch: dict,
                 weights: dict | None = None,
-                fallback_sigma: float = DEFAULT_DDG_SIGMA) -> dict[str, torch.Tensor]:
+                fallback_sigma: float = DEFAULT_DDG_SIGMA,
+                nll_beta: float = 0.0) -> dict[str, torch.Tensor]:
     """Compute the loss terms this task contributes for one batch."""
     weights = weights or {}
     if task == "stability":
         z = model.context(batch)
         ddg, logvar = model.ddg(batch, z)
-        losses = {"stability": gaussian_nll(ddg, logvar, batch["y"])}
+        losses = {"stability": beta_gaussian_nll(ddg, logvar, batch["y"], beta=nll_beta)}
         labels = three_state_labels(batch, fallback_sigma)
         losses["three_state"] = three_state_loss(
             model.three_state(batch, z), labels,
@@ -720,6 +737,30 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=None,
                     help="overrides configs/run.yaml; the ablation runner uses "
                          "this to repeat an arm across seeds")
+    ap.add_argument("--arch", choices=["v1", "v2"], default=None,
+                    help="model architecture: v1 (legacy 20.6M) or v2 (Holo-GeoN v2 ~2.5M)")
+    ap.add_argument("--nll-beta", type=float, default=None,
+                    help="beta-NLL exponent (0.0 = standard NLL, 0.5 = v2 anti-collapse)")
+    ap.add_argument("--cds-dropout", type=float, default=None,
+                    help="training-only CDS/E_mech modality dropout probability")
+    ap.add_argument("--no-esm-logits-prior", action="store_true",
+                    help="ablation (v2): disable WT-marginal ESM log-odds anchor")
+    ap.add_argument("--no-multi-layer", action="store_true",
+                    help="ablation (v2): use last ESM layer only (no scalar-mix)")
+    ap.add_argument("--no-contact-burial", action="store_true",
+                    help="ablation (v2): disable 6-ch contact-topology burial features")
+    ap.add_argument("--use-str-stream", action="store_true",
+                    help="GEOMETRIC_PLAN Arms B/C/D: enable invariant 3D coordinate stream")
+    ap.add_argument("--str-topology-only", action="store_true",
+                    help="GEOMETRIC_PLAN Arm D: 3-ch coordinate k-NN topology only")
+    ap.add_argument("--true-contact-edges", action="store_true",
+                    help="GEOMETRIC_PLAN Arm E: replace ESM contacts with real C-beta contacts")
+    ap.add_argument("--true-contacts-dir", default=None,
+                    help="directory of <sha1>.npy C-beta contact maps for Arm E")
+    ap.add_argument("--protein-batch", dest="protein_batch", action="store_true", default=None,
+                    help="enable Protein-Batch multi-mutation training (15-40x speedup)")
+    ap.add_argument("--no-protein-batch", dest="protein_batch", action="store_false",
+                    help="disable Protein-Batch training (row-level batching)")
     ap.add_argument("--no-mech-stream", action="store_true",
                     help="ablation: disable the E_mech message-passing stream")
     ap.add_argument("--no-ssm", action="store_true",
@@ -740,10 +781,21 @@ def main() -> None:
     cfg = load_config(
         args.config,
         overrides={
+            "arch": args.arch,
             "cache": args.cache, "esm_model": args.esm_model, "device": args.device,
             "epochs": args.epochs, "batch_size": args.batch_size, "lr": args.lr,
             "max_rows": args.max_rows, "num_workers": args.num_workers,
             "seed": args.seed,
+            "nll_beta": args.nll_beta,
+            "cds_dropout": args.cds_dropout,
+            "protein_batch": args.protein_batch,
+            "use_str_stream": True if args.use_str_stream else None,
+            "str_topology_only": True if args.str_topology_only else None,
+            "true_contact_edges": True if args.true_contact_edges else None,
+            "true_contacts_dir": args.true_contacts_dir,
+            "use_esm_logits_prior": False if args.no_esm_logits_prior else None,
+            "use_multi_layer": False if args.no_multi_layer else None,
+            "use_contact_burial": False if args.no_contact_burial else None,
             "strict_determinism": True if args.strict_determinism else None,
         },
     )
@@ -850,13 +902,22 @@ def main() -> None:
     esm_dim = ESM_DIMS.get(cfg.esm_model, 1280)
     model_kwargs = model_kwargs_from_config(
         cfg, esm_dim,
+        arch=cfg.get("arch", "v1"),
         use_ssm=cfg.use_ssm and not args.no_ssm,
         use_mech_stream=cfg.use_mech_stream and not args.no_mech_stream,
-        use_geo_stream=not args.no_geo_stream,
+        use_geo_stream=cfg.use_geo_stream and not args.no_geo_stream,
+        use_str_stream=bool(cfg.get("use_str_stream", False)),
+        str_topology_only=bool(cfg.get("str_topology_only", False)),
+        use_multi_layer=bool(cfg.get("use_multi_layer", True)),
+        use_contact_burial=bool(cfg.get("use_contact_burial", True)),
+        use_esm_logits_prior=bool(cfg.get("use_esm_logits_prior", True)),
         site_anchored_readout=not args.global_pool_readout,
     )
     model = HoloGeoN(**model_kwargs).to(device)
-    print(f"[train] parameters: {model.parameter_count()}")
+    nll_beta = float(cfg.get("nll_beta", 0.0))
+    print(f"[train] parameters: {model.parameter_count()}  (nll_beta={nll_beta}, "
+          f"cds_dropout={float(cfg.get('cds_dropout', 0.0))}, "
+          f"protein_batch={bool(cfg.get('protein_batch', False))})")
 
     active_loss_terms = list(
         dict.fromkeys(
@@ -1045,6 +1106,10 @@ def main() -> None:
         # a resume reproduces it exactly rather than restarting the loaders
         # from epoch 1 (R2-12).
         reseed_loaders_for_epoch(loaders, cfg.seed, epoch)
+        for v in loaders.values():
+            ds = getattr(v.get("train"), "dataset", None)
+            if hasattr(ds, "set_epoch"):
+                ds.set_epoch(epoch)
         cycles = {t: endless(v["train"]) for t, v in loaders.items()}
         running: dict[str, float] = {}
 
@@ -1059,7 +1124,7 @@ def main() -> None:
             with torch.amp.autocast("cuda", enabled=use_amp):
                 batch = move_batch(next(cycles[task]), device)
                 losses.update(task_losses(model, task, batch, class_weights,
-                                          three_state_sigma))
+                                          three_state_sigma, nll_beta=nll_beta))
                 total, parts = criterion(losses)
             scaler.scale(total).backward()
             scaler.unscale_(opt)

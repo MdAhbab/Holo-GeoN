@@ -68,6 +68,37 @@ def gaussian_nll(
     return per_item.mean() if reduction == "mean" else per_item.sum()
 
 
+def beta_gaussian_nll(
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+    target: torch.Tensor,
+    beta: float = 0.5,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """
+    Beta-NLL (Seitzer et al., ICLR 2022): weights each item's heteroscedastic
+    Gaussian NLL by ``stop_gradient(sigma^(2 * beta))`` so predicted variance
+    collapse cannot amplify mean-channel memorisation gradients by ``1/sigma^2``
+    (OVERFITTING_FIX.md §2c measured a 6.5x amplification under standard NLL).
+
+    * ``beta == 0.0`` reproduces :func:`gaussian_nll` identically.
+    * ``beta == 0.5`` (recommended) scales mean gradients as ``(mu - y) / sigma``
+      while preserving exact NLL training of the variance head.
+    * ``beta == 1.0`` recovers pure MSE gradients for the mean.
+    """
+    if beta <= 0.0:
+        return gaussian_nll(mu, logvar, target, reduction=reduction)
+    mu = mu.reshape(-1)
+    logvar = logvar.reshape(-1).clamp(min=-10.0, max=10.0)
+    target = target.reshape(-1)
+    nll = 0.5 * (math.log(2 * math.pi) + logvar + (target - mu) ** 2 * torch.exp(-logvar))
+    weight = torch.exp(beta * logvar.detach())
+    per_item = weight * nll
+    if reduction == "none":
+        return per_item
+    return per_item.mean() if reduction == "mean" else per_item.sum()
+
+
 def sigma_gaussian_nll(
     mu: torch.Tensor, sigma: torch.Tensor, target: torch.Tensor
 ) -> torch.Tensor:
@@ -263,6 +294,7 @@ __all__ = [
     "GLOBAL_LOSS_FLOOR",
     "LOSS_FLOORS",
     "gaussian_nll",
+    "beta_gaussian_nll",
     "sigma_gaussian_nll",
     "antisymmetry_violation",
     "UncertaintyWeightedLoss",

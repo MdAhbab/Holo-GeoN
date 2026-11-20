@@ -19,10 +19,14 @@ than a difference of two whole-protein embeddings.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from src.substitution import AminoAcidEmbedding
+from src.graphs import N_PAIR_GEO
+from src.substitution import AA_BIOPHYS, N_AA_BIOPHYS, N_AMINO_ACIDS, AminoAcidEmbedding
 
 
 def _mlp(in_dim: int, hidden: int, out_dim: int, dropout: float = 0.1) -> nn.Sequential:
@@ -118,23 +122,6 @@ class SubstitutionScoreHead(nn.Module):
         return ddg, logvar.clamp(LOGVAR_MIN, LOGVAR_MAX)
 
     def scan(self, z: torch.Tensor, wt_idx: torch.Tensor, n_aa: int = 20) -> torch.Tensor:
-        """
-        ddG for every substitution at a site, in one shot.
-
-        Args:
-            z      : (B, ctx_dim) contexts.
-            wt_idx : (B,) wild-type residue indices.
-            n_aa   : candidate columns. Pass ``N_AMINO_ACIDS + 1`` to include
-                     the unknown-residue slot, which is what makes the
-                     wild-type column zero for a non-standard parent residue -
-                     with 20 columns and a parent mapped to the unknown index,
-                     no column was zero despite the guarantee below
-                     (round-1 review, R1-24).
-        Returns:
-            (B, n_aa) ddG against each candidate residue; the wild-type column
-            is exactly 0 because the head is a difference of scores, provided
-            the wild-type index is within ``n_aa``.
-        """
         b = z.size(0)
         all_aa = torch.arange(n_aa, device=z.device).unsqueeze(0).expand(b, -1)
         z_rep = z.unsqueeze(1).expand(-1, n_aa, -1)
@@ -142,6 +129,202 @@ class SubstitutionScoreHead(nn.Module):
         mu_all = mu_all.view(b, n_aa)
         mu_wt, _ = self.score(z, wt_idx)
         return mu_all - mu_wt
+
+
+# ---------------------------------------------------------------------------
+# Evolutionary-anchored antisymmetric ddG head (Holo-GeoN v2)
+# ---------------------------------------------------------------------------
+class EvolutionarySubstitutionHead(nn.Module):
+    """
+    Antisymmetric-by-construction ddG head anchored on ESM-2's wild-type
+    marginal log-odds and explicit amino-acid biophysics:
+
+        ddG(wt -> mt) = alpha(z) * (lp[mt] - lp[wt])
+                        + [ s_theta(z, e_mt, phi_mt) - s_theta(z, e_wt, phi_wt) ]
+
+    Both terms are strictly odd under ``wt <-> mt``, so exact reversibility
+    ``ddG(b->a) == -ddG(a->b)`` holds to floating-point precision in both train
+    and eval modes, and single-pass 20 x L deep mutational scanning is exact.
+
+    When ``wt_logprobs`` is absent (legacy cache) or ``use_esm_logits_prior=False``
+    (ablation arm), the first term is cleanly zeroed.
+    """
+
+    def __init__(
+        self,
+        ctx_dim: int,
+        aa_dim: int = 32,
+        hidden: int = 256,
+        dropout: float = 0.1,
+        aa_embedding: AminoAcidEmbedding | None = None,
+        use_esm_logits_prior: bool = True,
+    ):
+        super().__init__()
+        self.aa = aa_embedding or AminoAcidEmbedding(aa_dim)
+        self.use_esm_logits_prior = bool(use_esm_logits_prior)
+        self.register_buffer("aa_biophys", AA_BIOPHYS.clone(), persistent=False)
+        # Deterministic on purpose (_DETERMINISTIC = 0.0) so antisymmetry holds in train() too.
+        self.net = _mlp(ctx_dim + self.aa.dim + N_AA_BIOPHYS, hidden, 2, _DETERMINISTIC)
+        # Context-dependent positive scaling for evolutionary log-odds prior.
+        # Bias -0.5 -> softplus(-0.5) ~ 0.47 kcal/mol per nat at initialization.
+        self.alpha_proj = nn.Linear(ctx_dim, 1)
+        nn.init.zeros_(self.alpha_proj.weight)
+        nn.init.constant_(self.alpha_proj.bias, -0.5)
+
+    def _aa_features(self, aa_idx: torch.Tensor) -> torch.Tensor:
+        idx = aa_idx.clamp(0, N_AMINO_ACIDS)
+        emb = self.aa(idx)
+        bio = self.aa_biophys[idx].to(dtype=emb.dtype)
+        return torch.cat([emb, bio], dim=-1)
+
+    def score(self, z: torch.Tensor, aa_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        out = self.net(torch.cat([z, self._aa_features(aa_idx)], dim=-1))
+        return out[..., :1], out[..., 1:2].clamp(LOGVAR_MIN, LOGVAR_MAX)
+
+    def _prior_term(
+        self,
+        z: torch.Tensor,
+        wt_idx: torch.Tensor,
+        mt_idx: torch.Tensor,
+        wt_logprobs: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if not self.use_esm_logits_prior or wt_logprobs is None:
+            return torch.zeros((z.size(0), 1), dtype=z.dtype, device=z.device)
+        # Pad an extra 0 column for the unknown-AA slot (index 20)
+        lp = wt_logprobs.to(dtype=z.dtype, device=z.device)
+        if lp.size(-1) == N_AMINO_ACIDS:
+            lp = F.pad(lp, (0, 1), value=0.0)
+        b = torch.arange(z.size(0), device=z.device)
+        wt_c = wt_idx.clamp(0, N_AMINO_ACIDS)
+        mt_c = mt_idx.clamp(0, N_AMINO_ACIDS)
+        # If either residue is unknown (20), do not inject spurious log-odds
+        known = (wt_c < N_AMINO_ACIDS) & (mt_c < N_AMINO_ACIDS)
+        delta_ll = (lp[b, mt_c] - lp[b, wt_c]).masked_fill(~known, 0.0).unsqueeze(-1)
+        alpha = F.softplus(self.alpha_proj(z))
+        return alpha * delta_ll
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        wt_idx: torch.Tensor,
+        mt_idx: torch.Tensor,
+        wt_logprobs: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        mu_wt, lv_wt = self.score(z, wt_idx)
+        mu_mt, lv_mt = self.score(z, mt_idx)
+        ddg = (mu_mt - mu_wt) + self._prior_term(z, wt_idx, mt_idx, wt_logprobs)
+        logvar = torch.logaddexp(lv_wt.float(), lv_mt.float()).to(ddg.dtype)
+        return ddg, logvar.clamp(LOGVAR_MIN, LOGVAR_MAX)
+
+    def scan(
+        self,
+        z: torch.Tensor,
+        wt_idx: torch.Tensor,
+        n_aa: int = 20,
+        wt_logprobs: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        b = z.size(0)
+        all_aa = torch.arange(n_aa, device=z.device).unsqueeze(0).expand(b, -1)
+        z_rep = z.unsqueeze(1).expand(-1, n_aa, -1)
+        mu_all, _ = self.score(z_rep.reshape(b * n_aa, -1), all_aa.reshape(-1))
+        mu_all = mu_all.view(b, n_aa)
+        mu_wt, _ = self.score(z, wt_idx)
+        ddg = mu_all - mu_wt
+
+        if self.use_esm_logits_prior and wt_logprobs is not None:
+            lp = wt_logprobs.to(dtype=z.dtype, device=z.device)
+            if lp.size(-1) < n_aa:
+                lp = F.pad(lp, (0, n_aa - lp.size(-1)), value=0.0)
+            lp = lp[:, :n_aa]
+            rows = torch.arange(b, device=z.device)
+            wt_c = wt_idx.clamp(0, n_aa - 1)
+            wt_lp = lp[rows, wt_c].unsqueeze(-1)              # (B, 1)
+            delta_ll = lp - wt_lp                             # (B, n_aa)
+            # Zero out unknown slots (>19) and any row whose WT is unknown
+            known_mt = (torch.arange(n_aa, device=z.device) < N_AMINO_ACIDS).unsqueeze(0)
+            known_wt = (wt_idx < N_AMINO_ACIDS).unsqueeze(-1)
+            delta_ll = delta_ll.masked_fill(~(known_mt & known_wt), 0.0)
+            alpha = F.softplus(self.alpha_proj(z))            # (B, 1)
+            ddg = ddg + alpha * delta_ll
+        return ddg
+
+
+# ---------------------------------------------------------------------------
+# Contact-Gated Potts Bilinear Epistasis Head (Double Mutants — Holo-GeoN v2)
+# ---------------------------------------------------------------------------
+class ContactGatedEpistasisHead(nn.Module):
+    """
+    Physically grounded double-mutant epistasis head gated by predicted contact
+    topology ``pair_geo`` from ``E_geo``:
+
+        u_i(a) = U_theta(z_i, e_a, phi_a)               in R^D_p
+        du_i   = u_i(mt_i) - u_i(wt_i)
+        du_j   = u_j(mt_j) - u_j(wt_j)
+        dddG(i, j) = g_theta(pair_geo) * (du_i^T du_j) / sqrt(D_p)
+
+    Mathematical guarantees (verified in ``tests/test_v2.py``):
+      1. **Zero boundary epistasis:** if ``mt_i == wt_i`` or ``mt_j == wt_j``,
+         ``dddG == 0`` identically.
+      2. **Exact site-order symmetry:** swapping ``(i, wt_i, mt_i) <-> (j, wt_j, mt_j)``
+         gives identical ``dddG`` to floating-point precision.
+      3. **Exact Potts cycle parity:** ``dddG`` is the exact second finite
+         difference of the pairwise Potts potential ``g_ij * u_i(a)^T u_j(b)``,
+         so it is EVEN under simultaneous reversal ``(wt_i, wt_j) <-> (mt_i, mt_j)``
+         and ODD under reversing a single site.
+      4. **Contact-gated physics:** ``pair_geo = [p_ij, log_sep, inv_hop, is_contact]``
+         makes ``E_geo`` mechanistically irreplaceable without requiring PDB input.
+    """
+
+    def __init__(
+        self,
+        ctx_dim: int,
+        aa_dim: int = 32,
+        potts_dim: int = 64,
+        pair_geo_dim: int = N_PAIR_GEO,
+        aa_embedding: AminoAcidEmbedding | None = None,
+        use_contact_gate: bool = True,
+    ):
+        super().__init__()
+        self.aa = aa_embedding or AminoAcidEmbedding(aa_dim)
+        self.potts_dim = potts_dim
+        self.use_contact_gate = bool(use_contact_gate)
+        self.register_buffer("aa_biophys", AA_BIOPHYS.clone(), persistent=False)
+        # Deterministic for exact symmetry/parity in both train() and eval().
+        self.potts_net = _mlp(ctx_dim + self.aa.dim + N_AA_BIOPHYS, potts_dim * 2, potts_dim, _DETERMINISTIC)
+        self.gate_net = nn.Sequential(
+            nn.Linear(pair_geo_dim, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+        )
+        # Start near zero epistasis so single-mutant additive signal dominates early.
+        nn.init.zeros_(self.gate_net[-1].weight)
+        nn.init.constant_(self.gate_net[-1].bias, 0.1)
+        self.const_gate = nn.Parameter(torch.tensor(0.1))
+
+    def _u(self, z: torch.Tensor, aa_idx: torch.Tensor) -> torch.Tensor:
+        idx = aa_idx.clamp(0, N_AMINO_ACIDS)
+        emb = self.aa(idx)
+        bio = self.aa_biophys[idx].to(dtype=emb.dtype)
+        return self.potts_net(torch.cat([z, emb, bio], dim=-1))
+
+    def forward(
+        self,
+        z_i: torch.Tensor,
+        z_j: torch.Tensor,
+        wt_i: torch.Tensor,
+        mt_i: torch.Tensor,
+        wt_j: torch.Tensor,
+        mt_j: torch.Tensor,
+        pair_geo: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        du_i = self._u(z_i, mt_i) - self._u(z_i, wt_i)
+        du_j = self._u(z_j, mt_j) - self._u(z_j, wt_j)
+        raw = (du_i * du_j).sum(dim=-1, keepdim=True) / math.sqrt(self.potts_dim)
+        if self.use_contact_gate and pair_geo is not None:
+            gate = self.gate_net(pair_geo.to(dtype=raw.dtype, device=raw.device))
+        else:
+            gate = self.const_gate
+        return gate * raw
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +518,8 @@ class ProteomicsHead(nn.Module):
 
 __all__ = [
     "SubstitutionScoreHead",
+    "EvolutionarySubstitutionHead",
+    "ContactGatedEpistasisHead",
     "ThreeStateHead",
     "PathogenicityHead",
     "IdrEnsembleHead",

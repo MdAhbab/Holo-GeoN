@@ -54,20 +54,52 @@ def _metrics(y: np.ndarray, p: np.ndarray) -> dict:
             "rmse": float(np.sqrt(np.mean((y - p) ** 2)))}
 
 
-def cluster_bootstrap(y, preds: dict, groups, reps: int, seed: int) -> dict:
-    """Resample whole clusters; return per-model and paired-vs-first draws."""
+def _per_protein_medians(y: np.ndarray, p: np.ndarray, proteins: np.ndarray) -> dict:
+    """
+    Per-protein median Pearson and Spearman over proteins with >= 3 mutations.
+
+    Kept strictly separate from pooled metrics (BENCHMARK_PLAN.md §2: SPURS
+    reports per-protein median Spearman 0.83 while ThermoMPNN reports pooled
+    0.725; both columns must be reported side by side for every model).
+    """
+    pears, spears = [], []
+    _, inv = np.unique(proteins, return_inverse=True)
+    for idx in range(int(inv.max()) + 1 if len(inv) else 0):
+        m = inv == idx
+        if int(m.sum()) < 3:
+            continue
+        yi, pi = y[m], p[m]
+        if np.std(yi) == 0 or np.std(pi) == 0:
+            continue
+        pears.append(float(np.corrcoef(yi, pi)[0, 1]))
+        spears.append(float(stats.spearmanr(yi, pi)[0]))
+    return {
+        "per_protein_median_pearson": float(np.median(pears)) if pears else float("nan"),
+        "per_protein_median_spearman": float(np.median(spears)) if spears else float("nan"),
+        "n_proteins_scored": len(spears),
+    }
+
+
+def cluster_bootstrap(y, preds: dict, groups, reps: int, seed: int, proteins=None) -> dict:
+    """Resample whole clusters; return per-model pooled and per-protein draws."""
     rng = np.random.default_rng(seed)
     codes, uniq = pd.factorize(groups)
     idx = [np.flatnonzero(codes == g) for g in range(len(uniq))]
     names = list(preds)
-    draws = {n: {"pearson": [], "spearman": [], "rmse": []} for n in names}
+    draws = {
+        n: {"pearson": [], "spearman": [], "rmse": [], "med_spearman": []}
+        for n in names
+    }
     for _ in range(reps):
         pick = rng.integers(0, len(idx), len(idx))
         rows = np.concatenate([idx[i] for i in pick])
         for n in names:
             m = _metrics(y[rows], preds[n][rows])
-            for k, v in m.items():
-                draws[n][k].append(v)
+            for k in ("pearson", "spearman", "rmse"):
+                draws[n][k].append(m[k])
+            if proteins is not None:
+                pm = _per_protein_medians(y[rows], preds[n][rows], proteins[rows])
+                draws[n]["med_spearman"].append(pm["per_protein_median_spearman"])
     return {n: {k: np.asarray(v) for k, v in d.items()} for n, d in draws.items()}
 
 
@@ -131,15 +163,25 @@ def main() -> None:
             raise SystemExit(f"{n}: Pearson r = {r:+.3f} after applying the declared sign. "
                              f"That is a sign-convention error, not a model result. Re-check ':+1/:-1'.")
 
-    boot = cluster_bootstrap(y, preds, groups, args.reps, args.seed)
+    proteins = sub["parent_seq"].to_numpy()
+    boot = cluster_bootstrap(y, preds, groups, args.reps, args.seed, proteins=proteins)
     first = next(iter(preds))
     out: dict = {"split": args.split, "subset": args.subset, "n_rows": int(len(sub)),
-                 "n_clusters": int(pd.Series(groups).nunique()), "reps": args.reps, "models": {}}
-    print(f"\n{'model':<22}{'Pearson [95% CI]':<30}{'Spearman':<12}{'RMSE':<10}{'dPearson vs ' + first}")
+                 "n_clusters": int(pd.Series(groups).nunique()),
+                 "n_proteins": int(sub["parent_seq"].nunique()),
+                 "reps": args.reps, "models": {}}
+    print(f"\n{'model':<22}{'Pearson [95% CI]':<28}{'PoolRho':<10}{'MedRho':<10}{'RMSE':<9}{'dPearson vs ' + first}")
     for n, p in preds.items():
         m = _metrics(y, p)
+        pm = _per_protein_medians(y, p, proteins)
         lo, hi = _ci(boot[n]["pearson"])
-        entry = {**m, "pearson_ci95": [lo, hi]}
+        slo, shi = _ci(boot[n]["med_spearman"])
+        entry = {
+            **m,
+            **pm,
+            "pearson_ci95": [lo, hi],
+            "per_protein_median_spearman_ci95": [slo, shi],
+        }
         if n != first:
             d = boot[n]["pearson"] - boot[first]["pearson"]
             entry["pearson_delta_vs_first"] = float(m["pearson"] - _metrics(y, preds[first])["pearson"])
@@ -148,8 +190,10 @@ def main() -> None:
         else:
             dtxt = "-"
         out["models"][n] = entry
-        print(f"{n:<22}{m['pearson']:.4f} [{lo:.3f},{hi:.3f}]".ljust(52)
-              + f"{m['spearman']:<12.4f}{m['rmse']:<10.4f}{dtxt}")
+        ci_txt = f"[{lo:.3f},{hi:.3f}]" if lo is not None and hi is not None else "[n/a]"
+        print(f"{n:<22}{m['pearson']:.4f} {ci_txt}".ljust(50)
+              + f"{m['spearman']:<10.4f}{pm['per_protein_median_spearman']:<10.4f}"
+              + f"{m['rmse']:<9.4f}{dtxt}")
     if args.out:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
         with open(args.out, "w", encoding="utf-8") as fh:

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
@@ -61,6 +62,7 @@ class HoloGeoNEngine:
     """
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self._tried = False
         self._ready = False
         self._error: Optional[str] = None
@@ -80,8 +82,19 @@ class HoloGeoNEngine:
     def _load(self) -> None:
         if self._tried:
             return
-        self._tried = True
+        with self._lock:
+            if self._tried:
+                return
+            try:
+                self._load_locked()
+            finally:
+                # Set _tried ONLY after loading completes (or fails), inside the
+                # lock, so concurrent startup requests (e.g. /api/health polling
+                # while torch imports) wait cleanly instead of seeing ready=False
+                # with error=None.
+                self._tried = True
 
+    def _load_locked(self) -> None:
         if not WEIGHTS_PATH.exists():
             self._error = (
                 f"no trained checkpoint at {WEIGHTS_PATH}. Train one with "

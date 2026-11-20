@@ -61,7 +61,20 @@ def run(cmd, cwd=None, env=None, check=True):
     return subprocess.run([str(c) for c in cmd], cwd=cwd, env=env, check=check)
 
 
-def ensure_venv() -> Path:
+def _current_env_ready() -> bool:
+    """True if the active interpreter already has FastAPI, uvicorn, torch and PyG."""
+    for mod in ("fastapi", "uvicorn", "torch", "torch_geometric"):
+        try:
+            __import__(mod)
+        except Exception:
+            return False
+    return True
+
+
+def ensure_venv(use_current: bool = False) -> Path:
+    if use_current or _current_env_ready():
+        print(f"[runapp] using active Python environment: {sys.executable}")
+        return Path(sys.executable)
     if not venv_python().exists():
         print(f"[runapp] creating virtualenv at {VENV}")
         run([sys.executable, "-m", "venv", VENV])
@@ -105,13 +118,16 @@ def wait_for_health(port: int, timeout: float = 120.0) -> dict | None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Launch the Holo-GeoN web interface.")
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--host", default="127.0.0.1", help="bind host (use 0.0.0.0 on remote VMs)")
     ap.add_argument("--weights", default="", help="path to a trained checkpoint")
+    ap.add_argument("--use-current-env", action="store_true",
+                    help="run uvicorn in the current Python environment (recommended on GPU/G4 VMs)")
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--rebuild-frontend", action="store_true")
     ap.add_argument("--dev", action="store_true", help="also run the Vite dev server")
     args = ap.parse_args()
 
-    py = ensure_venv()
+    py = ensure_venv(use_current=args.use_current_env)
     build_frontend(args.rebuild_frontend)
 
     env = dict(os.environ)
@@ -126,7 +142,7 @@ def main() -> int:
               "approximate results. Train one with `python run.py train`.\n")
 
     server = subprocess.Popen(
-        [str(py), "-m", "uvicorn", "app:app", "--host", "127.0.0.1",
+        [str(py), "-m", "uvicorn", "app:app", "--host", args.host,
          "--port", str(args.port)],
         cwd=BACKEND, env=env,
     )

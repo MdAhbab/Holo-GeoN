@@ -42,11 +42,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from collections import OrderedDict
 
 import torch
 import torch.nn as nn
+
+from src.substitution import AA_ORDER
 
 # Hidden size per ESM-2 checkpoint, so projections can be sized without a
 # forward pass.
@@ -58,10 +61,41 @@ ESM_DIMS: dict[str, int] = {
     "facebook/esm2_t36_3B_UR50D": 2560,
 }
 DEFAULT_ESM = "facebook/esm2_t33_650M_UR50D"
+N_TAP_LAYERS = 4
 
 # ESM-2 positional limit is 1024 tokens including CLS/EOS.
 MAX_CONTEXT_RESIDUES = 1022
 CHUNK_OVERLAP = 256
+
+
+def tap_layer_indices(num_layers: int) -> tuple[int, ...]:
+    """
+    Choose 4 hidden-state indices spanning middle-late to final layers for any
+    ESM-2 depth (e.g. ``(18, 24, 30, 33)`` for 33-layer 650M, ``(3, 4, 5, 6)``
+    for 6-layer 8M). Middle-late PLM layers retain stronger solvent-accessibility
+    and secondary-structure geometry than the final token-prediction layer alone.
+    """
+    if num_layers <= 0:
+        return (0,)
+    if num_layers == 33:
+        return (18, 24, 30, 33)
+    if num_layers == 30:
+        return (16, 21, 26, 30)
+    if num_layers <= N_TAP_LAYERS:
+        return tuple(range(1, num_layers + 1))
+    raw = [max(1, min(num_layers, round(num_layers * f))) for f in (0.55, 0.73, 0.91, 1.0)]
+    # Ensure 4 strictly increasing indices ending at num_layers.
+    uniq: list[int] = []
+    for x in raw:
+        if x not in uniq:
+            uniq.append(x)
+    while len(uniq) < N_TAP_LAYERS:
+        cand = max(1, uniq[0] - 1)
+        while cand in uniq and cand < num_layers:
+            cand += 1
+        uniq.append(cand)
+        uniq.sort()
+    return tuple(sorted(uniq[-N_TAP_LAYERS:]))
 
 
 def seq_key(seq: str) -> str:
@@ -170,24 +204,34 @@ class EsmEncoder(nn.Module):
 
     def __init__(self, esm_model_name: str = DEFAULT_ESM, device: str = "cpu"):
         super().__init__()
-        from transformers import AutoTokenizer, EsmModel
+        from transformers import AutoTokenizer, EsmForMaskedLM
 
         self.name = esm_model_name
         self.dim = ESM_DIMS.get(esm_model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(esm_model_name)
-        # Eager attention is required: predict_contacts() consumes real attention
-        # maps, which the default sdpa implementation in transformers >= 5 does
-        # not emit.
-        self.esm = EsmModel.from_pretrained(
-            esm_model_name, add_pooling_layer=False, attn_implementation="eager"
+        # Single EsmForMaskedLM gives hidden states, LM logits AND contact_head
+        # in ONE forward pass (previously EsmModel + predict_contacts ran the
+        # entire 33-layer 650M transformer twice per protein). Eager attention
+        # is required so output_attentions=True emits attention maps for
+        # contact_head across transformers 4.x and 5.x.
+        self.model = EsmForMaskedLM.from_pretrained(
+            esm_model_name, attn_implementation="eager"
         )
-        self.esm.eval()
-        for p in self.esm.parameters():
+        self.esm = self.model.esm
+        self._mlm = self.model
+        self.model.eval()
+        for p in self.model.parameters():
             p.requires_grad = False
         self.device = torch.device(device)
         self.to(self.device)
         if self.dim is None:
             self.dim = int(self.esm.config.hidden_size)
+        self.tap_layers = tap_layer_indices(int(self.esm.config.num_hidden_layers))
+        self._aa_token_ids = torch.tensor(
+            [self.tokenizer.convert_tokens_to_ids(aa) for aa in AA_ORDER],
+            dtype=torch.long,
+            device=self.device,
+        )
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -207,31 +251,57 @@ class EsmEncoder(nn.Module):
         return spans
 
     @torch.no_grad()
-    def _forward_chunk(self, seq: str) -> tuple[torch.Tensor, torch.Tensor]:
+    def _forward_chunk(
+        self, seq: str
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Single-pass ESM-2 chunk forward returning:
+          ``(emb (L,d), layer_embs (K,L,d), wt_logprobs (L,20), site_entropy (L,), cm (L,L))``
+        """
         toks = self.tokenizer(seq, return_tensors="pt", add_special_tokens=True)
         toks = {k: v.to(self.device) for k, v in toks.items()}
-        out = self.esm(**toks)
-        emb = out.last_hidden_state[0, 1:-1]                      # strip CLS/EOS
-        cm = self.esm.predict_contacts(toks["input_ids"], toks["attention_mask"])[0]
-        return emb.float().cpu(), cm.float().cpu()
+        out = self.model(
+            **toks,
+            return_dict=True,
+            output_attentions=True,
+            output_hidden_states=True,
+        )
+        emb = out.hidden_states[-1][0, 1:-1]
+        layer_embs = torch.stack(
+            [out.hidden_states[i][0, 1:-1] for i in self.tap_layers], dim=0
+        )
+
+        # Wild-type marginal log-probabilities over the 20 standard amino acids
+        # plus normalized site Shannon entropy H_i / log(20) in [0, 1].
+        logits_aa = out.logits[0, 1:-1].index_select(-1, self._aa_token_ids).float()
+        wt_logprobs = torch.log_softmax(logits_aa, dim=-1)
+        probs = wt_logprobs.exp()
+        site_entropy = -(probs * wt_logprobs).sum(dim=-1) / math.log(len(AA_ORDER))
+
+        # Exact EsmModel.predict_contacts math from the ALREADY computed attentions.
+        attns = torch.stack(out.attentions, dim=1)
+        amask = toks["attention_mask"]
+        attns = attns * amask.unsqueeze(1).unsqueeze(2).unsqueeze(3)
+        attns = attns * amask.unsqueeze(1).unsqueeze(2).unsqueeze(4)
+        cm = self.esm.contact_head(toks["input_ids"], attns)[0]
+
+        return (
+            emb.float().cpu(),
+            layer_embs.float().cpu(),
+            wt_logprobs.float().cpu(),
+            site_entropy.float().cpu(),
+            cm.float().cpu(),
+        )
 
     @torch.no_grad()
     def encode(self, seq: str, top_k: int = 24, min_sep: int = 3) -> dict:
         """
-        Encode one protein.
+        Encode one protein in a single ESM-2 pass per chunk.
 
-        Returns ``{"seq", "emb" (L, d) fp16, "contact_edges" (2, E) int32,
-        "contact_probs" (E,) fp16, "esm_model", "dim"}``.
-
-        For proteins longer than the encoder's context the sequence is split
-        into overlapping chunks. Each residue's embedding is taken from the
-        chunk that retains the largest fraction of its real surrounding context
-        (:func:`chunk_context_score`), so a residue is never moved to a chunk
-        that knows less about it. Contacts are extracted per chunk,
-        which means **contacts spanning more than one chunk are not recovered**
-        — a real limitation for proteins beyond ~1 kresidue, and the reason
-        window selection happens around the mutation rather than at the N
-        terminus.
+        Returns ``{"seq", "emb" (L, d) fp16, "layer_embs" (K, L, d) fp16,
+        "wt_logprobs" (L, 20) fp16, "site_entropy" (L,) fp16,
+        "contact_edges" (2, E) int32, "contact_probs" (E,) fp16,
+        "esm_model", "dim", "tap_layers"}``.
         """
         L = len(seq)
         if L == 0:
@@ -239,32 +309,24 @@ class EsmEncoder(nn.Module):
 
         spans = self._chunk_spans(L)
         if len(spans) == 1:
-            emb, cm = self._forward_chunk(seq)
+            emb, layer_embs, wt_logprobs, site_entropy, cm = self._forward_chunk(seq)
             edges, probs = sparse_topk_contacts(cm, top_k, min_sep)
         else:
+            k_layers = len(self.tap_layers)
             emb = torch.zeros((L, self.dim), dtype=torch.float32)
-            # Selection score per residue: the FRACTION of its real context that
-            # this chunk preserves, taking the worse of the two sides. See
-            # :func:`chunk_context_score`.
-            #
-            # Round-2 review, R2 (R1-26 re-opened): the round-1 fix added
-            # ``clamp(margin, max=n/2)`` to a boundary-distance score. That clamp
-            # is a provable no-op - the largest attainable margin in a chunk of
-            # n residues is (n-1)/2, which is already below the bound - so
-            # selection was unchanged and 128 residues per boundary still took
-            # their embedding from a strictly shorter chunk. The reviewer's
-            # example: at L=1023 residue 894 scored 128 in the 257-residue tail
-            # chunk against 127 in the 1022-residue chunk, and won on the tail.
-            # Boundary distance is the wrong quantity: it treats the 894
-            # residues of left context the tail chunk THROWS AWAY as free.
-            # Scoring retained context instead makes that trade explicit.
+            layer_embs = torch.zeros((k_layers, L, self.dim), dtype=torch.float32)
+            wt_logprobs = torch.zeros((L, len(AA_ORDER)), dtype=torch.float32)
+            site_entropy = torch.zeros((L,), dtype=torch.float32)
             best_score = torch.full((L,), -1.0)
             all_edges, all_probs = [], []
             for start, end in spans:
-                c_emb, c_cm = self._forward_chunk(seq[start:end])
+                c_emb, c_layers, c_lp, c_ent, c_cm = self._forward_chunk(seq[start:end])
                 score = chunk_context_score(L, start, end)
                 take = score > best_score[start:end]
                 emb[start:end][take] = c_emb[take]
+                layer_embs[:, start:end][:, take] = c_layers[:, take]
+                wt_logprobs[start:end][take] = c_lp[take]
+                site_entropy[start:end][take] = c_ent[take]
                 best_score[start:end][take] = score[take]
 
                 e, p = sparse_topk_contacts(c_cm, top_k, min_sep, offset=start)
@@ -274,7 +336,6 @@ class EsmEncoder(nn.Module):
             if all_edges:
                 edges = torch.cat(all_edges, dim=1)
                 probs = torch.cat(all_probs)
-                # Overlapping chunks can propose the same pair twice.
                 flat = edges[0].to(torch.int64) * L + edges[1].to(torch.int64)
                 uniq, inverse = torch.unique(flat, return_inverse=True)
                 best = torch.zeros(uniq.numel(), dtype=probs.dtype)
@@ -290,10 +351,14 @@ class EsmEncoder(nn.Module):
         return {
             "seq": seq,
             "emb": emb.half(),
+            "layer_embs": layer_embs.half(),
+            "wt_logprobs": wt_logprobs.half(),
+            "site_entropy": site_entropy.half(),
             "contact_edges": edges.to(torch.int32),
             "contact_probs": probs.half(),
             "esm_model": self.name,
             "dim": int(self.dim),
+            "tap_layers": list(self.tap_layers),
         }
 
     # ------------------------------------------------------------------
@@ -301,16 +366,9 @@ class EsmEncoder(nn.Module):
     def masked_marginals(self, seq: str, positions: list[int]) -> dict[int, torch.Tensor]:
         """
         Log-softmax over the amino-acid vocabulary at each requested position,
-        with that position masked. Used by the zero-shot baseline; not part of
-        the model's own forward path.
+        with that position masked. Reuses ``self.model`` rather than loading a
+        second copy of ESM-2.
         """
-        from transformers import EsmForMaskedLM
-
-        if not hasattr(self, "_mlm"):
-            self._mlm = EsmForMaskedLM.from_pretrained(
-                self.name, attn_implementation="eager"
-            ).eval().to(self.device)
-
         out: dict[int, torch.Tensor] = {}
         mask_id = self.tokenizer.mask_token_id
         for pos in positions:
@@ -524,20 +582,81 @@ class EncodingStore:
             "cds_coverage_sample_limit": sample if sampled else None,
         }
 
+    def coord_coverage(self, seqs, sample: int | None = None) -> dict:
+        """
+        Measure 3D coordinate coverage on the cached records themselves
+        (GEOMETRIC_PLAN.md §2.4, mirroring :meth:`mech_coverage`).
+        """
+        seqs = list(seqs)
+        sampled = sample is not None and 0 < sample < len(seqs)
+        if sampled:
+            step = max(1, len(seqs) // sample)
+            seqs = seqs[::step][:sample]
+        present = active = 0
+        for seq in seqs:
+            if not self.has(seq):
+                continue
+            present += 1
+            try:
+                rec = self.get(seq)
+            except Exception:
+                continue
+            cv = rec.get("coord_valid")
+            if rec.get("coords") is not None and cv is not None and float(cv.max()) > 0:
+                active += 1
+        return {
+            "parents_examined": len(seqs),
+            "parents_present_in_cache": present,
+            "coords_active": active,
+            "coord_coverage": round(active / present, 4) if present else 0.0,
+            "coord_coverage_is_a_sample": bool(sampled),
+        }
+
+    def v2_coverage(self, seqs, sample: int | None = None) -> dict:
+        """Measure presence of v2 single-pass features (``layer_embs``, ``wt_logprobs``)."""
+        seqs = list(seqs)
+        sampled = sample is not None and 0 < sample < len(seqs)
+        if sampled:
+            step = max(1, len(seqs) // sample)
+            seqs = seqs[::step][:sample]
+        present = has_layers = has_logprobs = 0
+        for seq in seqs:
+            if not self.has(seq):
+                continue
+            present += 1
+            try:
+                rec = self.get(seq)
+            except Exception:
+                continue
+            if rec.get("layer_embs") is not None:
+                has_layers += 1
+            if rec.get("wt_logprobs") is not None:
+                has_logprobs += 1
+        return {
+            "parents_present_in_cache": present,
+            "layer_embs_coverage": round(has_layers / present, 4) if present else 0.0,
+            "wt_logprobs_coverage": round(has_logprobs / present, 4) if present else 0.0,
+        }
+
     @staticmethod
-    def projected_bytes(total_residues: int, dim: int, top_k: int) -> int:
+    def projected_bytes(total_residues: int, dim: int, top_k: int, include_v2: bool = False) -> int:
         """
         Disk footprint for a planned cache.
 
         Embeddings dominate: ``residues x dim x 2`` bytes at fp16. Edges add
         ``residues x top_k x (8 + 2)`` for the int32 pair plus the fp16
-        probability.
+        probability. With ``include_v2=True``, adds 4 tapped layers plus the
+        20-AA WT log-probabilities and site entropy.
         """
-        return total_residues * (dim * 2 + top_k * 10)
+        base = total_residues * (dim * 2 + top_k * 10)
+        if include_v2:
+            base += total_residues * (N_TAP_LAYERS * dim * 2 + 21 * 2)
+        return base
 
 
 __all__ = [
-    "ESM_DIMS", "DEFAULT_ESM", "MAX_CONTEXT_RESIDUES",
+    "ESM_DIMS", "DEFAULT_ESM", "MAX_CONTEXT_RESIDUES", "N_TAP_LAYERS",
+    "tap_layer_indices",
     "EsmEncoder", "EncodingStore", "seq_key", "sparse_topk_contacts",
     "chunk_context_score",
 ]

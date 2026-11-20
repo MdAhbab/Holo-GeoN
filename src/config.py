@@ -78,14 +78,25 @@ DEFAULTS: dict[str, Any] = {
     "neighborhood_hops": 2,  # k-hop site neighbourhood for the readout
 
     # --- model ---
+    "arch": "v1",              # "v1" (legacy 20.6M) | "v2" (Holo-GeoN v2 ~2.5M)
     "hidden": 256,
     "out_dim": 256,
     "gat_heads": 4,
     "aa_dim": 32,
     "dropout": 0.1,
+    "feat_dropout": 0.25,      # v2 bottleneck feature dropout
+    "drop_edge": 0.20,         # v2 DropEdge rate on GATv2 streams during training
     "use_ssm": True,
     "use_mech_stream": True,   # ablation axis; the shipped model is dual-stream
     "use_geo_stream": True,    # ablation axis
+    "use_str_stream": False,   # GEOMETRIC_PLAN Arms B/C/D: invariant 3D coord stream
+    "str_topology_only": False,  # GEOMETRIC_PLAN Arm D: 3-ch coord k-NN topology only
+    "true_contact_edges": False, # GEOMETRIC_PLAN Arm E: real C-beta contact edges
+    "true_contacts_dir": None,   # directory of <sha1>.npy C-beta contact maps for Arm E
+    "use_multi_layer": True,     # v2 multi-layer ESM-2 scalar-mix
+    "use_contact_burial": True,  # v2 contact-topology burial/packing channels
+    "use_esm_logits_prior": True, # v2 evolutionary WT-marginal log-odds anchor
+    "use_contact_gate": True,    # v2 contact-gated epistasis head
     "site_anchored_readout": True,  # ablation axis; False is the v1 formulation
 
     # --- training ---
@@ -99,6 +110,11 @@ DEFAULTS: dict[str, Any] = {
     "amp": True,
     "num_workers": 4,
     "max_rows": None,
+    "nll_beta": 0.0,           # beta-NLL exponent (0.0 = standard NLL; 0.5 = v2 default)
+    "cds_dropout": 0.0,        # training-only CDS/E_mech modality dropout (0.5 in v2)
+    "protein_batch": False,    # Protein-Batch multi-mutation training (15-40x speedup)
+    "proteins_per_batch": 8,   # unique parents per step when protein_batch=True
+    "muts_per_protein": 64,    # mutations sampled per parent per step when protein_batch=True
     # Task sampling exponent: 1 is strictly proportional to loader size, 0.5 a
     # square-root schedule, 0 the old equal-steps-per-task behaviour.
     "task_sampling_temperature": 0.5,
