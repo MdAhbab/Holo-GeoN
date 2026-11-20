@@ -43,7 +43,15 @@ from scripts.competitors.common import (
     write_predictions,
 )
 from src.encoder import EncodingStore
-from src.geometry import NAME_RE, STR_NODE_DIM, align_to_sequence, node_geometry, parse_pdb_backbone
+from src.geometry import (
+    NAME_RE,
+    STR_NODE_DIM,
+    align_to_sequence,
+    node_geometry,
+    normalize_pdb_stem,
+    parse_pdb_backbone,
+    resolve_pdb_path,
+)
 from src.substitution import AA_ORDER, aa_index
 
 SPURS_URL = "https://github.com/luo-group/SPURS.git"
@@ -84,23 +92,14 @@ class SpursFusionHead(nn.Module):
 def _resolve_pdb_map(pdb_dir: str | None) -> dict[str, Path]:
     if not pdb_dir or not os.path.isdir(pdb_dir):
         return {}
-    return {p.stem.upper(): p for p in Path(pdb_dir).rglob("*.pdb")}
+    return {normalize_pdb_stem(p.name): p for p in Path(pdb_dir).rglob("*.pdb")}
 
 
 def _match_pdb(parent: str, pdb_map: dict[str, Path]) -> Path | None:
     if not pdb_map:
         return None
-    m = NAME_RE.match(str(parent))
-    if m and m.group("base").upper() in pdb_map:
-        return pdb_map[m.group("base").upper()]
-    key = str(parent).upper()
-    for cand in (key, f"AF-{key}"):
-        if cand in pdb_map:
-            return pdb_map[cand]
-    for stem, p in pdb_map.items():
-        if stem.startswith(f"AF-{key}-"):
-            return p
-    return None
+    hit = resolve_pdb_path(str(parent), pdb_map)
+    return Path(hit) if hit is not None else None
 
 
 def _build_local_fusion_arrays(df: pd.DataFrame, store: EncodingStore,

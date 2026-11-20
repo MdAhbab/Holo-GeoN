@@ -59,7 +59,9 @@ from src.geometry import (
     THREE_TO_ONE,
     align_to_sequence,
     contact_map,
+    normalize_pdb_stem,
     parse_pdb_cb,
+    resolve_pdb_path,
 )
 
 DEFAULT_PDB_DIR = os.path.join("dataset", "mega_scale_cdna", "AlphaFold_model_PDBs")
@@ -79,7 +81,7 @@ def main() -> None:
     constructs = df.drop_duplicates("parent")[["parent", "wt_seq"]]
     print(f"[contacts] {len(constructs)} constructs in {args.table}")
 
-    available = {f[:-4].upper(): f for f in os.listdir(args.pdb_dir)
+    available = {normalize_pdb_stem(f): f for f in os.listdir(args.pdb_dir)
                  if f.lower().endswith(".pdb")}
     print(f"[contacts] {len(available)} PDB models in {args.pdb_dir}")
 
@@ -91,13 +93,13 @@ def main() -> None:
         stats[reason] = stats.get(reason, 0) + 1
 
     for row in constructs.itertuples(index=False):
-        m = NAME_RE.match(str(row.parent))
+        parent = str(row.parent)
+        m = NAME_RE.match(parent)
         if not m:
             note("unparseable_construct_name")
             continue
-        fname = available.get(m.group("base").upper())
+        fname = resolve_pdb_path(parent, available)
         if fname is None:
-            # Designed proteins ("EA|run2_...") have no deposited structure.
             note("no_pdb_for_construct")
             continue
 

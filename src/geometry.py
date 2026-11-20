@@ -23,6 +23,7 @@ magnitude overhead of tensor-product equivariant layers.
 from __future__ import annotations
 
 import math
+from pathlib import Path
 import re
 
 import numpy as np
@@ -39,6 +40,85 @@ THREE_TO_ONE: dict[str, str] = {
 NAME_RE = re.compile(
     r"^(?P<base>[^.]+)\.pdb(?:_(?P<mut>[A-Z]\d+[A-Z]|pross\d+))?$"
 )
+
+
+def normalize_pdb_stem(name: str) -> str:
+    """
+    Canonicalize a PDB filename or construct stem for cross-platform lookup.
+
+    Strips a trailing ``.pdb`` (case-insensitively) if present, uppercases, and
+    normalizes ``|`` (MegaScale ``WT_name`` convention, e.g.
+    ``EA|run2_0325_0005.pdb``) and ``:`` (Zenodo 7844779 zip member naming,
+    e.g. ``EA:run2_0325_0005.pdb``, which Windows extracts as
+    ``EA_run2_0325_0005.pdb``) to ``_``.
+    """
+    s = str(name).strip()
+    if s.lower().endswith(".pdb"):
+        s = s[:-4]
+    return s.upper().replace("|", "_").replace(":", "_")
+
+
+def resolve_pdb_path(
+    parent: str,
+    available: dict[str, Path | str],
+) -> Path | str | None:
+    """
+    Resolve a MegaScale construct name (e.g. ``1A0N.pdb``, ``1A0N.pdb_L7S``,
+    ``EA|run2_0325_0005.pdb``) or UniProt accession (``P12345``,
+    ``AF-P12345-F1-model_v4.pdb``) against a mapping of available PDB stems.
+
+    Checks exact ``NAME_RE`` base, normalized base (via :func:`normalize_pdb_stem`),
+    and direct / AlphaFold DB ``AF-<KEY>`` / ``AF-<KEY>-*`` lookups while
+    normalizing keys in ``available`` so ``|``, ``:``, and ``_`` variants match
+    identically on Windows and Linux.
+    """
+    if not available or not parent:
+        return None
+    parent_s = str(parent).strip()
+    if not parent_s:
+        return None
+
+    m = NAME_RE.match(parent_s)
+    base_str = m.group("base") if m else parent_s
+    raw_base = base_str.upper()
+    norm_base = normalize_pdb_stem(base_str)
+
+    if m:
+        hit = available.get(raw_base)
+        if hit is not None:
+            return hit
+        hit = available.get(norm_base)
+        if hit is not None:
+            return hit
+
+    norm_available: dict[str, Path | str] = {}
+    for k, v in available.items():
+        nk = normalize_pdb_stem(k)
+        if nk not in norm_available:
+            norm_available[nk] = v
+
+    if m and norm_base in norm_available:
+        return norm_available[norm_base]
+
+    keys: list[str] = []
+    for k in (raw_base, norm_base, parent_s.upper(), normalize_pdb_stem(parent_s)):
+        if k and k not in keys:
+            keys.append(k)
+
+    for key in keys:
+        for cand in (key, f"AF-{key}"):
+            if cand in available:
+                return available[cand]
+            norm_cand = normalize_pdb_stem(cand)
+            if norm_cand in norm_available:
+                return norm_available[norm_cand]
+
+    for key in keys:
+        prefix = f"AF-{key}-"
+        for stem, val in available.items():
+            if stem.upper().startswith(prefix) or normalize_pdb_stem(stem).startswith(prefix):
+                return val
+    return None
 
 MAX_MISMATCH_FRACTION = 0.15
 
@@ -495,6 +575,8 @@ def node_geometry(
 __all__ = [
     "THREE_TO_ONE",
     "NAME_RE",
+    "normalize_pdb_stem",
+    "resolve_pdb_path",
     "MAX_MISMATCH_FRACTION",
     "ATOM_N", "ATOM_CA", "ATOM_C", "ATOM_CB",
     "N_RBF_BINS", "STR_GEOM_EDGE_DIM", "STR_NODE_DIM", "PLDDT_VALID_FLOOR",

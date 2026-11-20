@@ -42,7 +42,13 @@ from scripts.competitors.common import (
     load_split_table,
     write_predictions,
 )
-from src.geometry import NAME_RE, align_to_sequence, parse_pdb_cb
+from src.geometry import (
+    NAME_RE,
+    align_to_sequence,
+    normalize_pdb_stem,
+    parse_pdb_cb,
+    resolve_pdb_path,
+)
 from src.substitution import AA_ORDER, aa_index
 
 THERMOMPNN_URL = "https://github.com/Kuhlman-Lab/ThermoMPNN.git"
@@ -50,23 +56,14 @@ THERMOMPNN_URL = "https://github.com/Kuhlman-Lab/ThermoMPNN.git"
 
 def _resolve_pdb_map(pdb_dir: str) -> dict[str, Path]:
     return {
-        p.stem.upper(): p
+        normalize_pdb_stem(p.name): p
         for p in Path(pdb_dir).rglob("*.pdb")
     }
 
 
 def _match_pdb(parent: str, pdb_map: dict[str, Path]) -> Path | None:
-    m = NAME_RE.match(str(parent))
-    if m and m.group("base").upper() in pdb_map:
-        return pdb_map[m.group("base").upper()]
-    key = str(parent).upper()
-    for cand in (key, f"AF-{key}"):
-        if cand in pdb_map:
-            return pdb_map[cand]
-    for stem, p in pdb_map.items():
-        if stem.startswith(f"AF-{key}-"):
-            return p
-    return None
+    hit = resolve_pdb_path(str(parent), pdb_map)
+    return Path(hit) if hit is not None else None
 
 
 def _extract_proteinmpnn_features(repo_dir: Path, pdb_paths: dict[str, tuple[Path, str, int]],

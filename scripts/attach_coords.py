@@ -35,26 +35,16 @@ from src.geometry import (
     NAME_RE,
     PLDDT_VALID_FLOOR,
     align_to_sequence,
+    normalize_pdb_stem,
     parse_pdb_backbone,
+    resolve_pdb_path,
 )
 
 
 def _resolve_pdb(parent: str, available: dict[str, str]) -> str | None:
     """Match a MegaScale construct name or UniProt accession (AF-<ACC>.pdb)."""
-    m = NAME_RE.match(parent)
-    if m:
-        hit = available.get(m.group("base").upper())
-        if hit:
-            return hit
-    # Direct match or AlphaFold DB naming (AF-<ACC>.pdb / AF-<ACC>-F1-model_v*.pdb)
-    key = parent.upper()
-    for cand in (key, f"AF-{key}"):
-        if cand in available:
-            return available[cand]
-    for stem, fname in available.items():
-        if stem.startswith(f"AF-{key}-"):
-            return fname
-    return None
+    hit = resolve_pdb_path(parent, available)
+    return str(hit) if hit is not None else None
 
 
 def attach_from_npz(cache_dir: str, npz_path: str, report_path: str | None = None) -> dict:
@@ -123,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
     constructs = df[[args.parent_col, args.seq_col]].drop_duplicates()
 
     available = {
-        f[:-4].upper(): f
+        normalize_pdb_stem(f): f
         for f in os.listdir(args.pdb_dir)
         if f.lower().endswith(".pdb")
     }
