@@ -129,6 +129,9 @@ def calibration_report(mu: np.ndarray, sigma: np.ndarray, y: np.ndarray) -> dict
         "n": int(len(y)),
         "coverage_observed": coverage,
         "coverage_nominal": {f"{int(p * 100)}%": p for p in Z_FOR_NOMINAL},
+        # the PIT reliability curve behind the ECE, so a figure can draw it
+        "reliability": {"nominal": [round(float(g), 4) for g in grid],
+                        "empirical": [round(float(e), 5) for e in empirical]},
         "expected_calibration_error": ece,
         "max_calibration_error": float(np.max(np.abs(empirical - grid))),
         "max_coverage_gap": max_gap,

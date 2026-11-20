@@ -87,7 +87,7 @@ def cluster_bootstrap(y, preds: dict, groups, reps: int, seed: int, proteins=Non
     idx = [np.flatnonzero(codes == g) for g in range(len(uniq))]
     names = list(preds)
     draws = {
-        n: {"pearson": [], "spearman": [], "rmse": [], "med_spearman": []}
+        n: {"pearson": [], "spearman": [], "rmse": [], "med_spearman": [], "med_pearson": []}
         for n in names
     }
     for _ in range(reps):
@@ -100,6 +100,7 @@ def cluster_bootstrap(y, preds: dict, groups, reps: int, seed: int, proteins=Non
             if proteins is not None:
                 pm = _per_protein_medians(y[rows], preds[n][rows], proteins[rows])
                 draws[n]["med_spearman"].append(pm["per_protein_median_spearman"])
+                draws[n]["med_pearson"].append(pm["per_protein_median_pearson"])
     return {n: {k: np.asarray(v) for k, v in d.items()} for n, d in draws.items()}
 
 
@@ -169,17 +170,24 @@ def main() -> None:
     out: dict = {"split": args.split, "subset": args.subset, "n_rows": int(len(sub)),
                  "n_clusters": int(pd.Series(groups).nunique()),
                  "n_proteins": int(sub["parent_seq"].nunique()),
-                 "reps": args.reps, "models": {}}
+                 "reps": args.reps, "seed": args.seed,
+                 "ci": "95% percentile interval over cluster-bootstrap resamples of group_used",
+                 "models": {}}
     print(f"\n{'model':<22}{'Pearson [95% CI]':<28}{'PoolRho':<10}{'MedRho':<10}{'RMSE':<9}{'dPearson vs ' + first}")
     for n, p in preds.items():
         m = _metrics(y, p)
         pm = _per_protein_medians(y, p, proteins)
         lo, hi = _ci(boot[n]["pearson"])
         slo, shi = _ci(boot[n]["med_spearman"])
+        # Every reported metric carries its own cluster-bootstrap interval: pooled
+        # Pearson / Spearman / RMSE and the per-protein medians, in separate keys.
         entry = {
             **m,
             **pm,
             "pearson_ci95": [lo, hi],
+            "spearman_ci95": _ci(boot[n]["spearman"]),
+            "rmse_ci95": _ci(boot[n]["rmse"]),
+            "per_protein_median_pearson_ci95": _ci(boot[n]["med_pearson"]),
             "per_protein_median_spearman_ci95": [slo, shi],
         }
         if n != first:
