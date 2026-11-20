@@ -25,10 +25,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import numpy as np
 import pandas as pd
 import torch
 
-from src.encoder import EncodingStore
+from src.encoder import EncodingStore, seq_key
 from src.geometry import (
     MAX_MISMATCH_FRACTION,
     NAME_RE,
@@ -56,16 +57,66 @@ def _resolve_pdb(parent: str, available: dict[str, str]) -> str | None:
     return None
 
 
+def attach_from_npz(cache_dir: str, npz_path: str, report_path: str | None = None) -> dict:
+    """Attach pre-aligned ``<sha1>__coords/__plddt/__valid`` arrays from an NPZ bundle."""
+    store = EncodingStore(cache_dir)
+    z = np.load(npz_path)
+    keys = sorted({k.split("__", 1)[0] for k in z.files if k.endswith("__coords")})
+    attached = skipped_uncached = skipped_len = 0
+    for sha in keys:
+        pt_path = os.path.join(cache_dir, f"{sha}.pt")
+        if not os.path.isfile(pt_path):
+            skipped_uncached += 1
+            continue
+        rec = torch.load(pt_path, map_location="cpu", weights_only=False)
+        coords = z[f"{sha}__coords"]
+        plddt = z[f"{sha}__plddt"]
+        valid = z[f"{sha}__valid"]
+        if rec["emb"].shape[0] != coords.shape[0]:
+            skipped_len += 1
+            continue
+        rec["coords"] = torch.from_numpy(coords).float()
+        rec["plddt"] = torch.from_numpy(plddt).float()
+        rec["coord_valid"] = torch.from_numpy(
+            (valid > 0.5) & (plddt >= PLDDT_VALID_FLOOR)
+        ).float()
+        rec["structure_id"] = os.path.basename(npz_path)
+        store.put(rec)
+        attached += 1
+    summary = {
+        "geom_npz": npz_path,
+        "cache": cache_dir,
+        "total_in_npz": len(keys),
+        "attached": attached,
+        "skipped_uncached": skipped_uncached,
+        "skipped_length_mismatch": skipped_len,
+    }
+    print(f"[attach_coords] npz attached={attached}/{len(keys)} "
+          f"(uncached={skipped_uncached}, len_mismatch={skipped_len})")
+    if report_path:
+        os.makedirs(os.path.dirname(os.path.abspath(report_path)), exist_ok=True)
+        with open(report_path, "w", encoding="utf-8") as fh:
+            json.dump(summary, fh, indent=2)
+    return summary
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--table", required=True, help="parquet with parent and wt_seq")
-    ap.add_argument("--pdb-dir", required=True, help="directory of PDB files")
+    ap.add_argument("--table", default=None, help="parquet with parent and wt_seq")
+    ap.add_argument("--pdb-dir", default=None, help="directory of PDB files")
+    ap.add_argument("--geom-npz", default=None, help="pre-aligned invariant_backbone_geometry.npz bundle")
     ap.add_argument("--cache", required=True, help="EncodingStore cache directory")
     ap.add_argument("--parent-col", default="parent")
     ap.add_argument("--seq-col", default="wt_seq")
     ap.add_argument("--max-mismatch-frac", type=float, default=MAX_MISMATCH_FRACTION)
     ap.add_argument("--report", default=None, help="optional JSON summary path")
     args = ap.parse_args(argv)
+
+    if args.geom_npz:
+        attach_from_npz(args.cache, args.geom_npz, args.report)
+        return 0
+    if not args.table or not args.pdb_dir:
+        raise SystemExit("[attach_coords] pass either --geom-npz OR both --table and --pdb-dir")
 
     store = EncodingStore(args.cache)
     df = pd.read_parquet(args.table)

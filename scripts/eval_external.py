@@ -106,10 +106,14 @@ def main() -> None:
 
     key = os.path.splitext(os.path.basename(args.data))[0]
     overrides = cfg.column_overrides(key)
+    raw_df = pd.read_parquet(args.data)
+    raw_idx_map = len(raw_df)
     norm, report = load_mutation_table(
         args.data, kind="stability", overrides=overrides,
         max_protein_length=cfg.max_protein_length,
     )
+    norm["row_id"] = np.arange(len(norm), dtype=np.int64)
+    del raw_df, raw_idx_map
     print(report.summary())
     sign_applied = report.notes.get("ddg_sign", "stabilizing_positive")
     print(f"[external] ddg_sign applied: {sign_applied}  "
@@ -149,10 +153,25 @@ def main() -> None:
     mu, sigma, y = predict(model, loader, device)
     metrics = regression_metrics(y, mu)
 
+    # Also write common-format per-row predictions so scripts/score_predictions.py
+    # can compute cluster-bootstrap CIs and paired competitor comparisons directly.
+    if "row_id" in norm.columns:
+        row_ids = norm["row_id"].to_numpy(dtype=np.int64)
+    else:
+        row_ids = np.arange(len(norm), dtype=np.int64)
+    pred_path = os.path.join(args.out, f"pred_{key}.parquet")
+    pd.DataFrame({
+        "row_id": row_ids,
+        "y_true": y.astype(np.float32),
+        "y_pred": mu.astype(np.float32),
+        "y_sigma": sigma.astype(np.float32),
+    }).to_parquet(pred_path, index=False)
+
     out = {
         "provenance": provenance(),
         "checkpoint": args.checkpoint,
         "data": args.data,
+        "predictions_parquet": pred_path,
         "what_this_measures": (
             "transfer to proteins the run never saw: FireProtDB with all "
             "MegaScale-sourced rows removed, so no measurement is shared with "

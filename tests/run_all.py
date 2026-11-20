@@ -22,6 +22,7 @@ from tests import helpers
 def main() -> int:
     from tests import (
         test_app,
+        test_block_c,
         test_cli,
         test_dataset_etl,
         test_invariants,
@@ -42,6 +43,7 @@ def main() -> int:
         ("dataset ETL regressions", test_dataset_etl.TESTS),
         ("remote job runner", test_remote_job.TESTS),
         ("Holo-GeoN v2 & geometry invariants", test_v2.TESTS),
+        ("Block C epistasis / competitors / Zenodo", test_block_c.TESTS),
     ]
 
     errors: list[str] = []

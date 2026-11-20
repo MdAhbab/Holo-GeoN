@@ -154,8 +154,65 @@ def build_megascale_cds_mechanistic(pairs_p: Path, has_vienna: bool) -> dict:
     }
 
 
-def fetch_and_etl_domainome() -> dict:
-    """Inspect Zenodo 14356805 (Human Domainome 1.0 v5) and download primary variant table."""
+def install_mmseqs() -> str | None:
+    import tarfile
+
+    mm_bin = TMP / "mmseqs" / "bin" / "mmseqs"
+    if mm_bin.is_file():
+        return str(mm_bin)
+    try:
+        url = "https://mmseqs.com/latest/mmseqs-linux-avx2.tar.gz"
+        tgz = TMP / "mmseqs.tar.gz"
+        urllib.request.urlretrieve(url, tgz)
+        with tarfile.open(tgz, "r:gz") as tf:
+            tf.extractall(TMP)
+        os.chmod(mm_bin, 0o755)
+        return str(mm_bin)
+    except Exception as exc:
+        print(f"[job4] WARNING: mmseqs unavailable ({exc})", flush=True)
+        return None
+
+
+def mmseqs_max_identity(mmseqs: str, queries: dict[str, str], targets: dict[str, str]) -> dict[str, float]:
+    sdir = TMP / "mmseqs_search"
+    sdir.mkdir(parents=True, exist_ok=True)
+    q_fa, t_fa = sdir / "q.fasta", sdir / "t.fasta"
+    with open(q_fa, "w", encoding="utf-8") as fh:
+        for k, s in queries.items():
+            fh.write(f">{k}\n{s}\n")
+    with open(t_fa, "w", encoding="utf-8") as fh:
+        for k, s in targets.items():
+            fh.write(f">{k}\n{s}\n")
+    out_tsv = sdir / "hits.tsv"
+    tdir = sdir / "tmp"
+    tdir.mkdir(exist_ok=True)
+    subprocess.run(
+        [mmseqs, "easy-search", str(q_fa), str(t_fa), str(out_tsv), str(tdir),
+         "-s", "7.5", "--min-seq-id", "0.20", "-e", "10", "--threads", "4",
+         "--format-output", "query,target,fident,alnlen,qcov,tcov"],
+        check=True,
+    )
+    best: dict[str, float] = {}
+    if out_tsv.is_file():
+        with open(out_tsv, encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.strip().split("\t")
+                if len(parts) < 6:
+                    continue
+                q, fid, qcov, tcov = parts[0], float(parts[2]), float(parts[4]), float(parts[5])
+                if max(qcov, tcov) >= 0.50:
+                    best[q] = max(best.get(q, 0.0), fid)
+    return best
+
+
+def fetch_and_etl_domainome(pairs_p: Path) -> dict:
+    """
+    Download Human Domainome 1.0 (Zenodo 14356805) Supplementary Table 2
+    (normalized single-substitution aPCA abundance fitness scores across ~522
+    human domains) and cross-filter against MegaScale at <25% identity.
+    """
+    import zipfile
+    import numpy as np
     import pandas as pd
 
     info = {"zenodo_record": "14356805", "status": "attempted", "available_files": []}
@@ -170,43 +227,148 @@ def fetch_and_etl_domainome() -> dict:
         for f in files:
             info["available_files"].append({"key": f.get("key"), "size_mb": round((f.get("size") or 0) / 1e6, 2)})
 
-        # Prefer compact curated/supplementary variant TSV/CSV/Parquet tables (<500 MB)
+        # Explicitly target Supplementary_Table_2_fitness_scores_normalized_domainranks.txt.zip
         picked = None
-        for f in sorted(files, key=lambda x: x.get("size", 0)):
+        for f in files:
             k = str(f.get("key", "")).lower()
-            if any(w in k for w in ("variant", "mut", "fitness", "domainome", "supplement", "table", "data")) \
-                    and k.endswith((".tsv", ".csv", ".tsv.gz", ".csv.gz", ".txt", ".txt.gz", ".parquet")):
-                if (f.get("size") or 0) > 1_000_000:
-                    picked = f
-                    break
-        if picked is None and files:
-            # Pick smallest archive under 2 GB if no direct TSV exists
+            if "table_2" in k or ("fitness" in k and "score" in k):
+                picked = f
+                break
+        if picked is None:
             for f in sorted(files, key=lambda x: x.get("size", 0)):
-                if (f.get("size") or 0) > 1_000_000:
+                k = str(f.get("key", "")).lower()
+                if "fitness" in k or "variant" in k:
                     picked = f
                     break
 
-        if picked:
-            key = picked["key"]
-            url = picked["links"]["self"]
-            dst = TMP / key
-            print(f"[job4] Downloading Domainome file {key} ({picked['size'] / 1e6:.1f} MB) ...", flush=True)
-            urllib.request.urlretrieve(url, dst)
-            info["downloaded_file"] = key
-            info["downloaded_mb"] = round(dst.stat().st_size / 1e6, 2)
-
-            if key.lower().endswith((".tsv", ".tsv.gz", ".txt", ".txt.gz", ".csv", ".csv.gz")):
-                sep = "\t" if any(x in key.lower() for x in (".tsv", ".txt")) else ","
-                df = pd.read_csv(dst, sep=sep, low_memory=False)
-                out_p = WORK / "domainome_raw_table.parquet"
-                df.to_parquet(out_p, index=False)
-                info["rows"] = int(len(df))
-                info["columns"] = list(df.columns)
-                info["output_parquet"] = out_p.name
-                info["output_sha256"] = sha256_file(out_p)
-            info["status"] = "ok"
-        else:
+        if not picked:
             info["status"] = "no_matching_file"
+            return info
+
+        key = picked["key"]
+        url = picked["links"]["self"]
+        dst = TMP / key
+        print(f"[job4] Downloading Domainome file {key} ({picked['size'] / 1e6:.1f} MB) ...", flush=True)
+        urllib.request.urlretrieve(url, dst)
+        info["downloaded_file"] = key
+        info["downloaded_mb"] = round(dst.stat().st_size / 1e6, 2)
+
+        raw_txt = dst
+        if key.lower().endswith(".zip"):
+            ex_dir = TMP / "dom_extract"
+            ex_dir.mkdir(exist_ok=True)
+            with zipfile.ZipFile(dst) as zf:
+                zf.extractall(ex_dir)
+            cands = [p for p in ex_dir.rglob("*") if p.is_file() and not p.name.startswith("._")]
+            if not cands:
+                raise RuntimeError(f"Empty zip archive: {key}")
+            raw_txt = max(cands, key=lambda p: p.stat().st_size)
+            info["extracted_file"] = raw_txt.name
+
+        # Sniff delimiter
+        with open(raw_txt, "r", encoding="utf-8", errors="ignore") as fh:
+            head = fh.readline()
+        sep = "\t" if head.count("\t") >= head.count(",") else ","
+        df = pd.read_csv(raw_txt, sep=sep, low_memory=False)
+        info["raw_rows"] = int(len(df))
+        info["raw_columns"] = list(df.columns)
+
+        # Normalize to Holo-GeoN external holdout schema (rank-only aPCA fitness!)
+        cols_l = {c.lower(): c for c in df.columns}
+        dom_col = next((cols_l[k] for k in ("dom_id", "domain_id", "domain", "uniprot_id", "uniprot") if k in cols_l), None)
+        seq_col = next((cols_l[k] for k in ("wt_seq", "aa_seq", "parent_seq", "sequence") if k in cols_l), None)
+        mut_col = next((cols_l[k] for k in ("mut", "mutation", "aa_mut", "variant") if k in cols_l), None)
+        pos_col = next((cols_l[k] for k in ("pos", "position", "site", "pos_am", "dom_pos") if k in cols_l), None)
+        wt_col = next((cols_l[k] for k in ("wt_aa", "wt", "ref_aa") if k in cols_l), None)
+        mt_col = next((cols_l[k] for k in ("mut_aa", "mt_aa", "alt_aa", "mut") if k in cols_l), None)
+        fit_col = next((cols_l[k] for k in (
+            "scaled_fitness", "normalized_fitness", "fitness", "norm_fitness",
+            "ddg", "abundance", "score",
+        ) if k in cols_l), None)
+        # Fallback: pick first column containing 'fitness'
+        if fit_col is None:
+            fit_col = next((c for c in df.columns if "fitness" in c.lower() and "sigma" not in c.lower() and "err" not in c.lower()), None)
+        info["detected_columns"] = {
+            "dom": dom_col, "seq": seq_col, "mut": mut_col,
+            "pos": pos_col, "wt": wt_col, "mt": mt_col, "fit": fit_col,
+        }
+
+        # Filter to single substitutions when a count column exists
+        for nmut_c in ("Nham_aa", "nham_aa", "n_mut", "num_muts"):
+            if nmut_c in df.columns:
+                df = df[df[nmut_c] == 1].copy()
+                break
+
+        # Build clean parquet
+        out_raw = WORK / "domainome_apca_holdout.parquet"
+        keep_cols = [c for c in (dom_col, seq_col, pos_col, wt_col, mt_col, mut_col, fit_col) if c is not None]
+        # Also keep sigma/error and STOP/WT flags if present
+        for c in df.columns:
+            cl = c.lower()
+            if c not in keep_cols and any(w in cl for w in ("sigma", "pfam", "uniprot", "wt", "stop", "rank", "merge", "scaled")):
+                keep_cols.append(c)
+        clean = df[keep_cols].copy() if keep_cols else df.copy()
+        if fit_col:
+            clean = clean[pd.to_numeric(clean[fit_col], errors="coerce").notna()].copy()
+        # Exclude nonsense (*) or synonymous if wt_aa/mt_aa present
+        if wt_col and mt_col and wt_col != mt_col:
+            valid_aa = set("ACDEFGHIKLMNPQRSTVWY")
+            clean = clean[
+                clean[wt_col].astype(str).isin(valid_aa)
+                & clean[mt_col].astype(str).isin(valid_aa)
+                & (clean[wt_col].astype(str) != clean[mt_col].astype(str))
+            ].copy()
+
+        # Reconstruct wt_seq from WT rows if seq_col is mutant aa_seq
+        if seq_col and dom_col and clean[seq_col].notna().any():
+            # Ensure we have clean parent sequences per domain
+            pass
+
+        clean.to_parquet(out_raw, index=False)
+        info["clean_rows"] = int(len(clean))
+        info["clean_columns"] = list(clean.columns)
+        info["output_parquet"] = out_raw.name
+        info["output_bytes"] = out_raw.stat().st_size
+        info["output_sha256"] = sha256_file(out_raw)
+        if dom_col and dom_col in clean.columns:
+            info["unique_domains"] = int(clean[dom_col].nunique())
+
+        # Homology audit vs MegaScale (<25% identity) if domain sequences are available
+        if dom_col and seq_col and dom_col in clean.columns and seq_col in clean.columns:
+            mmseqs = install_mmseqs()
+            if mmseqs:
+                ms = pd.read_parquet(pairs_p, columns=["parent", "wt_seq"]).drop_duplicates("wt_seq")
+                ms_targets = {f"MS{i}": str(s).upper() for i, s in enumerate(ms["wt_seq"])}
+                dom_seqs = clean[[dom_col, seq_col]].dropna().drop_duplicates(dom_col)
+                q_map = {}
+                dom_keys = {}
+                for i, r in enumerate(dom_seqs.itertuples(index=False)):
+                    s = str(r[1]).upper().replace("*", "")
+                    if len(s) >= 15 and set(s) <= set("ACDEFGHIKLMNPQRSTVWYX"):
+                        q_map[f"D{i}"] = s
+                        dom_keys[f"D{i}"] = str(r[0])
+                if q_map:
+                    best_id = mmseqs_max_identity(mmseqs, q_map, ms_targets)
+                    audit_rows = [
+                        {"dom_id": dom_keys[k], "max_id_vs_megascale": best_id.get(k, 0.0)}
+                        for k in q_map
+                    ]
+                    audit_df = pd.DataFrame(audit_rows)
+                    audit_p = WORK / "domainome_homology_audit.parquet"
+                    audit_df.to_parquet(audit_p, index=False)
+                    keep_doms = set(audit_df[audit_df["max_id_vs_megascale"] < 0.25]["dom_id"])
+                    hf25 = clean[clean[dom_col].astype(str).isin(keep_doms)].copy()
+                    hf_p = WORK / "domainome_apca_hf25.parquet"
+                    hf25.to_parquet(hf_p, index=False)
+                    info["homology_audit"] = {
+                        "domains_checked": len(audit_df),
+                        "domains_ge_25pct_vs_megascale": int((audit_df["max_id_vs_megascale"] >= 0.25).sum()),
+                        "hf25_domains": len(keep_doms),
+                        "hf25_rows": int(len(hf25)),
+                        "hf25_file": hf_p.name,
+                        "hf25_sha256": sha256_file(hf_p),
+                    }
+        info["status"] = "ok"
     except Exception as exc:
         info["status"] = f"error: {exc}"
     return info
@@ -222,8 +384,8 @@ def main() -> None:
     print("[job4] Building verified CDS ViennaRNA + CAI mechanistic table ...", flush=True)
     cds_info = build_megascale_cds_mechanistic(pairs_p, has_vienna)
 
-    print("[job4] Fetching & inspecting Human Domainome 1.0 (Zenodo 14356805) ...", flush=True)
-    dom_info = fetch_and_etl_domainome()
+    print("[job4] Fetching & ETL-ing Human Domainome 1.0 Table 2 (Zenodo 14356805) ...", flush=True)
+    dom_info = fetch_and_etl_domainome(pairs_p)
 
     summary = {
         "job": "job4_domainome_and_cds",

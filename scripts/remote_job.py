@@ -112,6 +112,11 @@ def expand_items(manifest: dict) -> list[dict]:
                 "strict": bool(spec.get("strict", False)), "pack": tid,
                 "needs": ["precompute"] if _has_id(manifest, "precompute") else [],
             })
+            if spec.get("export", False):
+                items.append({
+                    "id": f"exp_{tid}", "kind": "export", "arm": spec["arm"],
+                    "seed": seed, "needs": [tid], "pack": tid,
+                })
             if spec.get("external", True):
                 items.append({
                     "id": f"ext_{tid}", "kind": "external", "arm": spec["arm"],
@@ -184,7 +189,7 @@ def take_shard(items: list[dict], spec: str | None) -> list[dict]:
     for it in items:
         if it["kind"] == "train" and it["id"] not in mine:
             continue
-        if it["kind"] == "external" and it["needs"][0] not in mine:
+        if it["kind"] in ("external", "export") and it["needs"][0] not in mine:
             continue
         if it["kind"] == "aggregate" and n > 1:
             continue   # aggregation runs once, after the shards are merged
@@ -300,13 +305,22 @@ def find_inputs(roots: list[str], names: tuple[str, ...], max_depth: int = 7) ->
     return found
 
 
-def stage_inputs(roots: list[str]) -> dict:
+def stage_inputs(roots: list[str], extra_files: tuple[str, ...] = ()) -> dict:
     data_dir = os.path.join(ROOT, "data")
     os.makedirs(data_dir, exist_ok=True)
-    extra = ("leakage_report_stability.json",)
-    present = {n: os.path.join(data_dir, n) for n in REQUIRED_INPUTS + extra
+    extra = (
+        "leakage_report_stability.json",
+        "splits_megascale_id25.parquet",
+        "splits_megascale_fold_tm60.parquet",
+        "fireprotdb_hf25.parquet",
+        "s669_holdout.parquet",
+        "domainome_apca_hf25.parquet",
+        "invariant_backbone_geometry.npz",
+    ) + tuple(extra_files)
+    all_names = tuple(dict.fromkeys(REQUIRED_INPUTS + extra))
+    present = {n: os.path.join(data_dir, n) for n in all_names
                if os.path.isfile(os.path.join(data_dir, n))}
-    missing = [n for n in REQUIRED_INPUTS + extra if n not in present]
+    missing = [n for n in all_names if n not in present]
     if missing:
         located = find_inputs(roots, tuple(missing))
         for name, src in located.items():
@@ -472,15 +486,20 @@ class Heartbeat(threading.Thread):
 def build_cmd(item: dict, ctx: dict) -> list[str]:
     py = sys.executable
     cfg, cache, dev = ctx["config"], ctx["cache"], ctx["device"]
+    splits_file = ctx.get("splits_file", "data/splits_megascale.parquet")
+    external_file = ctx.get("external_file", "data/fireprotdb_holdout.parquet")
     out = os.path.join(ctx["out_root"], item["pack"])
     kind = item["kind"]
     if kind == "precompute":
-        return [py, "-m", "scripts.precompute_embeddings", "--data",
-                "data/megascale_ddg_pairs.parquet", "data/fireprotdb_holdout.parquet",
+        data_args = ["data/megascale_ddg_pairs.parquet", external_file]
+        for opt_ext in ("data/fireprotdb_holdout.parquet", "data/s669_holdout.parquet"):
+            if opt_ext not in data_args and os.path.isfile(os.path.join(ROOT, opt_ext)):
+                data_args.append(opt_ext)
+        return [py, "-m", "scripts.precompute_embeddings", "--data", *data_args,
                 "--config", cfg, "--cache", cache, "--device", dev]
     if kind == "train":
         cmd = [py, "-m", "scripts.train", "--config", cfg,
-               "--stability-splits", "data/splits_megascale.parquet",
+               "--stability-splits", splits_file,
                # Benchmark is DDG only; a missing path drops the second task.
                "--pathogenicity-splits", "none",
                "--cache", cache, "--device", dev, "--out", out,
@@ -492,18 +511,25 @@ def build_cmd(item: dict, ctx: dict) -> list[str]:
         if item.get("strict"):
             cmd.append("--strict-determinism")
         return cmd + list(item.get("flags", []))
+    if kind == "export":
+        return [py, "-m", "scripts.export_predictions",
+                "--checkpoint", os.path.join(out, "model_best.pt"),
+                "--splits", splits_file, "--split", "test",
+                "--config", cfg, "--cache", cache, "--device", dev,
+                "--out", os.path.join(out, "pred_test.parquet")]
     if kind == "external":
         return [py, "-m", "scripts.eval_external",
                 "--checkpoint", os.path.join(out, "model_best.pt"),
-                "--data", "data/fireprotdb_holdout.parquet", "--config", cfg,
+                "--data", external_file, "--config", cfg,
                 "--cache", cache, "--device", dev, "--out", out]
     if kind == "baselines":
         return [py, "-m", "scripts.baselines", "--splits",
-                "data/splits_megascale.parquet", "--out", out, "--config", cfg,
+                splits_file, "--out", out, "--config", cfg,
                 "--cache", cache, "--device", dev] + list(item.get("flags", []))
     if kind == "cmd":
         sub = {"out": out, "cache": cache, "cfg": cfg, "device": dev, "root": ROOT,
-               "out_root": ctx["out_root"], "py": py}
+               "out_root": ctx["out_root"], "py": py,
+               "splits": splits_file, "external": external_file}
         return [str(a).format(**sub) for a in item["argv"]]
     raise SystemExit(f"unknown item kind {kind!r} (item {item['id']})")
 
@@ -512,12 +538,12 @@ def preflight(item: dict, ctx: dict, store: Store) -> None:
     """Fail fast: every input the stage needs must exist BEFORE it starts."""
     need: list[str] = []
     kind = item["kind"]
-    if kind in ("precompute", "baselines", "train", "external"):
+    if kind in ("precompute", "baselines", "train", "external", "export"):
         need += [os.path.join(ROOT, "data", n) for n in REQUIRED_INPUTS]
-    if kind in ("train", "external", "baselines"):
+    if kind in ("train", "external", "export", "baselines"):
         if not (os.path.isdir(ctx["cache"]) and os.listdir(ctx["cache"])):
             need.append(ctx["cache"] + "  (encoder cache is empty: precompute not done)")
-    if kind == "external":
+    if kind in ("external", "export"):
         need.append(os.path.join(store.pack_path(item), "model_best.pt"))
     for dep in item.get("needs", []):
         if not store.is_done(dep):
@@ -710,7 +736,9 @@ def main() -> None:
 
     ctx = {"config": manifest["config"], "cache": cache, "device": args.device,
            "out_root": out_root, "steps_per_epoch": sz["steps_per_epoch"],
-           "num_workers": args.num_workers or manifest.get("num_workers")}
+           "num_workers": args.num_workers or manifest.get("num_workers"),
+           "splits_file": manifest.get("splits_file", "data/splits_megascale.parquet"),
+           "external_file": manifest.get("external_file", "data/fireprotdb_holdout.parquet")}
     os.makedirs(out_root, exist_ok=True)
     store = Store(out_root, args.persist, cache)
     job = f"{manifest['name']}:{args.shard or 'all'}:{int(time.time())}"

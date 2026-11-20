@@ -1,0 +1,46 @@
+# configs/experiments/kaggle_v2_geometry.yaml
+# Controlled 5-Arm Geometry Dissection (GEOMETRIC_PLAN.md §3) on the structured subset.
+#
+# Holds architecture (Holo-GeoN v2), split, readout, loss (beta-NLL), and 5 seeds
+# strictly identical, varying ONLY whether coordinates/true contacts enter at inference:
+#   Arm A: full_pred_contacts  (ESM-2 predicted contacts, 3-ch)
+#   Arm B: str_only            (SE(3)-invariant 3D backbone frames, 26-ch)
+#   Arm C: both_streams        (predicted contacts + invariant 3D frames)
+#   Arm D: str_topology_only   (coordinate k-NN edges, 3-ch only)
+#   Arm E: true_contact_edges  (real C-beta 8 A contact maps, 3-ch)
+
+name: kaggle_v2_geometry
+platform: kaggle_t4
+config: configs/benchmark_v2.yaml
+cache: /tmp/holo/cache/esm2_650M_v2
+out_root: /kaggle/working/runs/kaggle_v2_geometry
+num_workers: 4
+
+cost:
+  gpu: T4
+  cu_per_hour: 0
+  budget_cu: null
+
+sizing:
+  steps_per_epoch: 560    # structured subset (93.1% of train rows)
+  epochs: 15
+  sec_per_step: 0.075     # ASSUMED (+25% for 26-ch str edges) — measure in probe
+  eval_overhead: 0.15
+  strict_factor: 1.3
+  vm_overhead_h: 0.40
+  precompute_h: 0.25
+  export_h: 0.02
+  external_h: 0.03
+
+items:
+  - {id: precompute, kind: precompute}
+  - {kind: train, arm: full,               seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true}
+  - {kind: train, arm: str_only,           seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true,
+     flags: ["--no-geo-stream", "--use-str-stream"]}
+  - {kind: train, arm: both_streams,       seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true,
+     flags: ["--use-str-stream"]}
+  - {kind: train, arm: str_topology_only,  seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true,
+     flags: ["--no-geo-stream", "--use-str-stream", "--str-topology-only"]}
+  - {kind: train, arm: true_contact_edges, seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true,
+     flags: ["--true-contact-edges", "--true-contacts-dir", "data/true_contacts"]}
+  - {id: aggregate, kind: aggregate, phase: post}

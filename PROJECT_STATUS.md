@@ -1,15 +1,24 @@
 # PROJECT_STATUS.md
 
-## 0. Update — 2026-11-20 (`version-2` active branch, pre-v2 implementation checkpoint)
+## 0. Update — 2026-11-20 (`version-2` active branch — Block A + B + C Code & All 5 Kaggle CPU Audits Complete)
 
-* **Workspace scaffolded** into `project/` (Git repository only + gitignored `DATASETS/`), `paper/`, and `extras/` (non-Git notes, Zenodo staging, Kaggle account templates).
-* **Git synced:** Previous uncommitted benchmark/geometry/runner scaffolding reviewed, verified (`tests/test_remote_job.py` 52/52 passed), committed as `f083217`, pushed to `origin/main`, and fast-forwarded onto **`version-2`** (`origin/version-2`). All v2 implementation proceeds on `version-2` before merging back to `main`.
-* **Expanded compute pool:** 4 Kaggle accounts (2 weeks -> ~240h T4 GPU + 20 concurrent CPU workers) + ~200 CU (~20h) 95 GB G4 GPU (keep 20 CU safety reserve).
-* **Approved roadmap (details in `../extras/notes/HOLO_GEON_MASTER_PLAN.md` & `../extras/notes/HANDOFF.md`):**
-  1. **Block A (next):** Holo-GeoN v2 core — single-pass `EsmForMaskedLM` (fixing the duplicate 650M forward pass in `src/encoder.py` + extracting free WT-marginal log-odds, Shannon entropy, and multi-layer taps), parent graph cache + Protein-Batch training, `20.6M -> ~2.4M` compressed backbone (FiLM + compact bidirectional mixer + DropEdge + CDS modality dropout), evolutionary-anchored antisymmetric head + `beta-NLL` (`beta=0.5`), Contact-Gated Double-Mutant Epistasis head, upgraded `score_predictions.py` (pooled + per-protein median), and fixing the 6 pre-existing `tests/test_app.py` failures + `runapp.py`.
-  2. **Block B:** Cross-platform non-Linux CLI (`holo.py`/`hologe`), local `fetch_alphafold.py` (176 FireProtDB structures), and non-registration Kaggle CPU jobs (Foldseek/TM-align audit, MMseqs2 25% splits, S669/Domainome ETL, ViennaRNA/CAI, `src/geometry.py`).
-  3. **Block C:** User completes Zenodo `7844779` & Rocklin/OpenFold MGnify Stability registrations -> 4-account Kaggle T4 ablations + competitor adapters (ThermoMPNN, SPURS, RaSP, PROSTATA, optional DDGemb) -> Unified same-GPU 95 GB G4 headline runs -> Zenodo `Holo-StabBench v1.0` dataset & weights release.
-  4. **Block D (later):** Modern Web GUI redesign (`app/frontend/`) + live real-time CLI & tunneled GUI run on G4.
+* **Workspace scaffolded** into `project/` (Git repository only + gitignored `DATASETS/`), `paper/`, and `extras/` (non-Git notes, Zenodo staging, Kaggle account outputs).
+* **Git branches:** `main` == `origin/main` at `f083217`. All new work is on **`version-2`** (`origin/version-2`), keeping legacy v1 (`arch: "v1"`, 20.6M params) selectable alongside Holo-GeoN v2 (`arch: "v2"`, 2.04M params) for direct paired Kaggle ablations.
+* **Block A — Holo-GeoN v2 Core & Efficiency (DONE & VERIFIED):**
+  * Single-pass `EsmForMaskedLM` encoder (`src/encoder.py`): eliminates duplicate 650M forward pass (2x faster, saves 2.6 GB VRAM), extracts 4 tapped layers, 20-AA WT-marginal log-odds, normalized Shannon entropy, and exact `contact_head` contacts.
+  * Compressed `HoloBackboneV2` (**2,038,417 params** vs. v1 **20,607,788 params** = **10.11x smaller**): Multi-layer ScalarMix -> shared `1280->256` bottleneck -> zero-init FiLM -> mask-aware `BidirectionalMixer` -> split-head residual Pre-LN GATv2 streams (`E_geo`, `E_mech`, optional SE(3)-invariant 3D `E_str`) with DropEdge + CDS modality dropout (`p = 0.5`).
+  * `EvolutionarySubstitutionHead` (exact antisymmetry + WT-marginal log-odds prior + 8-ch AA biophysics), `ContactGatedEpistasisHead` (Potts bilinear double-mutant head gated by `E_geo`), and `beta-NLL` (`beta = 0.5`).
+  * `ProteinBatchMutationDataset` + `_ParentGraphCache` (~15-40x faster epochs, eliminates 740x/epoch CPU graph rebuilds).
+  * Upgraded `scripts/score_predictions.py` (separate pooled & per-protein median columns + cluster-bootstrap CIs) and fixed the 6 pre-existing `tests/test_app.py` 503 race failures (now **28/28 passing**).
+* **Block B — Cross-Platform CLI & 5 Parallel Kaggle CPU Audits (DONE, 0 GPU HOURS USED):**
+  * Non-Linux-friendly CLI (`holo.py` / `holo.bat` / `holo.ps1` / `pyproject.toml`): interactive menu + `doctor`, `predict`, `scan --html`, `epistasis`, `batch`, `gui`.
+  * **Landmark Audit Finding #1 (MegaScale Structural Fold Collapse — `cpu1` + `cpu5`, 69,378 exact TM-align pairs):** On standard 30%-identity splits, **37/37 (100%)** structured test domains share a fold (`TM >= 0.5`) with training, and **27/37 (73%)** are near-identical (`TM >= 0.7`, median `0.824`, max `0.975`, e.g. `2L7F` vs `2L9R` at RMSD `0.37 A`). All-vs-all clustering shows **97.05% (362/373)** collapse into one connected component at `TM_max >= 0.50`, cleanly partitioning into **76 fold clusters** at `TM_min >= 0.60` -> produced **`splits_megascale_fold_tm60.parquet`** (`max_cross_tm_min = 0.5956`).
+  * **Landmark Audit Finding #2 (Hidden External Homology Leakage — `cpu2` + `cpu4`):** Even after removing all 604,920 MegaScale rows from FireProtDB 2.0, **68/176 proteins (55.3% of rows)** still have `>= 25%` identity to MegaScale -> produced **`fireprotdb_hf25.parquet`** (1,894 rows, 108 proteins) + **`splits_megascale_id25.parquet`** (zero 8-mer overlap). On Human Domainome 1.0 (522 domains, 536,164 single mutants), **195/522 domains (37.4%)** have `>= 25%` identity to MegaScale -> produced 100%-WT-verified **`domainome_apca_hf25.parquet`** (332,854 rows, 327 domains).
+  * **Precomputed Benchmark Assets (`cpu3` + `cpu4`):** 166/176 SHA-256-pinned FireProtDB AlphaFold DB PDBs, S669 (`669/669` verified against WT PDB chains, 94 proteins), 412/412 frame-verified real-CDS ViennaRNA/CAI features, and 538 aligned SE(3)-invariant backbone geometry tensors (`invariant_backbone_geometry.npz`).
+* **Block C Scaffolding & Zenodo `Holo-StabBench v1.0.0-rc1` (DONE & VERIFIED):**
+  * Implemented all 5 competitor adapters (`scripts/competitors/`: `thermompnn.py`, `spurs.py`, `rasp.py`, `prostata.py`, `ddgemb.py`), `scripts/train_epistasis.py`, `scripts/error_decomp.py`, `scripts/build_external_holdouts.py`, and `scripts/zenodo_pack.py`.
+  * Staged 21 verified files (**63.84 MB**) into `../extras/zenodo_staging/Holo-StabBench-v1.0/` with `SHA256SUMS.txt` and `DATASHEET.md`.
+  * **Next:** User approval to launch Wave 0 Kaggle T4 timing probe + 4-account T4 ablations, user registrations for Zenodo `7844779` (double mutants) & optional MGnify Stability, unified 95 GB G4 headline runs, and Block D modern Web GUI + live G4 run.
 
 ---
 

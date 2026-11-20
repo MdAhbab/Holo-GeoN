@@ -1,0 +1,64 @@
+# configs/experiments/kaggle_v2_ablations.yaml
+# Full Holo-GeoN v2 component + v1-comparison ablation suite across 4 Kaggle T4 accounts.
+#
+#   python -m scripts.remote_job --manifest configs/experiments/kaggle_v2_ablations.yaml --plan
+#   python -m scripts.remote_job --manifest configs/experiments/kaggle_v2_ablations.yaml --shard 0/5 ...
+#
+# With Protein-Batch training (P=8 parents x M=64 muts = 512 rows/step -> ~600 steps/epoch
+# instead of 4,782) and 10.1x parameter compression (2.04M vs 20.6M), each 12-epoch v2 arm
+# is projected at ~0.12-0.25 h on a single T4 (MEASURE FIRST in a 10-min T4 probe!).
+
+name: kaggle_v2_ablations
+platform: kaggle_t4
+config: configs/benchmark_v2.yaml
+cache: /tmp/holo/cache/esm2_650M_v2
+out_root: /kaggle/working/runs/kaggle_v2_ablations
+num_workers: 4
+
+cost:
+  gpu: T4
+  cu_per_hour: 0
+  budget_cu: null
+
+sizing:
+  steps_per_epoch: 600    # Protein-Batch (P=8 parents x M=64 muts/parent ~ 512 rows/step)
+  epochs: 15
+  sec_per_step: 0.060     # ASSUMED for 2.04M v2 on T4 — replace after Wave 0 probe
+  eval_overhead: 0.15
+  strict_factor: 1.3
+  vm_overhead_h: 0.40
+  precompute_h: 0.20      # single-pass EsmForMaskedLM (2x faster than v1)
+  export_h: 0.02
+  external_h: 0.03
+
+items:
+  - {id: precompute, kind: precompute}
+
+  # Headline Holo-GeoN v2 (~2.04M params)
+  - {kind: train, arm: full,                seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true}
+
+  # Legacy v1 baseline (20.6M params, standard NLL, no CDS dropout) directly paired on same seeds!
+  - {kind: train, arm: v1_baseline,         seeds: [42, 43, 44, 45, 46], epochs: 12, strict: true, export: true,
+     flags: ["--arch", "v1", "--nll-beta", "0.0", "--cds-dropout", "0.0", "--no-protein-batch"]}
+
+  # v2 feature & loss ablations (one axis removed at a time)
+  - {kind: train, arm: no_esm_logits_prior, seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true,
+     flags: ["--no-esm-logits-prior"]}
+  - {kind: train, arm: no_multi_layer,      seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true,
+     flags: ["--no-multi-layer"]}
+  - {kind: train, arm: no_contact_burial,   seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true,
+     flags: ["--no-contact-burial"]}
+  - {kind: train, arm: standard_nll,        seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true,
+     flags: ["--nll-beta", "0.0"]}
+  - {kind: train, arm: no_cds_dropout,      seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true,
+     flags: ["--cds-dropout", "0.0"]}
+  - {kind: train, arm: no_mech_stream,      seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true,
+     flags: ["--no-mech-stream"]}
+  - {kind: train, arm: no_geo_stream,       seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true,
+     flags: ["--no-geo-stream"]}
+  - {kind: train, arm: no_ssm,              seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true,
+     flags: ["--no-ssm"]}
+  - {kind: train, arm: global_pool_readout, seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true,
+     flags: ["--global-pool-readout"]}
+
+  - {id: aggregate, kind: aggregate, phase: post}
