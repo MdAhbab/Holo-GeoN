@@ -104,11 +104,20 @@ def provenance() -> dict:
 
     Cheap enough to call once per script; never raises.
     """
-    try:
-        import ViennaRNA  # noqa: F401
+    # The ViennaRNA distribution installs its Python bindings as the module
+    # `RNA`, which is what src/features.py imports. Importing `ViennaRNA` here
+    # therefore always failed, so every artifact's manifest recorded
+    # vienna_rna_importable: false even on machines where the CDS/mRNA features
+    # were computed. The legacy name is still tried, in case a future release
+    # provides it.
+    vienna = False
+    for _module in ("RNA", "ViennaRNA"):
+        try:
+            __import__(_module)
+        except Exception:
+            continue
         vienna = True
-    except Exception:
-        vienna = False
+        break
 
     return {
         "git": _git_commit(),

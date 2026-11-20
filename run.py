@@ -284,7 +284,13 @@ def stage_external(args, cfg) -> None:
     if not done(ckpt):
         print(f"[external] no checkpoint at {ckpt}; run `python run.py train` first")
         return
-    if done(os.path.join(run_dir, "external_fireprotdb.json")):
+    # eval_external writes external_{key}.json, key = the data file's stem. Runs
+    # made before that wrote only external_fireprotdb.json, which still counts
+    # as complete for a fireprotdb* table.
+    key = os.path.splitext(os.path.basename(external))[0]
+    if (done(os.path.join(run_dir, f"external_{key}.json"))
+            or (key.startswith("fireprotdb")
+                and done(os.path.join(run_dir, "external_fireprotdb.json")))):
         print("[skip] external evaluation already complete")
         return
     py("scripts.eval_external", "--checkpoint", ckpt, "--data", external,

@@ -219,6 +219,84 @@ def test_scorer_guards_sign_and_common_rows() -> None:
               "scoring uses only the rows EVERY model scored (a model that skipped hard rows cannot look better)")
 
 
+def test_external_results_are_keyed_by_table() -> None:
+    section("eval_external - one result file per table, legacy name only for fireprotdb*")
+    from scripts.eval_external import LEGACY_RESULT_JSON, describe_table, result_paths
+
+    out = os.path.join("some", "run")
+    tables = ("fireprotdb_hf25", "fireprotdb_holdout", "s669_holdout")
+    primaries = [result_paths(out, k)[0] for k in tables]
+    check(len(set(primaries)) == 3,
+          "three tables evaluated into one directory get three different result files")
+    check(primaries[2] == os.path.join(out, "external_s669_holdout.json"),
+          "the result is named external_{key}.json")
+    legacy = os.path.join(out, LEGACY_RESULT_JSON)
+    check(LEGACY_RESULT_JSON == "external_fireprotdb.json",
+          "the legacy name is the one run.py, final_scores and old run artifacts use")
+    check(result_paths(out, "fireprotdb_hf25")[1:] == [legacy]
+          and result_paths(out, "fireprotdb_holdout")[1:] == [legacy],
+          "a fireprotdb* table also writes the legacy file")
+    check(result_paths(out, "s669_holdout") == [primaries[2]]
+          and result_paths(out, "domainome_apca_holdout") == [
+              os.path.join(out, "external_domainome_apca_holdout.json")],
+          "any other table never writes the legacy file")
+    check(result_paths(out, "fireprotdb") == [legacy],
+          "a table literally named fireprotdb does not list the same file twice")
+
+    desc = {k: describe_table(k) for k in tables}
+    what = {k: v["what"] for k, v in desc.items()}
+    check(len(set(what.values())) == 3, "each table has its own what_this_measures")
+    check("MegaScale-sourced rows removed" in what["fireprotdb_holdout"]
+          and "MegaScale-sourced rows removed" not in what["s669_holdout"],
+          "only the FireProtDB holdout is described as MegaScale rows removed")
+    check("25%" in what["fireprotdb_hf25"], "hf25 is described by its 25% identity filter")
+    check("669" in what["s669_holdout"] and "PDB" in what["s669_holdout"],
+          "S669 is described as the 669-mutation holdout verified against WT PDB chains")
+    check(all("FireProtDB" not in desc["s669_holdout"][f] or "not a FireProtDB" in desc["s669_holdout"][f]
+              for f in ("title", "what")),
+          "S669's description does not present it as FireProtDB")
+    unknown = describe_table("my_new_table")
+    check("my_new_table" in unknown["what"] and unknown["what"] not in what.values(),
+          "an unregistered table gets a generic description, not another table's")
+
+
+def test_aggregate_reads_the_manifests_external_table() -> None:
+    section("remote_job.aggregate - external metrics come from the manifest's own table")
+    import json
+
+    from scripts.remote_job import aggregate
+
+    items = [{"kind": "train", "arm": "full", "seed": 42, "pack": "full_s42"}]
+
+    def run(external_file: str, files: dict) -> float | None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pack = os.path.join(tmp, "full_s42")
+            os.makedirs(pack)
+            files = {"metrics.json": {"best_epoch": 3,
+                                      "test": {"stability": {"pearson": 0.5, "rmse": 1.0}}},
+                     **files}
+            for name, doc in files.items():
+                with open(os.path.join(pack, name), "w", encoding="utf-8") as fh:
+                    json.dump(doc, fh)
+            ctx = {"out_root": tmp, "external_file": external_file}
+            return aggregate({}, items, ctx)["arms"]["full"]["ext_pearson"]["mean"]
+
+    def doc(r: float) -> dict:
+        return {"metrics": {"pearson": r, "rmse": 1.0}}
+
+    check(run("data/s669_holdout.parquet",
+              {"external_s669_holdout.json": doc(0.31), "external_fireprotdb.json": doc(0.99)})
+          == 0.31, "an S669 manifest reads external_s669_holdout.json, not the legacy file")
+    check(run("data/s669_holdout.parquet", {"external_fireprotdb.json": doc(0.99)}) is None,
+          "an S669 manifest never reports FireProtDB's legacy file as its own number")
+    check(run("data/fireprotdb_holdout.parquet", {"external_fireprotdb.json": doc(0.99)}) == 0.99,
+          "a pack made before the rename (legacy file only) is still read for FireProtDB")
+    check(run("data/fireprotdb_holdout.parquet",
+              {"external_fireprotdb_holdout.json": doc(0.42),
+               "external_fireprotdb.json": doc(0.99)}) == 0.42,
+          "when both exist the table's own file wins over the legacy one")
+
+
 TESTS = [
     test_items_are_seed_major_and_paired,
     test_scorer_guards_sign_and_common_rows,
@@ -226,6 +304,8 @@ TESTS = [
     test_input_discovery_flattens_kaggle_folders,
     test_resume_restores_finished_items,
     test_plan_reprojects_and_cuts_in_order,
+    test_external_results_are_keyed_by_table,
+    test_aggregate_reads_the_manifests_external_table,
 ]
 
 

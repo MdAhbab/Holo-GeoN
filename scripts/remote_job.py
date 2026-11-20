@@ -604,6 +604,22 @@ def train_facts(metrics_path: str, ctx: dict, seconds: float) -> dict:
 # ---------------------------------------------------------------------------
 # Aggregation
 # ---------------------------------------------------------------------------
+def _read_external_result(pack: str, ctx: dict) -> dict | None:
+    """The external-eval JSON of one pack, for the manifest's external table.
+
+    scripts/eval_external writes ``external_{key}.json`` (key = the data file's
+    stem). Packs made before that hold only ``external_fireprotdb.json``; it is
+    read as a fallback for a ``fireprotdb*`` table only, so a pack never has
+    another table's numbers passed off as this one's.
+    """
+    ext_file = ctx.get("external_file", "data/fireprotdb_holdout.parquet")
+    key = os.path.splitext(os.path.basename(ext_file))[0]
+    found = _read_json(os.path.join(pack, f"external_{key}.json"))
+    if found is None and key.startswith("fireprotdb"):
+        found = _read_json(os.path.join(pack, "external_fireprotdb.json"))
+    return found
+
+
 def aggregate(manifest: dict, items: list[dict], ctx: dict) -> dict:
     rows: dict[str, dict[int, dict]] = {}
     for it in items:
@@ -614,7 +630,7 @@ def aggregate(manifest: dict, items: list[dict], ctx: dict) -> dict:
         if not m:
             continue
         test = (m.get("test") or {}).get("stability") or {}
-        ext = (_read_json(os.path.join(pack, "external_fireprotdb.json")) or {}).get("metrics") or {}
+        ext = (_read_external_result(pack, ctx) or {}).get("metrics") or {}
         rows.setdefault(it["arm"], {})[it["seed"]] = {
             "test_pearson": test.get("pearson"), "test_rmse": test.get("rmse"),
             "ext_pearson": ext.get("pearson"), "ext_rmse": ext.get("rmse"),
