@@ -5,6 +5,13 @@ import type {
   DdgResponse,
   ScanRequest,
   ScanResponse,
+  ScanStreamStart,
+  ScanStreamChunk,
+  EpistasisRequest,
+  EpistasisResponse,
+  EpistasisStreamStart,
+  EpistasisStreamChunk,
+  StreamError,
   IdrRequest,
   IdrResponse,
   CompareRequest,
@@ -18,6 +25,26 @@ const client = axios.create({
   baseURL: '/api',
   headers: { 'Content-Type': 'application/json' },
 })
+
+export interface StreamHandlers<TStart, TChunk, TResult> {
+  onStart?: (data: TStart) => void
+  onChunk?: (data: TChunk) => void
+  onResult?: (data: TResult) => void
+  onError?: (err: StreamError) => void
+  signal?: AbortSignal
+}
+
+export type ScanStreamHandlers = StreamHandlers<
+  ScanStreamStart,
+  ScanStreamChunk,
+  ScanResponse
+>
+
+export type EpistasisStreamHandlers = StreamHandlers<
+  EpistasisStreamStart,
+  EpistasisStreamChunk,
+  EpistasisResponse
+>
 
 export async function getHealth(): Promise<HealthResponse> {
   const res = await client.get<HealthResponse>('/health')
@@ -34,6 +61,11 @@ export async function postScan(payload: ScanRequest): Promise<ScanResponse> {
   return res.data
 }
 
+export async function postEpistasis(payload: EpistasisRequest): Promise<EpistasisResponse> {
+  const res = await client.post<EpistasisResponse>('/epistasis', payload)
+  return res.data
+}
+
 export async function postIdr(payload: IdrRequest): Promise<IdrResponse> {
   const res = await client.post<IdrResponse>('/idr', payload)
   return res.data
@@ -42,6 +74,139 @@ export async function postIdr(payload: IdrRequest): Promise<IdrResponse> {
 export async function postCompare(payload: CompareRequest): Promise<CompareResponse> {
   const res = await client.post<CompareResponse>('/compare', payload)
   return res.data
+}
+
+/**
+ * Internal helper for POST text/event-stream endpoints (/api/scan/stream, /api/epistasis/stream).
+ * Surfaces pre-stream HTTP refusals (400 / 503) with their {detail} message and parses
+ * potentially multi-chunk SSE frames cleanly.
+ */
+async function postSseStream<TStart, TChunk, TResult>(
+  path: string,
+  payload: unknown,
+  handlers?: StreamHandlers<TStart, TChunk, TResult>,
+  signal?: AbortSignal
+): Promise<TResult> {
+  const abortSignal = signal ?? handlers?.signal
+  const res = await fetch(`/api${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal: abortSignal,
+  })
+
+  if (!res.ok) {
+    let detail = `Request failed (${res.status})`
+    try {
+      const text = await res.text()
+      if (text) {
+        try {
+          const parsed = JSON.parse(text) as { detail?: string }
+          detail = parsed.detail || text
+        } catch {
+          detail = text
+        }
+      }
+    } catch {
+      // keep default status message
+    }
+    const errObj: StreamError = { status: res.status, detail }
+    handlers?.onError?.(errObj)
+    throw new Error(detail)
+  }
+
+  if (!res.body) {
+    const detail = 'Streaming response body is unavailable in this browser'
+    handlers?.onError?.({ status: 500, detail })
+    throw new Error(detail)
+  }
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let finalResult: TResult | null = null
+
+  const processFrame = (rawFrame: string) => {
+    let eventName = 'message'
+    const dataLines: string[] = []
+    for (const line of rawFrame.split('\n')) {
+      if (line.startsWith('event:')) {
+        eventName = line.slice(6).trim()
+      } else if (line.startsWith('data:')) {
+        dataLines.push(line.slice(5).trim())
+      }
+    }
+    if (dataLines.length === 0) return
+    const parsedData = JSON.parse(dataLines.join('\n'))
+    if (eventName === 'start') {
+      handlers?.onStart?.(parsedData as TStart)
+    } else if (eventName === 'chunk') {
+      handlers?.onChunk?.(parsedData as TChunk)
+    } else if (eventName === 'result') {
+      finalResult = parsedData as TResult
+      handlers?.onResult?.(finalResult)
+    } else if (eventName === 'error') {
+      const streamErr = parsedData as StreamError
+      handlers?.onError?.(streamErr)
+      throw new Error(streamErr.detail || `Stream failed (${streamErr.status})`)
+    }
+  }
+
+  while (true) {
+    const { value, done } = await reader.read()
+    if (value) {
+      buffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, '\n')
+    } else if (done) {
+      buffer += decoder.decode().replace(/\r\n/g, '\n')
+    }
+
+    let sepIdx: number
+    while ((sepIdx = buffer.indexOf('\n\n')) !== -1) {
+      const frame = buffer.slice(0, sepIdx)
+      buffer = buffer.slice(sepIdx + 2)
+      if (frame.trim()) {
+        processFrame(frame)
+      }
+    }
+
+    if (done) {
+      if (buffer.trim()) {
+        processFrame(buffer)
+      }
+      break
+    }
+  }
+
+  if (finalResult === null) {
+    throw new Error('Stream ended before emitting a final result event')
+  }
+  return finalResult
+}
+
+export async function streamScan(
+  payload: ScanRequest,
+  handlers?: ScanStreamHandlers,
+  signal?: AbortSignal
+): Promise<ScanResponse> {
+  return postSseStream<ScanStreamStart, ScanStreamChunk, ScanResponse>(
+    '/scan/stream',
+    payload,
+    handlers,
+    signal
+  )
+}
+
+export async function streamEpistasis(
+  payload: EpistasisRequest,
+  handlers?: EpistasisStreamHandlers,
+  signal?: AbortSignal
+): Promise<EpistasisResponse> {
+  return postSseStream<EpistasisStreamStart, EpistasisStreamChunk, EpistasisResponse>(
+    '/epistasis/stream',
+    payload,
+    handlers,
+    signal
+  )
 }
 
 /**
