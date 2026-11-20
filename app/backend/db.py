@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional
 DB_PATH = Path(os.environ.get("HOLOGEON_DB", Path(__file__).resolve().parent / "holo_geon_history.db"))
 
 # Allowed prediction kinds (also used to validate the ?kind= filter).
-KINDS = ("ddg", "scan", "idr", "compare")
+KINDS = ("ddg", "scan", "idr", "compare", "epistasis")
 
 
 def _connect() -> sqlite3.Connection:

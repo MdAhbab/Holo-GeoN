@@ -9,6 +9,12 @@ Every prediction endpoint requires a loaded model. There is no demo mode and no
 heuristic fallback, so a request made without a trained checkpoint returns 503
 with the reason rather than a plausible-looking number. `demo_mode` has been
 removed from the API contract, the database schema and the frontend types.
+
+v2 additions (see app/API_V2.md): /api/epistasis (+ /stream), optional `cds` on
+/api/ddg and /api/scan with both paths side by side, a structure-free vs
+SE(3)-invariant-3D `mode`, /api/scan/stream for live progress, and pLDDT bands on
+/api/compare. Each refuses with 503/400 and the reason when it cannot be served
+honestly (untrained epistasis head, no ViennaRNA, no 3D checkpoint, bad CDS frame).
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ import requests as _requests
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, Response
+from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -39,7 +45,7 @@ from db import (
 # ---------------------------------------------------------------------------
 # Application setup
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Holo-GeoN API", version="2.0")
+app = FastAPI(title="Holo-GeoN API", version="2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -60,12 +66,29 @@ init_db()
 class DdgRequest(BaseModel):
     wt_sequence: str
     mutation: str
+    # Optional real coding sequence: validated as a reading frame that encodes this very
+    # protein; the response then carries the with-CDS and without-CDS paths side by side.
+    cds: Optional[str] = None
+    # "structure_free" (default; reads no coordinates) or "invariant_3d" (needs the optional
+    # 3D checkpoint and structure_pdb). compare_modes returns both, with the delta.
+    mode: str = "structure_free"
+    structure_pdb: Optional[str] = None
+    compare_modes: bool = False
 
 
 class ScanRequest(BaseModel):
     sequence: str
     start: int = 1
     end: Optional[int] = None
+    cds: Optional[str] = None
+    mode: str = "structure_free"
+    structure_pdb: Optional[str] = None
+
+
+class EpistasisRequest(BaseModel):
+    wt_sequence: str
+    pairs: List[str]               # e.g. ["L8P+V5A", "I13A+L15V"]
+    cds: Optional[str] = None
 
 
 class IdrRequest(BaseModel):
@@ -113,6 +136,89 @@ def _unavailable(exc: ModelUnavailable) -> Response:
     return _error(503, str(exc))
 
 
+def _loggable(model: BaseModel) -> Dict[str, Any]:
+    """The request as stored in history: a supplied structure is replaced by its size."""
+    d = _as_dict(model)
+    if d.get("structure_pdb"):
+        d["structure_pdb"] = f"<{len(d['structure_pdb'])} characters of PDB text>"
+    return d
+
+
+def _sse(event: str, data: Dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def _stream(events, kind: str, req: BaseModel, summarize) -> StreamingResponse:
+    """
+    Server-sent events for a long request: ``start``, ``chunk`` (progress + the new columns /
+    pairs), then ``result``, or ``error`` carrying the status the blocking endpoint would have
+    returned. Anything that can be refused was refused before this was called, so a bad
+    request is an HTTP error, not a half-written stream. The final result is stored in
+    history exactly as the blocking endpoint stores it.
+    """
+    def gen():
+        final = None
+        try:
+            for ev in events:
+                if ev["event"] == "result":
+                    final = ev["data"]
+                yield _sse(ev["event"], ev["data"])
+        except ModelUnavailable as exc:
+            yield _sse("error", {"status": 503, "detail": str(exc)})
+            return
+        except ValueError as exc:
+            yield _sse("error", {"status": 400, "detail": str(exc)})
+            return
+        except Exception as exc:  # noqa: BLE001
+            yield _sse("error", {"status": 500, "detail": f"{exc.__class__.__name__}: {exc}"})
+            return
+        if final is not None:
+            insert_prediction(kind, summarize(final), _loggable(req), final)
+
+    return StreamingResponse(
+        gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _scan_summary(result: Dict[str, Any]) -> str:
+    pos = result["positions"]
+    tags = []
+    if (result.get("cds") or {}).get("supplied"):
+        tags.append("with CDS")
+    if result.get("mode") == "invariant_3d":
+        tags.append("3D")
+    suffix = f" · {', '.join(tags)}" if tags else ""
+    return (f"Scan {len(pos)} positions (residues {pos[0]}–{pos[-1]}){suffix}"
+            if pos else "Scan (empty window)")
+
+
+def _epistasis_summary(result: Dict[str, Any]) -> str:
+    return f"Epistasis · {result['n_pairs']} pair(s) · L={result['length']}"
+
+
+def _plddt_summary(plddt: List[float]) -> Dict[str, Any]:
+    """AlphaFold's own confidence bands over a per-residue pLDDT list."""
+    if not plddt:
+        return {}
+    bands = {
+        "very_high_gt_90": sum(1 for v in plddt if v > 90),
+        "confident_70_90": sum(1 for v in plddt if 70 < v <= 90),
+        "low_50_70": sum(1 for v in plddt if 50 < v <= 70),
+        "very_low_le_50": sum(1 for v in plddt if v <= 50),
+    }
+    return {
+        "plddt_mean": round(sum(plddt) / len(plddt), 2),
+        "plddt_bands": bands,
+        "low_confidence_positions": [i + 1 for i, v in enumerate(plddt) if v < 70],
+        "plddt_note": (
+            "pLDDT describes the AlphaFold model drawn here, not the prediction: the structure-free model "
+            "reads no coordinates. Residues below 70 are usually disordered or poorly modelled, where a "
+            "folded-state ddG is less meaningful, so read the heatmap there with the same caution."
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # API endpoints
 # ---------------------------------------------------------------------------
@@ -127,14 +233,17 @@ def health() -> Dict:
 def ddg(req: DdgRequest):
     eng = get_engine()
     try:
-        result = eng.predict_ddg(req.wt_sequence, req.mutation)
+        result = eng.predict_ddg(
+            req.wt_sequence, req.mutation, cds=req.cds, mode=req.mode,
+            structure_pdb=req.structure_pdb, compare_modes=req.compare_modes,
+        )
     except ModelUnavailable as exc:
         return _unavailable(exc)
     except ValueError as exc:
         return _error(400, str(exc))
     summary = (f"ΔΔG {result['mutation']} = {result['ddg']:+.2f} kcal/mol "
                f"({result['verdict']})")
-    insert_prediction("ddg", summary, _as_dict(req), result)
+    insert_prediction("ddg", summary, _loggable(req), result)
     return result
 
 
@@ -142,16 +251,55 @@ def ddg(req: DdgRequest):
 def scan(req: ScanRequest):
     eng = get_engine()
     try:
-        result = eng.mutation_scan(req.sequence, req.start, req.end)
+        result = eng.mutation_scan(req.sequence, req.start, req.end, cds=req.cds, mode=req.mode,
+                                   structure_pdb=req.structure_pdb)
     except ModelUnavailable as exc:
         return _unavailable(exc)
     except ValueError as exc:
         return _error(400, str(exc))
-    pos = result["positions"]
-    summary = (f"Scan {len(pos)} positions (residues {pos[0]}–{pos[-1]})"
-               if pos else "Scan (empty window)")
-    insert_prediction("scan", summary, _as_dict(req), result)
+    insert_prediction("scan", _scan_summary(result), _loggable(req), result)
     return result
+
+
+@app.post("/api/scan/stream")
+def scan_stream(req: ScanRequest):
+    """The same scan as /api/scan, streamed per batch of sites so a long scan shows progress."""
+    eng = get_engine()
+    try:
+        events = eng.mutation_scan_events(req.sequence, req.start, req.end, cds=req.cds,
+                                          mode=req.mode, structure_pdb=req.structure_pdb)
+    except ModelUnavailable as exc:
+        return _unavailable(exc)
+    except ValueError as exc:
+        return _error(400, str(exc))
+    return _stream(events, "scan", req, _scan_summary)
+
+
+@app.post("/api/epistasis")
+def epistasis(req: EpistasisRequest):
+    """Double-mutant epistasis from the contact-gated Potts head; refused if that head is untrained."""
+    eng = get_engine()
+    try:
+        result = eng.predict_epistasis(req.wt_sequence, req.pairs, cds=req.cds)
+    except ModelUnavailable as exc:
+        return _unavailable(exc)
+    except ValueError as exc:
+        return _error(400, str(exc))
+    insert_prediction("epistasis", _epistasis_summary(result), _loggable(req), result)
+    return result
+
+
+@app.post("/api/epistasis/stream")
+def epistasis_stream(req: EpistasisRequest):
+    """The same request as /api/epistasis, streamed in batches of pairs."""
+    eng = get_engine()
+    try:
+        events = eng.epistasis_events(req.wt_sequence, req.pairs, cds=req.cds)
+    except ModelUnavailable as exc:
+        return _unavailable(exc)
+    except ValueError as exc:
+        return _error(400, str(exc))
+    return _stream(events, "epistasis", req, _epistasis_summary)
 
 
 @app.post("/api/idr")
@@ -247,6 +395,12 @@ def compare(req: CompareRequest):
             "sequence": sequence,
             "structure_pdb": structure_pdb,
             "plddt": plddt,
+            **_plddt_summary(plddt),
+            # aligned with min_ddg_per_position: True where the AlphaFold model is low confidence
+            "low_confidence_in_scan": [
+                bool(plddt[i] < 70) if i < len(plddt) else False
+                for i in range(len(min_ddg_per_position))
+            ],
             "pae": pae_matrix,
             "pae_downsampled": pae_downsampled,
             "min_ddg_per_position": min_ddg_per_position,

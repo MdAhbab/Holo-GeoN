@@ -22,9 +22,11 @@ from tests import helpers
 def main() -> int:
     from tests import (
         test_app,
+        test_app_v2,
         test_block_c,
         test_cli,
         test_dataset_etl,
+        test_figures,
         test_invariants,
         test_pipeline,
         test_remote_job,
@@ -37,6 +39,7 @@ def main() -> int:
         ("invariants", test_invariants.TESTS),
         ("pipeline", test_pipeline.TESTS),
         ("web backend", test_app.TESTS),
+        ("web backend v2 (epistasis / CDS / 3D mode / streaming)", test_app_v2.TESTS),
         ("cross-platform CLI", test_cli.TESTS),
         ("round-1 review regressions", test_round1_fixes.TESTS),
         ("round-2 review regressions", test_round2_fixes.TESTS),
@@ -44,6 +47,7 @@ def main() -> int:
         ("remote job runner", test_remote_job.TESTS),
         ("Holo-GeoN v2 & geometry invariants", test_v2.TESTS),
         ("Block C epistasis / competitors / Zenodo", test_block_c.TESTS),
+        ("paper figures & tables", test_figures.TESTS),
     ]
 
     errors: list[str] = []

@@ -244,6 +244,14 @@ def test_backend_with_model() -> None:
             check(status == 503,
                   f"/api/idr refuses because that head was never trained (got {status})")
 
+            status, epi = _request("/api/epistasis", {"wt_sequence": SEQ, "pairs": ["V5A+L8P"]})
+            check(status == 503 and "no epistasis head" in epi.get("detail", ""),
+                  f"/api/epistasis refuses on a v1 checkpoint, which has no such head (got {status})")
+            caps = health.get("capabilities", {})
+            check(caps.get("epistasis", {}).get("available") is False
+                  and "not SE(3)" in caps.get("modes", {}).get("structure_free", "").replace("NOT", "not"),
+                  "health reports its v2 capabilities (epistasis unavailable on v1) and the symmetry statement")
+
             status, body = _request("/api/ddg", {"wt_sequence": SEQ, "mutation": "A8P"})
             check(status == 400, "a wild-type mismatch is rejected with 400")
             status, body = _request("/api/ddg",
