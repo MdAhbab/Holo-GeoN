@@ -361,7 +361,7 @@ def standardize_s1724(df, pdb_lookup: dict[str, list[str]]) -> tuple[object, dic
         cols,
         ("pdb", "pdb_chain", "wt_pdb", "pdb_id", "pdb_wild", "pdb_code", "protein", "pdb_name", "name", "id"),
     )
-    chain_col = pick_col(cols, ("chain", "chain_id", "pdb_chain"))
+    chain_col = pick_col(cols, ("mutated_chain", "chain", "chain_id", "pdb_chain"))
     if chain_col == pdb_col:
         chain_col = None
     wt_seq_col = pick_col(cols, ("wt_seq", "parent_seq", "wildtype_seq", "wt_sequence"))
@@ -372,7 +372,7 @@ def standardize_s1724(df, pdb_lookup: dict[str, list[str]]) -> tuple[object, dic
         if hit is not None and hit not in row_seq_cols:
             row_seq_cols.append(hit)
 
-    mut_col = pick_col(cols, ("seq_mut", "mutation", "mut", "mut_type", "substitution", "pdb_mut", "variant"))
+    mut_col = pick_col(cols, ("paper_seq_muts", "mutation_code", "seq_mut", "mutation", "mut", "mut_type", "substitution", "pdb_mut", "variant"))
     pos_col = pick_col(cols, ("site", "pos", "position", "seq_pos", "resnum"))
     wt_col = pick_col(cols, ("wt_aa", "wt", "ref_aa", "wild_type"))
     mt_col = pick_col(cols, ("mt_aa", "mut_aa", "alt_aa", "mutant_aa"))
