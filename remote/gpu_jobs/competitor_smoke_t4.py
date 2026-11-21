@@ -32,6 +32,7 @@ os.environ["PYTHONUTF8"] = "1"
 os.environ["PYTHONIOENCODING"] = "utf-8"
 os.environ["PYTHONUNBUFFERED"] = "1"
 os.environ["GIT_TERMINAL_PROMPT"] = "0"
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 REPO_URL = os.environ.get("HOLO_REPO_URL", "https://github.com/MdAhbab/Holo-GeoN.git")
 REPO_BRANCH = os.environ.get("HOLO_REPO_BRANCH", "version-2")

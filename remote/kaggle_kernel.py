@@ -31,6 +31,7 @@ os.environ["PYTHONUTF8"] = "1"
 os.environ["PYTHONIOENCODING"] = "utf-8"
 os.environ["PYTHONUNBUFFERED"] = "1"
 os.environ["GIT_TERMINAL_PROMPT"] = "0"
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 SHARD = os.environ.get("HOLO_SHARD", "0/5")
 MANIFEST = os.environ.get("HOLO_MANIFEST", "configs/experiments/kaggle_v2_ablations.yaml")

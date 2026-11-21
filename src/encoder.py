@@ -223,6 +223,14 @@ class EsmEncoder(nn.Module):
         for p in self.model.parameters():
             p.requires_grad = False
         self.device = torch.device(device)
+        # On CUDA, keep the frozen 650M backbone in fp16 (while preserving
+        # contact_head in fp32 for exact APC/logistic precision). This halves
+        # weight and attention-map memory so long FireProtDB/ClinVar proteins
+        # (L up to 3,400) never OOM a 15 GB T4 during output_attentions=True.
+        self._use_fp16_cuda = self.device.type == "cuda"
+        if self._use_fp16_cuda:
+            self.model.half()
+            self.esm.contact_head.float()
         self.to(self.device)
         if self.dim is None:
             self.dim = int(self.esm.config.hidden_size)
@@ -235,15 +243,19 @@ class EsmEncoder(nn.Module):
 
     # ------------------------------------------------------------------
     @staticmethod
-    def _chunk_spans(length: int) -> list[tuple[int, int]]:
+    def _chunk_spans(
+        length: int,
+        max_context: int = MAX_CONTEXT_RESIDUES,
+        overlap: int = CHUNK_OVERLAP,
+    ) -> list[tuple[int, int]]:
         """Overlapping [start, end) spans covering a sequence of ``length``."""
-        if length <= MAX_CONTEXT_RESIDUES:
+        if length <= max_context:
             return [(0, length)]
-        stride = MAX_CONTEXT_RESIDUES - CHUNK_OVERLAP
+        stride = max(1, max_context - overlap)
         spans = []
         start = 0
         while start < length:
-            end = min(start + MAX_CONTEXT_RESIDUES, length)
+            end = min(start + max_context, length)
             spans.append((start, end))
             if end == length:
                 break
@@ -266,10 +278,10 @@ class EsmEncoder(nn.Module):
             output_attentions=True,
             output_hidden_states=True,
         )
-        emb = out.hidden_states[-1][0, 1:-1]
+        emb = out.hidden_states[-1][0, 1:-1].float().cpu()
         layer_embs = torch.stack(
             [out.hidden_states[i][0, 1:-1] for i in self.tap_layers], dim=0
-        )
+        ).float().cpu()
 
         # Wild-type marginal log-probabilities over the 20 standard amino acids
         # plus normalized site Shannon entropy H_i / log(20) in [0, 1].
@@ -277,26 +289,100 @@ class EsmEncoder(nn.Module):
         wt_logprobs = torch.log_softmax(logits_aa, dim=-1)
         probs = wt_logprobs.exp()
         site_entropy = -(probs * wt_logprobs).sum(dim=-1) / math.log(len(AA_ORDER))
+        wt_logprobs_cpu = wt_logprobs.cpu()
+        site_entropy_cpu = site_entropy.cpu()
 
         # Exact EsmModel.predict_contacts math from the ALREADY computed attentions.
-        attns = torch.stack(out.attentions, dim=1)
-        amask = toks["attention_mask"]
-        attns = attns * amask.unsqueeze(1).unsqueeze(2).unsqueeze(3)
-        attns = attns * amask.unsqueeze(1).unsqueeze(2).unsqueeze(4)
-        cm = self.esm.contact_head(toks["input_ids"], attns)[0]
+        # Free hidden_states/logits first and build the fp32 attention tensor
+        # layer-by-layer with in-place masking (avoids 3x redundant 2.8 GB copies
+        # that OOM 15 GB T4 GPUs on sequences >= 700 aa).
+        attns_list = list(out.attentions)
+        del out, logits_aa, wt_logprobs, probs, site_entropy
+        n_layers = len(attns_list)
+        b, n_heads, t_len, _ = attns_list[0].shape
+        attns = torch.empty(
+            (b, n_layers, n_heads, t_len, t_len),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        for li in range(n_layers):
+            attns[:, li] = attns_list[li].float()
+            attns_list[li] = None  # release fp16 slice immediately
+        del attns_list
+
+        amask = toks["attention_mask"].to(dtype=torch.float32)
+        if not bool(amask.all()):
+            attns.mul_(amask.unsqueeze(1).unsqueeze(2).unsqueeze(3))
+            attns.mul_(amask.unsqueeze(1).unsqueeze(2).unsqueeze(4))
+        cm = self.esm.contact_head(toks["input_ids"], attns)[0].float().cpu()
+        del attns, amask, toks
+        if self.device.type == "cuda" and t_len > 512:
+            torch.cuda.empty_cache()
 
         return (
-            emb.float().cpu(),
-            layer_embs.float().cpu(),
-            wt_logprobs.float().cpu(),
-            site_entropy.float().cpu(),
-            cm.float().cpu(),
+            emb,
+            layer_embs,
+            wt_logprobs_cpu,
+            site_entropy_cpu,
+            cm,
         )
+
+    @torch.no_grad()
+    def _encode_with_chunk_limit(
+        self, seq: str, top_k: int, min_sep: int, max_context: int, overlap: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        L = len(seq)
+        spans = self._chunk_spans(L, max_context=max_context, overlap=overlap)
+        if len(spans) == 1:
+            emb, layer_embs, wt_logprobs, site_entropy, cm = self._forward_chunk(seq)
+            edges, probs = sparse_topk_contacts(cm, top_k, min_sep)
+            return emb, layer_embs, wt_logprobs, site_entropy, edges, probs
+
+        k_layers = len(self.tap_layers)
+        emb = torch.zeros((L, self.dim), dtype=torch.float32)
+        layer_embs = torch.zeros((k_layers, L, self.dim), dtype=torch.float32)
+        wt_logprobs = torch.zeros((L, len(AA_ORDER)), dtype=torch.float32)
+        site_entropy = torch.zeros((L,), dtype=torch.float32)
+        best_score = torch.full((L,), -1.0)
+        all_edges, all_probs = [], []
+        for start, end in spans:
+            c_emb, c_layers, c_lp, c_ent, c_cm = self._forward_chunk(seq[start:end])
+            score = chunk_context_score(L, start, end)
+            take = score > best_score[start:end]
+            emb[start:end][take] = c_emb[take]
+            layer_embs[:, start:end][:, take] = c_layers[:, take]
+            wt_logprobs[start:end][take] = c_lp[take]
+            site_entropy[start:end][take] = c_ent[take]
+            best_score[start:end][take] = score[take]
+
+            e, p = sparse_topk_contacts(c_cm, top_k, min_sep, offset=start)
+            if e.numel():
+                all_edges.append(e)
+                all_probs.append(p)
+        if all_edges:
+            edges = torch.cat(all_edges, dim=1)
+            probs = torch.cat(all_probs)
+            flat = edges[0].to(torch.int64) * L + edges[1].to(torch.int64)
+            uniq, inverse = torch.unique(flat, return_inverse=True)
+            best = torch.zeros(uniq.numel(), dtype=probs.dtype)
+            best.scatter_reduce_(0, inverse, probs, reduce="amax", include_self=False)
+            edges = torch.stack(
+                [(uniq // L).to(torch.int32), (uniq % L).to(torch.int32)], dim=0
+            )
+            probs = best
+        else:
+            edges = torch.zeros((2, 0), dtype=torch.int32)
+            probs = torch.zeros(0)
+        return emb, layer_embs, wt_logprobs, site_entropy, edges, probs
 
     @torch.no_grad()
     def encode(self, seq: str, top_k: int = 24, min_sep: int = 3) -> dict:
         """
         Encode one protein in a single ESM-2 pass per chunk.
+
+        On CUDA OOM for long proteins, automatically clears cache and retries
+        with smaller overlapping chunks (512 -> 384) so 15 GB GPUs encode
+        arbitrary-length holdout proteins without failure.
 
         Returns ``{"seq", "emb" (L, d) fp16, "layer_embs" (K, L, d) fp16,
         "wt_logprobs" (L, 20) fp16, "site_entropy" (L,) fp16,
@@ -307,46 +393,21 @@ class EsmEncoder(nn.Module):
         if L == 0:
             raise ValueError("cannot encode an empty sequence")
 
-        spans = self._chunk_spans(L)
-        if len(spans) == 1:
-            emb, layer_embs, wt_logprobs, site_entropy, cm = self._forward_chunk(seq)
-            edges, probs = sparse_topk_contacts(cm, top_k, min_sep)
-        else:
-            k_layers = len(self.tap_layers)
-            emb = torch.zeros((L, self.dim), dtype=torch.float32)
-            layer_embs = torch.zeros((k_layers, L, self.dim), dtype=torch.float32)
-            wt_logprobs = torch.zeros((L, len(AA_ORDER)), dtype=torch.float32)
-            site_entropy = torch.zeros((L,), dtype=torch.float32)
-            best_score = torch.full((L,), -1.0)
-            all_edges, all_probs = [], []
-            for start, end in spans:
-                c_emb, c_layers, c_lp, c_ent, c_cm = self._forward_chunk(seq[start:end])
-                score = chunk_context_score(L, start, end)
-                take = score > best_score[start:end]
-                emb[start:end][take] = c_emb[take]
-                layer_embs[:, start:end][:, take] = c_layers[:, take]
-                wt_logprobs[start:end][take] = c_lp[take]
-                site_entropy[start:end][take] = c_ent[take]
-                best_score[start:end][take] = score[take]
-
-                e, p = sparse_topk_contacts(c_cm, top_k, min_sep, offset=start)
-                if e.numel():
-                    all_edges.append(e)
-                    all_probs.append(p)
-            if all_edges:
-                edges = torch.cat(all_edges, dim=1)
-                probs = torch.cat(all_probs)
-                flat = edges[0].to(torch.int64) * L + edges[1].to(torch.int64)
-                uniq, inverse = torch.unique(flat, return_inverse=True)
-                best = torch.zeros(uniq.numel(), dtype=probs.dtype)
-                best.scatter_reduce_(0, inverse, probs, reduce="amax", include_self=False)
-                edges = torch.stack(
-                    [(uniq // L).to(torch.int32), (uniq % L).to(torch.int32)], dim=0
+        last_oom: Exception | None = None
+        for max_ctx, ov in ((MAX_CONTEXT_RESIDUES, CHUNK_OVERLAP), (512, 128), (384, 96)):
+            try:
+                emb, layer_embs, wt_logprobs, site_entropy, edges, probs = (
+                    self._encode_with_chunk_limit(seq, top_k, min_sep, max_ctx, ov)
                 )
-                probs = best
-            else:
-                edges = torch.zeros((2, 0), dtype=torch.int32)
-                probs = torch.zeros(0)
+                last_oom = None
+                break
+            except torch.cuda.OutOfMemoryError as exc:
+                last_oom = exc
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                continue
+        if last_oom is not None:
+            raise last_oom
 
         return {
             "seq": seq,
