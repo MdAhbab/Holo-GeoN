@@ -297,6 +297,74 @@ def test_aggregate_reads_the_manifests_external_table() -> None:
           "when both exist the table's own file wins over the legacy one")
 
 
+def test_per_item_sizing_and_no_persist_cache() -> None:
+    section("remote_job - per-arm-class sizing, eval_overhead=0, external_files, attach_coords, no-persist-cache")
+    from scripts.remote_job import Store, est_hours, expand_items, measured_sec_per_step, _write_json
+
+    manifest = {
+        "name": "test_v2",
+        "platform": "kaggle_t4",
+        "config": "configs/benchmark_v2.yaml",
+        "splits_file": "data/splits_megascale_id25.parquet",
+        "external_files": [
+            "data/fireprotdb_hf25.parquet",
+            "data/s669_holdout.parquet",
+            "data/s1724_thermomutdb_hf25.parquet",
+        ],
+        "sizing": {
+            "steps_per_epoch": 600,
+            "epochs": 15,
+            "sec_per_step": 0.050,
+            "eval_overhead": 0.0,
+            "strict_factor": 1.0,
+        },
+        "items": [
+            {"id": "precompute", "kind": "precompute"},
+            {"id": "attach_coords", "kind": "attach_coords"},
+            {"kind": "train", "arm": "full", "seeds": [42], "epochs": 10},
+            {
+                "kind": "train", "arm": "v1_baseline", "seeds": [42], "epochs": 10,
+                "steps_per_epoch": 4800, "sec_per_step": 0.100, "arm_class": "v1_baseline",
+            },
+        ],
+    }
+    items = expand_items(manifest)
+    v2_t = next(i for i in items if i["id"] == "full_s42")
+    v1_t = next(i for i in items if i["id"] == "v1_baseline_s42")
+    check(v2_t["needs"] == ["attach_coords"], "train depends on attach_coords when declared")
+    exts = [i for i in items if i["kind"] == "external" and i["needs"] == ["full_s42"]]
+    check(len(exts) == 3, f"3 external_files create 3 external items per run (got {len(exts)})")
+    check(exts[2]["external_file"] == "data/s1724_thermomutdb_hf25.parquet",
+          "each external item carries its own external_file")
+
+    sz = manifest["sizing"]
+    h_v2 = est_hours(v2_t, sz, 0.050)
+    h_v1 = est_hours(v1_t, sz, 0.050)
+    check(abs(h_v2 - (600 * 10 * 0.050 / 3600.0)) < 1e-9,
+          "eval_overhead=0.0 is preserved (not treated as falsy 0.10)")
+    check(abs(h_v1 - (4800 * 10 * 0.100 / 3600.0)) < 1e-9,
+          "v1_baseline uses its own steps_per_epoch (4800) and sec_per_step (0.100)")
+
+    with tempfile.TemporaryDirectory() as persist, tempfile.TemporaryDirectory() as run1:
+        cache_dir = os.path.join(run1, "cache")
+        os.makedirs(cache_dir)
+        with open(os.path.join(cache_dir, "dummy.pt"), "w") as fh:
+            fh.write("x")
+        st = Store(run1, persist, cache_dir, persist_cache=False)
+        st.save({"id": "precompute", "kind": "precompute", "pack": "precompute"},
+                {"id": "precompute", "returncode": 0})
+        check(st.is_done("precompute"), "local precompute DONE marker written")
+        check(not os.path.exists(os.path.join(persist, "packs", "cache")),
+              "persist_cache=False does NOT mirror multi-GB cache into persistent storage")
+        # v1_baseline sec_per_step must not poison default v2 measured_sec_per_step
+        _write_json(os.path.join(st.done_dir, "full_s42.json"),
+                    {"id": "full_s42", "arm_class": None, "sec_per_step": 0.045})
+        _write_json(os.path.join(st.done_dir, "v1_baseline_s42.json"),
+                    {"id": "v1_baseline_s42", "arm_class": "v1_baseline", "sec_per_step": 0.140})
+        check(abs(measured_sec_per_step(st.done_dir) - 0.045) < 1e-9,
+              "v1_baseline step time does not skew v2 measured_sec_per_step")
+
+
 TESTS = [
     test_items_are_seed_major_and_paired,
     test_scorer_guards_sign_and_common_rows,
@@ -306,6 +374,7 @@ TESTS = [
     test_plan_reprojects_and_cuts_in_order,
     test_external_results_are_keyed_by_table,
     test_aggregate_reads_the_manifests_external_table,
+    test_per_item_sizing_and_no_persist_cache,
 ]
 
 

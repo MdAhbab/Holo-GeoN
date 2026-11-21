@@ -101,27 +101,45 @@ def expand_items(manifest: dict) -> list[dict]:
         if spec.get("phase", "pre") == "pre":
             items.append(_plain_item(spec))
 
+    ext_list = manifest.get("external_files")
+    pre_needs = ["precompute"] if _has_id(manifest, "precompute") else []
+    if _has_id(manifest, "attach_coords"):
+        pre_needs = ["attach_coords"]
+
     for seed in seeds:
         for spec in train_specs:
             if seed not in spec.get("seeds", []):
                 continue
             tid = f"{spec['arm']}_s{seed}"
-            items.append({
+            t_item = {
                 "id": tid, "kind": "train", "arm": spec["arm"], "seed": seed,
                 "flags": list(spec.get("flags", [])), "epochs": spec.get("epochs"),
                 "strict": bool(spec.get("strict", False)), "pack": tid,
-                "needs": ["precompute"] if _has_id(manifest, "precompute") else [],
-            })
+                "needs": list(pre_needs),
+            }
+            for opt_k in ("steps_per_epoch", "sec_per_step", "arm_class"):
+                if opt_k in spec and spec[opt_k] is not None:
+                    t_item[opt_k] = spec[opt_k]
+            items.append(t_item)
             if spec.get("export", False):
                 items.append({
                     "id": f"exp_{tid}", "kind": "export", "arm": spec["arm"],
                     "seed": seed, "needs": [tid], "pack": tid,
                 })
             if spec.get("external", True):
-                items.append({
-                    "id": f"ext_{tid}", "kind": "external", "arm": spec["arm"],
-                    "seed": seed, "needs": [tid], "pack": tid,
-                })
+                if ext_list:
+                    for ext_p in ext_list:
+                        stem = os.path.splitext(os.path.basename(str(ext_p)))[0]
+                        items.append({
+                            "id": f"ext_{tid}_{stem}", "kind": "external",
+                            "arm": spec["arm"], "seed": seed, "needs": [tid],
+                            "pack": tid, "external_file": str(ext_p),
+                        })
+                else:
+                    items.append({
+                        "id": f"ext_{tid}", "kind": "external", "arm": spec["arm"],
+                        "seed": seed, "needs": [tid], "pack": tid,
+                    })
 
     for spec in manifest.get("items", []):
         if spec.get("kind") != "train" and spec.get("phase", "pre") == "post":
@@ -204,8 +222,18 @@ def est_hours(item: dict, sz: dict, sec_per_step: float) -> float:
     kind = item["kind"]
     if kind == "train":
         epochs = item.get("epochs") or sz["epochs"]
-        hours = sz["steps_per_epoch"] * epochs * sec_per_step \
-            * (1.0 + sz.get("eval_overhead", 0.10)) / 3600.0
+        spe = int(item.get("steps_per_epoch") or sz["steps_per_epoch"])
+        # Per-item sec_per_step (e.g. v1_baseline or 3D arm class) scales
+        # proportionally when a caller overrides sec_per_step via --sec-per-step.
+        base_sps = float(sz["sec_per_step"])
+        if item.get("sec_per_step") is not None:
+            item_sps = float(item["sec_per_step"])
+            if base_sps > 0 and abs(sec_per_step - base_sps) > 1e-12:
+                item_sps = item_sps * (sec_per_step / base_sps)
+        else:
+            item_sps = sec_per_step
+        eval_oh = float(sz["eval_overhead"]) if "eval_overhead" in sz else 0.10
+        hours = spe * epochs * item_sps * (1.0 + eval_oh) / 3600.0
         if item.get("strict"):
             hours *= sz.get("strict_factor", 1.3)
         return hours
@@ -219,7 +247,7 @@ def measured_sec_per_step(done_dir: str) -> float | None:
     if os.path.isdir(done_dir):
         for name in os.listdir(done_dir):
             d = _read_json(os.path.join(done_dir, name))
-            if d and d.get("sec_per_step"):
+            if d and d.get("sec_per_step") and d.get("arm_class") in (None, "v2", "default"):
                 vals.append(float(d["sec_per_step"]))
     return statistics.median(vals) if vals else None
 
@@ -306,6 +334,8 @@ def find_inputs(roots: list[str], names: tuple[str, ...], max_depth: int = 7) ->
 
 
 def stage_inputs(roots: list[str], extra_files: tuple[str, ...] = ()) -> dict:
+    import tarfile
+
     data_dir = os.path.join(ROOT, "data")
     os.makedirs(data_dir, exist_ok=True)
     extra = (
@@ -314,8 +344,14 @@ def stage_inputs(roots: list[str], extra_files: tuple[str, ...] = ()) -> dict:
         "splits_megascale_fold_tm60.parquet",
         "fireprotdb_hf25.parquet",
         "s669_holdout.parquet",
+        "s1724_thermomutdb_holdout.parquet",
+        "s1724_thermomutdb_hf25.parquet",
         "domainome_apca_hf25.parquet",
         "invariant_backbone_geometry.npz",
+        "megascale_double_mutants_id25.parquet",
+        "megascale_double_mutants_fold_tm60.parquet",
+        "megascale_double_mutants_id30.parquet",
+        "true_contacts_megascale.tar.gz",
     ) + tuple(extra_files)
     all_names = tuple(dict.fromkeys(REQUIRED_INPUTS + extra))
     present = {n: os.path.join(data_dir, n) for n in all_names
@@ -330,6 +366,31 @@ def stage_inputs(roots: list[str], extra_files: tuple[str, ...] = ()) -> dict:
             except OSError:
                 shutil.copy2(src, dst)
             present[name] = dst
+
+    # Populate data/true_contacts/ from tar.gz OR Kaggle's auto-extracted folder
+    tc_dir = os.path.join(data_dir, "true_contacts")
+    if not (os.path.isdir(tc_dir) and any(f.endswith(".npy") for f in os.listdir(tc_dir))):
+        os.makedirs(tc_dir, exist_ok=True)
+        tc_tar = present.get("true_contacts_megascale.tar.gz")
+        if tc_tar and os.path.isfile(tc_tar) and tarfile.is_tarfile(tc_tar):
+            with tarfile.open(tc_tar, "r:gz") as tf:
+                tf.extractall(tc_dir)
+        else:
+            for root in roots:
+                if not os.path.isdir(root):
+                    continue
+                for dirpath, _, filenames in os.walk(root):
+                    npys = [f for f in filenames if f.endswith(".npy") and len(f) == 44]
+                    if len(npys) >= 10:
+                        for f in npys:
+                            dst = os.path.join(tc_dir, f)
+                            if not os.path.exists(dst):
+                                try:
+                                    os.symlink(os.path.join(dirpath, f), dst)
+                                except OSError:
+                                    shutil.copy2(os.path.join(dirpath, f), dst)
+                        break
+
     absent = [n for n in REQUIRED_INPUTS if n not in present]
     if absent:
         raise SystemExit(
@@ -395,18 +456,24 @@ def env_report(device: str) -> dict:
 class Store:
     """Local out_root plus optional persistent mirror."""
 
-    def __init__(self, out_root: str, persist: str | None, cache: str):
+    def __init__(self, out_root: str, persist: str | None, cache: str,
+                 persist_cache: bool = True):
         self.out_root, self.persist, self.cache = out_root, persist, cache
+        self.persist_cache = bool(persist_cache)
         self.done_dir = os.path.join(out_root, "_done")
         os.makedirs(self.done_dir, exist_ok=True)
 
     def pack_path(self, item: dict) -> str:
-        return self.cache if item["kind"] == "precompute" else os.path.join(self.out_root, item["pack"])
+        if item["kind"] in ("precompute", "attach_coords"):
+            return self.cache
+        return os.path.join(self.out_root, item["pack"])
 
     def _persist_pack(self, item: dict) -> str | None:
         if not self.persist:
             return None
-        return os.path.join(self.persist, "packs", "cache" if item["kind"] == "precompute" else item["pack"])
+        if item["kind"] in ("precompute", "attach_coords"):
+            return os.path.join(self.persist, "packs", "cache") if self.persist_cache else None
+        return os.path.join(self.persist, "packs", item["pack"])
 
     def is_done(self, item_id: str) -> bool:
         return os.path.isfile(os.path.join(self.done_dir, item_id + ".json"))
@@ -492,11 +559,20 @@ def build_cmd(item: dict, ctx: dict) -> list[str]:
     kind = item["kind"]
     if kind == "precompute":
         data_args = ["data/megascale_ddg_pairs.parquet", external_file]
-        for opt_ext in ("data/fireprotdb_holdout.parquet", "data/s669_holdout.parquet"):
+        extra_tables = [
+            "data/fireprotdb_holdout.parquet",
+            "data/s669_holdout.parquet",
+            "data/s1724_thermomutdb_hf25.parquet",
+        ] + list(ctx.get("external_files") or [])
+        for opt_ext in extra_tables:
             if opt_ext not in data_args and os.path.isfile(os.path.join(ROOT, opt_ext)):
                 data_args.append(opt_ext)
         return [py, "-m", "scripts.precompute_embeddings", "--data", *data_args,
                 "--config", cfg, "--cache", cache, "--device", dev]
+    if kind == "attach_coords":
+        geom_npz = item.get("geom_npz", "data/invariant_backbone_geometry.npz")
+        return [py, "-m", "scripts.attach_coords", "--geom-npz", geom_npz,
+                "--cache", cache, "--report", os.path.join(ctx["out_root"], "attach_coords.json")]
     if kind == "train":
         cmd = [py, "-m", "scripts.train", "--config", cfg,
                "--stability-splits", splits_file,
@@ -518,9 +594,10 @@ def build_cmd(item: dict, ctx: dict) -> list[str]:
                 "--config", cfg, "--cache", cache, "--device", dev,
                 "--out", os.path.join(out, "pred_test.parquet")]
     if kind == "external":
+        ext_target = item.get("external_file", external_file)
         return [py, "-m", "scripts.eval_external",
                 "--checkpoint", os.path.join(out, "model_best.pt"),
-                "--data", external_file, "--config", cfg,
+                "--data", ext_target, "--config", cfg,
                 "--cache", cache, "--device", dev, "--out", out]
     if kind == "baselines":
         return [py, "-m", "scripts.baselines", "--splits",
@@ -540,9 +617,14 @@ def preflight(item: dict, ctx: dict, store: Store) -> None:
     kind = item["kind"]
     if kind in ("precompute", "baselines", "train", "external", "export"):
         need += [os.path.join(ROOT, "data", n) for n in REQUIRED_INPUTS]
-    if kind in ("train", "external", "export", "baselines"):
+    if kind in ("train", "external", "export", "baselines", "attach_coords"):
         if not (os.path.isdir(ctx["cache"]) and os.listdir(ctx["cache"])):
             need.append(ctx["cache"] + "  (encoder cache is empty: precompute not done)")
+    if kind == "attach_coords":
+        need.append(os.path.join(ROOT, item.get("geom_npz", "data/invariant_backbone_geometry.npz")))
+    if kind == "external":
+        ext_target = item.get("external_file", ctx.get("external_file", "data/fireprotdb_holdout.parquet"))
+        need.append(os.path.join(ROOT, ext_target))
     if kind in ("external", "export"):
         need.append(os.path.join(store.pack_path(item), "model_best.pt"))
     for dep in item.get("needs", []):
@@ -576,20 +658,23 @@ def run_item(item: dict, ctx: dict, store: Store, hb: Heartbeat) -> dict:
         rc = proc.wait()
     seconds = time.time() - started
     rec = {"id": item["id"], "kind": item["kind"], "arm": item.get("arm"),
+           "arm_class": item.get("arm_class"),
            "seed": item.get("seed"), "returncode": rc, "seconds": round(seconds, 1),
            "finished_utc": utc()}
     if rc == 0 and item["kind"] == "train":
-        rec.update(train_facts(os.path.join(out, "metrics.json"), ctx, seconds))
+        rec.update(train_facts(os.path.join(out, "metrics.json"), ctx, seconds,
+                               steps_per_epoch=item.get("steps_per_epoch")))
     hb.state.update(item=None, log=None)
     return rec
 
 
-def train_facts(metrics_path: str, ctx: dict, seconds: float) -> dict:
+def train_facts(metrics_path: str, ctx: dict, seconds: float,
+                steps_per_epoch: int | None = None) -> dict:
     m = _read_json(metrics_path) or {}
     epochs_run = len(m.get("history", []))
     facts = {"epochs_run": epochs_run, "best_epoch": m.get("best_epoch"),
              "wall_clock_hours": m.get("wall_clock_hours")}
-    spe = ctx.get("steps_per_epoch")
+    spe = steps_per_epoch or ctx.get("steps_per_epoch")
     if epochs_run and spe:
         wall = (m.get("wall_clock_hours") or 0) * 3600 or seconds
         facts["sec_per_step"] = wall / (epochs_run * spe)
@@ -723,6 +808,8 @@ def main() -> None:
                     help="restore finished packs from --persist and write summary.*")
     ap.add_argument("--fail-fast", action="store_true")
     ap.add_argument("--num-workers", type=int, default=None)
+    ap.add_argument("--no-persist-cache", action="store_true",
+                    help="keep the ESM encoder cache in /tmp instead of mirroring into --persist (Kaggle)")
     args = ap.parse_args()
 
     with open(args.manifest, encoding="utf-8") as fh:
@@ -754,9 +841,10 @@ def main() -> None:
            "out_root": out_root, "steps_per_epoch": sz["steps_per_epoch"],
            "num_workers": args.num_workers or manifest.get("num_workers"),
            "splits_file": manifest.get("splits_file", "data/splits_megascale.parquet"),
-           "external_file": manifest.get("external_file", "data/fireprotdb_holdout.parquet")}
+           "external_file": manifest.get("external_file", "data/fireprotdb_holdout.parquet"),
+           "external_files": manifest.get("external_files")}
     os.makedirs(out_root, exist_ok=True)
-    store = Store(out_root, args.persist, cache)
+    store = Store(out_root, args.persist, cache, persist_cache=not args.no_persist_cache)
     job = f"{manifest['name']}:{args.shard or 'all'}:{int(time.time())}"
 
     if args.aggregate_only:
