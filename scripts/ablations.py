@@ -82,6 +82,7 @@ ARMS: dict[str, list[str]] = {
     "no_ssm": ["--no-ssm"],
     "no_esm_logits_prior": ["--no-esm-logits-prior"],
     "no_multi_layer": ["--no-multi-layer"],
+    "multi_layer_ln": ["--use-multi-layer"],
     "no_contact_burial": ["--no-contact-burial"],
     "standard_nll": ["--nll-beta", "0.0"],
     "no_cds_dropout": ["--cds-dropout", "0.0"],

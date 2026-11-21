@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src.features import N_MECH_CHANNELS
 from src.geometry import STR_NODE_DIM
@@ -306,7 +307,7 @@ class HoloBackboneV2(nn.Module):
 
         # 1. Learned scalar-mix over tapped ESM-2 layers (initialized to favor final layer)
         init_w = torch.zeros(n_tap_layers)
-        init_w[-1] = 1.0
+        init_w[-1] = 2.0
         self.layer_weights = nn.Parameter(init_w)
         self.layer_scale = nn.Parameter(torch.ones(()))
 
@@ -349,9 +350,12 @@ class HoloBackboneV2(nn.Module):
             and layer_embs.ndim == 4
             and layer_embs.shape[1] == self.layer_weights.numel()
         ):
-            # layer_embs: (B, K, L, D)
+            # Per-layer LayerNorm BEFORE scalar mixing prevents un-normalized
+            # intermediate ESM-2 residual streams (layers 18/24/30, which lack
+            # emb_layer_norm_after) from swamping the post-LN final layer 33.
+            normed = F.layer_norm(layer_embs.float(), (self.esm_dim,)).to(layer_embs.dtype)
             w = torch.softmax(self.layer_weights, dim=0).view(1, -1, 1, 1)
-            return self.layer_scale * (layer_embs * w).sum(dim=1)
+            return self.layer_scale * (normed * w).sum(dim=1)
         return esm
 
     def forward(

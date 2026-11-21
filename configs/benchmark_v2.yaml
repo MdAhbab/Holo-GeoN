@@ -53,7 +53,7 @@ use_geo_stream: true
 use_str_stream: false
 str_topology_only: false
 true_contact_edges: false
-use_multi_layer: true
+use_multi_layer: false
 use_contact_burial: true
 use_esm_logits_prior: true
 use_contact_gate: true

@@ -745,6 +745,8 @@ def main() -> None:
                     help="training-only CDS/E_mech modality dropout probability")
     ap.add_argument("--no-esm-logits-prior", action="store_true",
                     help="ablation (v2): disable WT-marginal ESM log-odds anchor")
+    ap.add_argument("--use-multi-layer", action="store_true",
+                    help="ablation (v2): enable per-layer-LN multi-layer ESM scalar-mix")
     ap.add_argument("--no-multi-layer", action="store_true",
                     help="ablation (v2): use last ESM layer only (no scalar-mix)")
     ap.add_argument("--no-contact-burial", action="store_true",
@@ -794,7 +796,9 @@ def main() -> None:
             "true_contact_edges": True if args.true_contact_edges else None,
             "true_contacts_dir": args.true_contacts_dir,
             "use_esm_logits_prior": False if args.no_esm_logits_prior else None,
-            "use_multi_layer": False if args.no_multi_layer else None,
+            "use_multi_layer": (
+                False if args.no_multi_layer else (True if args.use_multi_layer else None)
+            ),
             "use_contact_burial": False if args.no_contact_burial else None,
             "strict_determinism": True if args.strict_determinism else None,
         },

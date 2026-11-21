@@ -300,6 +300,31 @@ def test_competitor_models_and_common_io() -> None:
         check(y_batch.shape == (4,) and torch.allclose(y_batch, y_single, atol=1e-6),
               "ThermoMPNN batched head matches per-mutation evaluation (including B=1)")
 
+        # _load_true_contact_map loads <sha1>.npy cleanly (catches missing `import os`)
+        from src.data import _load_true_contact_map
+        from src.encoder import seq_key
+        tc_dir = Path(td) / "true_contacts"
+        tc_dir.mkdir()
+        seq_t = "ACDEFGHIK"
+        mat = np.eye(len(seq_t), dtype=np.float32)
+        np.save(tc_dir / f"{seq_key(seq_t)}.npy", mat)
+        loaded = _load_true_contact_map(seq_t, str(tc_dir))
+        check(loaded is not None and tuple(loaded.shape) == (len(seq_t), len(seq_t)),
+              "_load_true_contact_map loads <sha1>.npy without NameError")
+
+        # HoloBackboneV2._mix_esm normalizes each tapped layer before scalar mixing
+        from src.backbone import HoloBackboneV2
+        bb = HoloBackboneV2(esm_dim=16, hidden=16, out_dim=16, heads=2, n_tap_layers=4, use_multi_layer=True)
+        torch.manual_seed(0)
+        base_layers = torch.randn(1, 4, 6, 16)
+        scaled_layers = base_layers.clone()
+        scaled_layers[:, 0] *= 50.0  # huge intermediate-layer scale drift
+        scaled_layers[:, 1] *= 25.0
+        out_base = bb._mix_esm(base_layers[:, -1], base_layers)
+        out_scaled = bb._mix_esm(base_layers[:, -1], scaled_layers)
+        check(torch.allclose(out_base, out_scaled, atol=1e-5),
+              "HoloBackboneV2._mix_esm is invariant to per-layer scale mismatch via LayerNorm")
+
 
 def test_v2_manifests_and_zenodo_pack() -> None:
     section("block_c - v2 experiment manifests & Zenodo packager")
@@ -311,6 +336,7 @@ def test_v2_manifests_and_zenodo_pack() -> None:
     for fname, expected_arms, n_shards in (
         ("kaggle_v2_ablations.yaml", 11, 5),
         ("kaggle_v2_geometry.yaml", 5, 5),
+        ("kaggle_v2_clean_abl_geom.yaml", 14, 5),
         ("g4_v2_headline.yaml", 1, 1),
     ):
         m = yaml.safe_load((ROOT / "configs" / "experiments" / fname).read_text(encoding="utf-8"))
