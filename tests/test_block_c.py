@@ -256,6 +256,50 @@ def test_competitor_models_and_common_io() -> None:
               and cfg.true_contact_edges is True and cfg.true_contacts_dir == "data/true_contacts",
               "apply_checkpoint_graph_config propagates 3D and true-contact settings")
 
+        # ThermoMPNN Lightning checkpoint stripping & batched head exactness
+        from scripts.competitors.thermompnn import (
+            _forward_thermompnn_head,
+            _strip_lightning_state_dict,
+        )
+        sd_clean = _strip_lightning_state_dict({
+            "state_dict": {
+                "model.both_out.0.weight": torch.zeros(2, 2),
+                "model.ddg_out.bias": torch.zeros(1),
+                "metrics.val_metrics.ddG.r2": torch.tensor(0.5),
+            }
+        })
+        check(set(sd_clean.keys()) == {"both_out.0.weight", "ddg_out.bias"},
+              "ThermoMPNN _strip_lightning_state_dict strips model. prefix and drops metrics.*")
+
+        class _MockLA(torch.nn.Module):
+            def __init__(self, d: int):
+                super().__init__()
+                self.feature_convolution = torch.nn.Conv1d(d, d, 3, padding=1)
+                self.attention_convolution = torch.nn.Conv1d(d, d, 3, padding=1)
+                self.softmax = torch.nn.Softmax(dim=-1)
+                self.dropout = torch.nn.Dropout(0.0)
+
+        class _MockTM(torch.nn.Module):
+            def __init__(self, d: int = 8):
+                super().__init__()
+                self.lightattn = True
+                self.subtract_mut = True
+                self.light_attention = _MockLA(d)
+                self.both_out = torch.nn.Sequential(torch.nn.ReLU(), torch.nn.Linear(d, 21))
+                self.ddg_out = torch.nn.Linear(1, 1)
+
+        tm = _MockTM(8).eval()
+        rf = torch.randn(4, 8)
+        wi_t = torch.tensor([0, 1, 2, 3])
+        mi_t = torch.tensor([4, 5, 6, 7])
+        y_batch = _forward_thermompnn_head(tm, rf, wi_t, mi_t)
+        y_single = torch.stack([
+            _forward_thermompnn_head(tm, rf[i:i + 1], wi_t[i:i + 1], mi_t[i:i + 1])[0]
+            for i in range(4)
+        ])
+        check(y_batch.shape == (4,) and torch.allclose(y_batch, y_single, atol=1e-6),
+              "ThermoMPNN batched head matches per-mutation evaluation (including B=1)")
+
 
 def test_v2_manifests_and_zenodo_pack() -> None:
     section("block_c - v2 experiment manifests & Zenodo packager")

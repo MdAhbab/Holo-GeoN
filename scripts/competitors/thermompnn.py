@@ -66,56 +66,128 @@ def _match_pdb(parent: str, pdb_map: dict[str, Path]) -> Path | None:
     return Path(hit) if hit is not None else None
 
 
-def _extract_proteinmpnn_features(repo_dir: Path, pdb_paths: dict[str, tuple[Path, str, int]],
-                                  device: torch.device) -> dict[str, torch.Tensor]:
+def _strip_lightning_state_dict(raw_ckpt: dict) -> dict[str, torch.Tensor]:
+    """Extract a ``TransferModel`` state_dict from a Lightning or raw checkpoint."""
+    sd = raw_ckpt["state_dict"] if isinstance(raw_ckpt, dict) and "state_dict" in raw_ckpt else raw_ckpt
+    cleaned: dict[str, torch.Tensor] = {}
+    for k, v in sd.items():
+        if k.startswith("metrics."):
+            continue
+        cleaned[k[6:] if k.startswith("model.") else k] = v
+    return cleaned
+
+
+def _forward_thermompnn_head(
+    model: nn.Module,
+    res_feats: torch.Tensor,
+    wt_idx: torch.Tensor,
+    mt_idx: torch.Tensor,
+) -> torch.Tensor:
     """
-    Run ThermoMPNN's frozen ProteinMPNN backbone ONCE per unique parent PDB to
-    extract per-residue structural embeddings ``(L, d)`` aligned to ``wt_seq``.
+    Vectorized exact equivalent of ``TransferModel.forward``'s trainable head
+    (``light_attention`` + ``both_out`` + ``ddg_out`` + ``subtract_mut``) over
+    a batch of pre-extracted frozen ProteinMPNN residue features ``(B, D)``.
+    """
+    x = res_feats
+    if getattr(model, "lightattn", False):
+        x_in = x.unsqueeze(-1)  # (B, D, 1)
+        la = model.light_attention
+        o = la.dropout(la.feature_convolution(x_in))
+        attn = la.attention_convolution(x_in)
+        x = (o * la.softmax(attn)).squeeze(-1)  # (B, D)
+    both_input = model.both_out(x).unsqueeze(-1)  # (B, 21, 1)
+    ddg_out = model.ddg_out(both_input).squeeze(-1)  # (B, 21)
+    idx = torch.arange(ddg_out.size(0), device=ddg_out.device)
+    if getattr(model, "subtract_mut", True):
+        return ddg_out[idx, mt_idx] - ddg_out[idx, wt_idx]
+    return ddg_out[idx, mt_idx]
+
+
+def _extract_mpnn_residue_features(
+    model: nn.Module,
+    pdb_list: list[dict],
+    tied_featurize,
+    device: torch.device,
+) -> torch.Tensor:
+    """Run ThermoMPNN's frozen ProteinMPNN backbone ONCE for one PDB -> ``(L, D)``."""
+    with torch.no_grad():
+        feat = tied_featurize(
+            [pdb_list[0]], device, None, None, None, None, None, None, ca_only=False
+        )
+        X, S, mask, _lengths, chain_M, chain_encoding_all = feat[0], feat[1], feat[2], feat[3], feat[4], feat[5]
+        residue_idx = feat[12]
+        all_mpnn_hid, mpnn_embed, _ = model.prot_mpnn(
+            X, S, mask, chain_M, residue_idx, chain_encoding_all, None
+        )
+        parts = []
+        n_final = int(getattr(model, "num_final_layers", 2))
+        if n_final > 0:
+            parts.append(torch.cat(all_mpnn_hid[:n_final], dim=-1))
+        parts.append(mpnn_embed)
+        return torch.cat(parts, dim=-1)[0].detach().cpu()
+
+
+class _AttrDict(dict):
+    """Lightweight dict supporting attribute access + ``in`` checks (no omegaconf needed)."""
+
+    def __getattr__(self, key: str):
+        try:
+            return self[key]
+        except KeyError as exc:
+            raise AttributeError(key) from exc
+
+    def __setattr__(self, key: str, value) -> None:
+        self[key] = value
+
+
+def _load_thermompnn_model(repo_dir: Path, device: torch.device):
+    """
+    Instantiate ThermoMPNN's pure PyTorch ``TransferModel(cfg)`` (no
+    ``pytorch_lightning``, ``wandb``, or ``omegaconf`` needed) and load the
+    official checkpoint ``models/thermoMPNN_default.pt`` safely under PyTorch 2.x.
     """
     if str(repo_dir) not in sys.path:
         sys.path.append(str(repo_dir))
-    from omegaconf import OmegaConf
-    from transfer_model import TransferModel  # type: ignore
+    from protein_mpnn_utils import alt_parse_PDB, tied_featurize  # type: ignore
+    from transfer_model import ALPHABET as TM_ALPHABET, TransferModel  # type: ignore
 
-    cfg = OmegaConf.create({
-        "platform": {"thermompnn_dir": str(repo_dir)},
-        "model": {
-            "hidden_dims": [64, 32],
-            "subtract_mut": True,
-            "num_final_layers": 2,
-            "freeze_weights": True,
-            "load_pretrained": True,
-            "lightattn": True,
-            "lr": 1e-3,
-        },
-        "training": {"num_workers": 0, "learn_rate": 1e-3, "epochs": 10},
-    })
+    cfg = _AttrDict(
+        platform=_AttrDict(thermompnn_dir=str(repo_dir)),
+        model=_AttrDict(
+            hidden_dims=[64, 32],
+            subtract_mut=True,
+            num_final_layers=2,
+            freeze_weights=True,
+            load_pretrained=True,
+            lightattn=True,
+            lr=1e-3,
+        ),
+        training=_AttrDict(num_workers=0, learn_rate=1e-3, epochs=10),
+    )
     ckpt = repo_dir / "models" / "thermoMPNN_default.pt"
     if not ckpt.is_file():
         raise FileNotFoundError(f"Expected ThermoMPNN checkpoint at {ckpt}")
 
-    # Load ThermoMPNN's local datasets.py by explicit file path so pre-installed
-    # HuggingFace `datasets` package on Kaggle/Colab never shadows it.
-    import importlib.util
-
-    ds_file = repo_dir / "datasets.py"
-    if not ds_file.is_file():
-        raise FileNotFoundError(f"Expected ThermoMPNN datasets.py at {ds_file}")
-    spec = importlib.util.spec_from_file_location("thermompnn_datasets", str(ds_file))
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Could not build module spec for {ds_file}")
-    tm_ds = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(tm_ds)
-    alt_parse_PDB = tm_ds.alt_parse_PDB
-
+    # PyTorch 2.6+ defaults torch.load(weights_only=True); if upstream
+    # get_protein_mpnn() hits an unpickling error on vanilla weights, temporarily
+    # pass weights_only=False only for that load.
     try:
-        model = TransferModel.load_from_checkpoint(
-            str(ckpt), cfg=cfg, map_location=device, weights_only=False
-        )
-    except TypeError:
-        model = TransferModel.load_from_checkpoint(str(ckpt), cfg=cfg, map_location=device)
+        model = TransferModel(cfg)
+    except Exception:
+        _orig_load = torch.load
+        try:
+            def _load_compat(*a, **kw):
+                kw.setdefault("weights_only", False)
+                return _orig_load(*a, **kw)
+            torch.load = _load_compat  # type: ignore[assignment]
+            model = TransferModel(cfg)
+        finally:
+            torch.load = _orig_load
+
+    raw = torch.load(str(ckpt), map_location="cpu", weights_only=False)
+    model.load_state_dict(_strip_lightning_state_dict(raw), strict=True)
     model.eval().to(device)
-    return model, alt_parse_PDB
+    return model, alt_parse_PDB, tied_featurize, TM_ALPHABET
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -128,6 +200,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--work-dir", default="/tmp/competitors/ThermoMPNN")
     ap.add_argument("--out", required=True)
     ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--batch-size", type=int, default=512)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--official-external-only", action="store_true",
@@ -145,34 +218,36 @@ def main(argv: list[str] | None = None) -> int:
     if str(repo_dir) not in sys.path:
         sys.path.append(str(repo_dir))
 
-    model, alt_parse_PDB = _extract_proteinmpnn_features(repo_dir, {}, device)
-    from protein_mpnn_utils import tied_featurize  # type: ignore
+    model, alt_parse_PDB, tied_featurize, tm_alphabet = _load_thermompnn_model(repo_dir, device)
+    aa_to_tm = {aa: idx for idx, aa in enumerate(tm_alphabet)}
 
-    def _score_official_table(df: pd.DataFrame, pdb_map: dict[str, Path],
-                              par_col: str, seq_col: str) -> tuple[np.ndarray, np.ndarray]:
+    def _score_table_direct(df: pd.DataFrame, pdb_map: dict[str, Path],
+                            par_col: str, seq_col: str) -> tuple[np.ndarray, np.ndarray]:
         rids, preds = [], []
         for parent, grp in df.groupby(par_col, sort=False):
             pfile = _match_pdb(str(parent), pdb_map)
             if pfile is None:
                 continue
-            pdb_seq, _ = parse_pdb_cb(str(pfile))
+            pdb_list = alt_parse_PDB(str(pfile))
+            if not pdb_list or "seq" not in pdb_list[0]:
+                continue
+            pdb_seq = str(pdb_list[0]["seq"]).upper()
             wt_seq = str(grp[seq_col].iloc[0]).upper()
-            off, _, err = align_to_sequence(pdb_seq, wt_seq)
+            off, _, _err = align_to_sequence(pdb_seq, wt_seq)
             if off is None:
                 continue
-            pdb_dict = alt_parse_PDB(str(pfile))[0]
             mut_list = []
             valid_rids = []
             for r in grp.itertuples(index=False):
                 site = int(r.site) + off
                 w, m_aa = str(r.wt_aa).upper(), str(r.mt_aa).upper()
-                if 0 <= site < len(pdb_seq) and w in AA_ORDER and m_aa in AA_ORDER:
+                if 0 <= site < len(pdb_seq) and w in aa_to_tm and m_aa in aa_to_tm:
                     mut_list.append(type("M", (), {"position": site, "wildtype": w, "mutation": m_aa})())
                     valid_rids.append(int(r.row_id))
             if not mut_list:
                 continue
             with torch.no_grad():
-                out_list, _ = model(pdb_dict, mut_list)
+                out_list, _ = model(pdb_list, mut_list)
             for rid, item in zip(valid_rids, out_list):
                 rids.append(rid)
                 preds.append(float(item["ddG"].item()))
@@ -184,7 +259,7 @@ def main(argv: list[str] | None = None) -> int:
         par_col = "parent" if "parent" in ext_df.columns else "uniprot_id"
         seq_col = "wt_seq" if "wt_seq" in ext_df.columns else "parent_seq"
         t_inf = time.time()
-        e_rids, e_preds = _score_official_table(ext_df, ext_pdbs, par_col, seq_col)
+        e_rids, e_preds = _score_table_direct(ext_df, ext_pdbs, par_col, seq_col)
         write_predictions(
             out_dir / "pred_external_official.parquet",
             e_rids, e_preds,
@@ -217,60 +292,101 @@ def main(argv: list[str] | None = None) -> int:
     opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=1e-4)
     loss_fn = nn.MSELoss()
 
-    def _prepare_groups(sub_df: pd.DataFrame):
-        items = []
+    def _build_split_tensors(sub_df: pd.DataFrame):
+        feats_list, wt_list, mt_list, y_list, rid_list = [], [], [], [], []
+        n_proteins = 0
         for parent, grp in sub_df.groupby("parent", sort=False):
             pfile = _match_pdb(str(parent), ms_pdbs)
             if pfile is None:
                 continue
-            pdb_seq, _ = parse_pdb_cb(str(pfile))
+            pdb_list = alt_parse_PDB(str(pfile))
+            if not pdb_list or "seq" not in pdb_list[0]:
+                continue
+            pdb_seq = str(pdb_list[0]["seq"]).upper()
             wt_seq = str(grp["parent_seq"].iloc[0]).upper()
-            off, _, err = align_to_sequence(pdb_seq, wt_seq)
+            off, _, _err = align_to_sequence(pdb_seq, wt_seq)
             if off is None:
                 continue
-            pdb_dict = alt_parse_PDB(str(pfile))[0]
-            muts, ys, rids = [], [], []
+            res_emb = _extract_mpnn_residue_features(model, pdb_list, tied_featurize, device)
+            pos_idx, w_idx, m_idx, ys, rids = [], [], [], [], []
             for r in grp.itertuples(index=False):
                 site = int(r.site) + off
                 w, m_aa = str(r.wt_aa).upper(), str(r.mt_aa).upper()
-                if 0 <= site < len(pdb_seq) and w in AA_ORDER and m_aa in AA_ORDER:
-                    muts.append(type("M", (), {"position": site, "wildtype": w, "mutation": m_aa})())
+                if 0 <= site < res_emb.size(0) and w in aa_to_tm and m_aa in aa_to_tm:
+                    pos_idx.append(site)
+                    w_idx.append(aa_to_tm[w])
+                    m_idx.append(aa_to_tm[m_aa])
                     ys.append(float(r.target))
                     rids.append(int(r.row_id))
-            if muts:
-                items.append((pdb_dict, muts, torch.tensor(ys, dtype=torch.float32), np.asarray(rids, np.int64)))
-        return items
+            if pos_idx:
+                n_proteins += 1
+                feats_list.append(res_emb[torch.tensor(pos_idx, dtype=torch.long)])
+                wt_list.append(torch.tensor(w_idx, dtype=torch.long))
+                mt_list.append(torch.tensor(m_idx, dtype=torch.long))
+                y_list.append(torch.tensor(ys, dtype=torch.float32))
+                rid_list.append(np.asarray(rids, dtype=np.int64))
+        if not feats_list:
+            return (
+                torch.empty((0, 384), dtype=torch.float32),
+                torch.empty((0,), dtype=torch.long),
+                torch.empty((0,), dtype=torch.long),
+                torch.empty((0,), dtype=torch.float32),
+                np.empty((0,), dtype=np.int64),
+                0,
+            )
+        return (
+            torch.cat(feats_list, dim=0),
+            torch.cat(wt_list, dim=0),
+            torch.cat(mt_list, dim=0),
+            torch.cat(y_list, dim=0),
+            np.concatenate(rid_list),
+            n_proteins,
+        )
 
-    print("[thermompnn] Preparing PDB groups for train/val/test ...", flush=True)
-    tr_items = _prepare_groups(splits[splits["split"] == "train"])
-    va_items = _prepare_groups(splits[splits["split"] == "val"])
-    te_items = _prepare_groups(splits[splits["split"] == "test"])
-    print(f"[thermompnn] Groups: train={len(tr_items)}, val={len(va_items)}, test={len(te_items)}", flush=True)
+    print("[thermompnn] Extracting frozen ProteinMPNN residue features for train/val/test ...", flush=True)
+    tr_X, tr_w, tr_m, tr_y, _tr_r, n_tr = _build_split_tensors(splits[splits["split"] == "train"])
+    va_X, va_w, va_m, va_y, _va_r, n_va = _build_split_tensors(splits[splits["split"] == "val"])
+    te_X, te_w, te_m, _te_y, te_rids, n_te = _build_split_tensors(splits[splits["split"] == "test"])
+    print(
+        f"[thermompnn] Proteins: train={n_tr} ({len(tr_y)}), val={n_va} ({len(va_y)}), "
+        f"test={n_te} ({len(te_rids)})",
+        flush=True,
+    )
+
+    def _predict_batched(X: torch.Tensor, w: torch.Tensor, m: torch.Tensor) -> np.ndarray:
+        preds = []
+        model.eval()
+        with torch.no_grad():
+            for s in range(0, len(X), args.batch_size):
+                e = min(s + args.batch_size, len(X))
+                p = _forward_thermompnn_head(
+                    model, X[s:e].to(device), w[s:e].to(device), m[s:e].to(device)
+                )
+                preds.append(p.detach().cpu().numpy().astype(np.float32))
+        return np.concatenate(preds) if preds else np.empty((0,), dtype=np.float32)
 
     best_r = -1e9
     best_state = None
     rng = np.random.default_rng(args.seed)
+    n_train = len(tr_y)
     for ep in range(1, args.epochs + 1):
         model.train()
-        order = rng.permutation(len(tr_items))
-        for idx in order:
-            pdb_dict, muts, ys, _ = tr_items[int(idx)]
+        model.prot_mpnn.eval()
+        order = rng.permutation(n_train)
+        for s in range(0, n_train, args.batch_size):
+            idx = order[s:min(s + args.batch_size, n_train)]
+            idx_t = torch.from_numpy(idx)
             opt.zero_grad(set_to_none=True)
-            out_list, _ = model(pdb_dict, muts)
-            pred = torch.stack([o["ddG"].reshape(()) for o in out_list])
-            loss = loss_fn(pred, ys.to(device))
+            pred = _forward_thermompnn_head(
+                model, tr_X[idx_t].to(device), tr_w[idx_t].to(device), tr_m[idx_t].to(device)
+            )
+            loss = loss_fn(pred, tr_y[idx_t].to(device))
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             opt.step()
 
-        model.eval()
-        vp, vt = [], []
-        with torch.no_grad():
-            for pdb_dict, muts, ys, _ in va_items:
-                out_list, _ = model(pdb_dict, muts)
-                vp.append(np.array([float(o["ddG"].item()) for o in out_list]))
-                vt.append(ys.numpy())
-        r = float(np.corrcoef(np.concatenate(vt), np.concatenate(vp))[0, 1]) if vp else float("nan")
+        vp = _predict_batched(va_X, va_w, va_m)
+        r = float(np.corrcoef(va_y.numpy(), vp)[0, 1]) if len(vp) > 1 else float("nan")
         print(f"[thermompnn] epoch {ep}/{args.epochs}  val_pearson={r:.4f}", flush=True)
         if np.isfinite(r) and r > best_r:
             best_r = r
@@ -281,15 +397,10 @@ def main(argv: list[str] | None = None) -> int:
     model.eval()
 
     t_te = time.time()
-    te_rids, te_preds = [], []
-    with torch.no_grad():
-        for pdb_dict, muts, _, rids in te_items:
-            out_list, _ = model(pdb_dict, muts)
-            te_rids.append(rids)
-            te_preds.append(np.array([float(o["ddG"].item()) for o in out_list], dtype=np.float32))
+    te_preds = _predict_batched(te_X, te_w, te_m)
     write_predictions(
         out_dir / "pred_test.parquet",
-        np.concatenate(te_rids), np.concatenate(te_preds),
+        te_rids, te_preds,
         meta={
             "model": "ThermoMPNN_retrained",
             "sign": "stabilizing_positive (:+1 — trained on our targets)",
@@ -307,7 +418,7 @@ def main(argv: list[str] | None = None) -> int:
         ext_pdbs = _resolve_pdb_map(args.external_pdb_dir)
         par_col = "parent" if "parent" in ext_df.columns else "uniprot_id"
         seq_col = "wt_seq" if "wt_seq" in ext_df.columns else "parent_seq"
-        er_rids, er_preds = _score_official_table(ext_df, ext_pdbs, par_col, seq_col)
+        er_rids, er_preds = _score_table_direct(ext_df, ext_pdbs, par_col, seq_col)
         write_predictions(
             out_dir / "pred_external_retrained.parquet",
             er_rids, er_preds,

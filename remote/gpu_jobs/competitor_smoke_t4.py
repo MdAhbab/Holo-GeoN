@@ -267,10 +267,13 @@ def main() -> int:
                 "--work-dir", str(TMP_ROOT / "ThermoMPNN"),
                 "--out", str(WORK / "comp_thermompnn"),
                 "--epochs", str(EPOCHS), "--seed", str(SEED),
-            ], ["omegaconf", "pytorch-lightning", "biopython"]),
+            ], []),
         ]
 
+        only_set = {x.strip() for x in os.environ.get("HOLO_COMP_ONLY", "").split(",") if x.strip()}
         for name, cmd, extra_pip in specs:
+            if only_set and name not in only_set:
+                continue
             try:
                 run_competitor(name, cmd, extra_pip, WORK / f"comp_{name}", report)
             except Exception as exc:
