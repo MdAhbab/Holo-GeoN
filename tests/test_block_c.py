@@ -189,6 +189,73 @@ def test_competitor_models_and_common_io() -> None:
         check(len(df) == 2 and list(df["row_id"]) == [0, 2], "write_predictions filters NaN & keeps exact row_id")
         check(p_out.with_suffix(".meta.json").is_file(), "companion .meta.json written")
 
+        # load_external_table derives site/wt_aa/mt_aa from (wt_seq, mt_seq)
+        from scripts.competitors.common import load_external_table
+        ext_p = Path(td) / "ext_raw.parquet"
+        pd.DataFrame({
+            "wt_seq": ["ACDEFG", "ACDEFG", "ACDEFG"],
+            "mt_seq": ["ACKEFG", "ACDEFG", "ACDEFA"],  # middle row is synonymous -> dropped
+            "ddg": [-1.2, 0.0, -0.4],
+            "parent": ["P1", "P1", "P1"],
+        }).to_parquet(ext_p, index=False)
+        ext_df = load_external_table(str(ext_p))
+        check(len(ext_df) == 2 and list(ext_df["row_id"]) == [0, 2],
+              "load_external_table drops non-single-mut while preserving raw row_id")
+        check(list(ext_df["site"]) == [2, 5] and list(ext_df["wt_aa"]) == ["D", "G"]
+              and list(ext_df["mt_aa"]) == ["K", "A"],
+              "load_external_table derives exact 0-based site/wt_aa/mt_aa")
+
+        # DDGemb compact parent-indexed _extract_windows matches exact window padding
+        from scripts.competitors.ddgemb import _extract_windows
+        from src.encoder import EncodingStore
+        store = EncodingStore(str(Path(td) / "cache"))
+        seq = "ACDEFGH"
+        emb = torch.arange(len(seq) * 8, dtype=torch.float32).reshape(len(seq), 8)
+        store.put({"seq": seq, "emb": emb.half(), "contact_edges": torch.zeros((2, 0), dtype=torch.long),
+                   "contact_probs": torch.zeros((0,), dtype=torch.float32)})
+        mini = pd.DataFrame({
+            "parent_seq": [seq, seq], "site": [0, 6], "wt_aa": ["A", "H"],
+            "mt_aa": ["G", "A"], "target": [-1.0, -2.0], "row_id": [10, 20],
+        })
+        widx = _extract_windows(mini, store, radius=2)
+        we, wm, wi, mi, yb = widx.gather_batch(slice(0, 2), torch.device("cpu"))
+        check(we.shape == (2, 5, 8) and wm.shape == (2, 5), "DDGemb gather_batch shape matches (B, 2R+1, D)")
+        check(wm[0].tolist() == [False, False, True, True, True]
+              and wm[1].tolist() == [True, True, True, False, False],
+              "DDGemb boundary window masks match left/right zero padding")
+        check(torch.allclose(we[0, 2], emb[0]) and torch.allclose(we[1, 2], emb[6]),
+              "DDGemb center token matches exact mutated residue embedding")
+
+        # load_mutation_table accepts pre-normalised tables lacking mt_seq (e.g. s669)
+        from src.data import load_mutation_table
+        s669_p = Path(td) / "s669_like.parquet"
+        pd.DataFrame({
+            "parent": ["P1", "P1", "P1"],
+            "wt_seq": ["ACDEFG", "ACDEFG", "ACDEFG"],
+            "site": [1, 2, 3],
+            "wt_aa": ["C", "X", "E"],  # row 1 mismatches wt_seq[2]=='D' -> dropped
+            "mt_aa": ["A", "A", "K"],
+            "ddg": [-1.1, -0.5, -2.0],
+        }).to_parquet(s669_p, index=False)
+        norm, rep = load_mutation_table(str(s669_p), kind="stability")
+        check(len(norm) == 2 and rep.dropped.get("wt_aa_mismatch") == 1,
+              "load_mutation_table accepts site/wt_aa/mt_aa without mt_seq and catches mismatch")
+        check(list(norm["source_row_id"]) == [0, 2],
+              "load_mutation_table records original source_row_id")
+
+        # apply_checkpoint_graph_config restores 3D / true-contact flags onto default Config
+        from src.config import apply_checkpoint_graph_config, load_config
+        cfg = load_config("configs/benchmark_v2.yaml")
+        check(cfg.use_str_stream is False and cfg.true_contact_edges is False,
+              "benchmark_v2 default is structure-free")
+        apply_checkpoint_graph_config(cfg, {"config": {
+            "use_str_stream": True, "str_topology_only": True,
+            "true_contact_edges": True, "true_contacts_dir": "data/true_contacts",
+        }})
+        check(cfg.use_str_stream is True and cfg.str_topology_only is True
+              and cfg.true_contact_edges is True and cfg.true_contacts_dir == "data/true_contacts",
+              "apply_checkpoint_graph_config propagates 3D and true-contact settings")
+
 
 def test_v2_manifests_and_zenodo_pack() -> None:
     section("block_c - v2 experiment manifests & Zenodo packager")

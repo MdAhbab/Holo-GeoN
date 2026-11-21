@@ -53,9 +53,13 @@ from src.windowing import MutationParseError, mutation_position, window_bounds
 # of these per dataset; see src/config.py.
 _CANDIDATES: dict[str, list[str]] = {
     "wt_seq": ["wt_seq", "wildtype_seq", "seq_wt", "ref_seq", "wild_seq",
-               "wildtype", "reference_seq", "source_sequence", "ref_protein"],
+               "wildtype", "reference_seq", "source_sequence", "ref_protein",
+               "parent_seq"],
     "mt_seq": ["mt_seq", "mutant_seq", "seq_mt", "alt_seq", "mut_seq",
                "mutant", "alternate_seq", "target_sequence", "alt_protein"],
+    "site": ["site"],
+    "wt_aa": ["wt_aa", "ref_aa"],
+    "mt_aa": ["mt_aa", "mut_aa", "alt_aa"],
     "target": ["ddg", "ddG", "delta_delta_g", "ddg_exp", "DDG_mean", "target", "score"],
     "sigma": ["ddg_std", "ddG_std", "DDG_std", "ddg_err", "sigma", "std_err"],
     "label": ["label", "y", "pathogenic", "is_pathogenic",
@@ -218,7 +222,11 @@ def load_mutation_table(
         report.rows_in = len(df)
 
     col = detect_columns(df, overrides)
-    needed = ["wt_seq", "mt_seq"] + (["target"] if kind == "stability" else ["label"])
+    has_mt_seq = col["mt_seq"] is not None
+    has_site_cols = all(col[k] is not None for k in ("site", "wt_aa", "mt_aa"))
+    needed = ["wt_seq"] + (["target"] if kind == "stability" else ["label"])
+    if not has_mt_seq and not has_site_cols:
+        needed.append("mt_seq")
     missing = [k for k in needed if col[k] is None]
     if missing:
         raise ValueError(
@@ -234,29 +242,61 @@ def load_mutation_table(
         _reject_legacy_integer_labels(df[col["label"]], path)
 
     wt = df[col["wt_seq"]].astype(str).str.upper()
-    mt = df[col["mt_seq"]].astype(str).str.upper()
+    mt = df[col["mt_seq"]].astype(str).str.upper() if has_mt_seq else None
+    site_ser = df[col["site"]] if (not has_mt_seq and has_site_cols) else None
+    wt_aa_ser = df[col["wt_aa"]].astype(str).str.strip().str.upper() if (not has_mt_seq and has_site_cols) else None
+    mt_aa_ser = df[col["mt_aa"]].astype(str).str.strip().str.upper() if (not has_mt_seq and has_site_cols) else None
 
     records: list[dict] = []
     for i in range(len(df)):
-        w, m = wt.iat[i], mt.iat[i]
-        if not w or not m or w == "NAN" or m == "NAN":
+        w = wt.iat[i]
+        if not w or w == "NAN":
             report.drop("missing_sequence")
             continue
         if len(w) > max_protein_length:
             report.drop("protein_too_long")
             continue
-        try:
-            site = mutation_position(w, m)
-        except MutationParseError as exc:
-            reason = "length_mismatch_indel" if "length mismatch" in str(exc) else "not_single_substitution"
-            report.drop(reason)
-            continue
+
+        if has_mt_seq:
+            m = mt.iat[i]
+            if not m or m == "NAN":
+                report.drop("missing_sequence")
+                continue
+            try:
+                site = mutation_position(w, m)
+            except MutationParseError as exc:
+                reason = "length_mismatch_indel" if "length mismatch" in str(exc) else "not_single_substitution"
+                report.drop(reason)
+                continue
+            wa = w[site]
+            ma = m[site]
+        else:
+            try:
+                raw_site = site_ser.iat[i]
+                if pd.isna(raw_site):
+                    raise ValueError("nan site")
+                site = int(raw_site)
+            except (TypeError, ValueError):
+                report.drop("unparseable_site")
+                continue
+            wa = wt_aa_ser.iat[i]
+            ma = mt_aa_ser.iat[i]
+            if not (0 <= site < len(w)):
+                report.drop("site_out_of_bounds")
+                continue
+            if len(wa) != 1 or len(ma) != 1 or wa == ma:
+                report.drop("not_single_substitution")
+                continue
+            if w[site] != wa:
+                report.drop("wt_aa_mismatch")
+                continue
 
         rec: dict = {
+            "source_row_id": i,
             "parent_seq": w,
             "site": site,
-            "wt_aa": w[site],
-            "mt_aa": m[site],
+            "wt_aa": wa,
+            "mt_aa": ma,
         }
         if kind == "stability":
             try:

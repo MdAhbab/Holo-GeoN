@@ -261,4 +261,35 @@ def load_config(
     return Config(values=values, columns=columns, sources=sources)
 
 
-__all__ = ["Config", "load_config", "DEFAULTS", "ROOT"]
+_CHECKPOINT_GRAPH_KEYS = (
+    "use_str_stream",
+    "str_topology_only",
+    "true_contact_edges",
+    "true_contacts_dir",
+    "graph_top_k",
+    "geo_threshold",
+    "contact_min_sep",
+    "eps",
+    "delta",
+    "mech_max_degree",
+    "neighborhood_hops",
+    "window",
+)
+
+
+def apply_checkpoint_graph_config(cfg: Config, state: dict) -> Config:
+    """
+    Propagate graph/stream-construction settings saved in a checkpoint's
+    ``config`` dict onto ``cfg`` so export/evaluation builds the exact same
+    input streams (e.g. 3D ``E_str`` for Arms B/C/D, true C-beta ``E_geo``
+    for Arm E) that the checkpoint was trained with.
+    """
+    saved = state.get("config")
+    if isinstance(saved, dict):
+        for k in _CHECKPOINT_GRAPH_KEYS:
+            if k in saved and saved[k] is not None:
+                cfg.values[k] = saved[k]
+    return cfg
+
+
+__all__ = ["Config", "load_config", "apply_checkpoint_graph_config", "DEFAULTS", "ROOT"]

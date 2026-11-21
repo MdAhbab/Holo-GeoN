@@ -12,8 +12,15 @@
 name: kaggle_v2_geometry
 platform: kaggle_t4
 config: configs/benchmark_v2.yaml
+splits_file: data/splits_megascale_id25.parquet
+external_file: data/fireprotdb_hf25.parquet
+external_files:
+  - data/fireprotdb_hf25.parquet
+  - data/fireprotdb_holdout.parquet
+  - data/s669_holdout.parquet
+  - data/s1724_thermomutdb_hf25.parquet
 cache: /tmp/holo/cache/esm2_650M_v2
-out_root: /kaggle/working/runs/kaggle_v2_geometry
+out_root: /tmp/holo/runs/kaggle_v2_geometry
 num_workers: 4
 
 cost:
@@ -22,25 +29,32 @@ cost:
   budget_cu: null
 
 sizing:
-  steps_per_epoch: 560    # structured subset (93.1% of train rows)
-  epochs: 15
-  sec_per_step: 0.075     # ASSUMED (+25% for 26-ch str edges) — measure in probe
-  eval_overhead: 0.15
-  strict_factor: 1.3
-  vm_overhead_h: 0.40
-  precompute_h: 0.25
+  steps_per_epoch: 619    # MEASURED Wave 0 T4 (412/412 MegaScale constructs aligned!)
+  epochs: 20
+  sec_per_step: 0.076619  # MEASURED Wave 0 T4 steady state (v2_both_streams: 47.43 s/epoch)
+  eval_overhead: 0.0      # steady epoch rate already includes val/ckpt
+  strict_factor: 1.3      # conservative multiplier for --strict-determinism
+  vm_overhead_h: 0.25
+  precompute_h: 0.05      # MEASURED 114.1 s on T4 with FP16 ESM-2
+  attach_coords_h: 0.01   # MEASURED 7.2 s on T4 (577 proteins from invariant_backbone_geometry.npz)
   export_h: 0.02
-  external_h: 0.03
+  external_h: 0.01
 
 items:
   - {id: precompute, kind: precompute}
-  - {kind: train, arm: full,               seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true}
-  - {kind: train, arm: str_only,           seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true,
+  - {id: attach_coords, kind: attach_coords, geom_npz: data/invariant_backbone_geometry.npz, needs: [precompute]}
+  - {kind: train, arm: full,               seeds: [42, 43, 44, 45, 46], epochs: 20, strict: true, export: true,
+     sec_per_step: 0.067824, arm_class: v2}
+  - {kind: train, arm: str_only,           seeds: [42, 43, 44, 45, 46], epochs: 20, strict: true, export: true,
+     sec_per_step: 0.076619, arm_class: str,
      flags: ["--no-geo-stream", "--use-str-stream"]}
-  - {kind: train, arm: both_streams,       seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true,
+  - {kind: train, arm: both_streams,       seeds: [42, 43, 44, 45, 46], epochs: 20, strict: true, export: true,
+     sec_per_step: 0.076619, arm_class: str,
      flags: ["--use-str-stream"]}
-  - {kind: train, arm: str_topology_only,  seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true,
+  - {kind: train, arm: str_topology_only,  seeds: [42, 43, 44, 45, 46], epochs: 20, strict: true, export: true,
+     sec_per_step: 0.076619, arm_class: str,
      flags: ["--no-geo-stream", "--use-str-stream", "--str-topology-only"]}
-  - {kind: train, arm: true_contact_edges, seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true,
+  - {kind: train, arm: true_contact_edges, seeds: [42, 43, 44, 45, 46], epochs: 20, strict: true, export: true,
+     sec_per_step: 0.067824, arm_class: v2,
      flags: ["--true-contact-edges", "--true-contacts-dir", "data/true_contacts"]}
   - {id: aggregate, kind: aggregate, phase: post}

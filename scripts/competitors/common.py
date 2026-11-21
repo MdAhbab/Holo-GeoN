@@ -38,10 +38,48 @@ def load_split_table(splits_path: str, split: str | None = None) -> pd.DataFrame
 
 
 def load_external_table(path: str) -> pd.DataFrame:
-    """Load an external holdout table (FireProtDB / S669 / Domainome) with ``row_id``."""
-    df = pd.read_parquet(path)
-    df = df.copy()
+    """
+    Load an external holdout table (FireProtDB / S669 / S1724 / Domainome) with
+    explicit positional ``row_id`` and guaranteed normalised mutation columns
+    (``parent_seq``, ``wt_seq``, ``site``, ``wt_aa``, ``mt_aa``, ``target``).
+    """
+    from src.windowing import MutationParseError, mutation_position
+
+    df = pd.read_parquet(path).copy()
     df["row_id"] = np.arange(len(df), dtype=np.int64)
+
+    if "wt_seq" not in df.columns and "parent_seq" in df.columns:
+        df["wt_seq"] = df["parent_seq"]
+    if "parent_seq" not in df.columns and "wt_seq" in df.columns:
+        df["parent_seq"] = df["wt_seq"]
+    if "wt_seq" in df.columns:
+        df["wt_seq"] = df["wt_seq"].astype(str).str.upper()
+    if "parent_seq" in df.columns:
+        df["parent_seq"] = df["parent_seq"].astype(str).str.upper()
+    if "target" not in df.columns and "ddg" in df.columns:
+        df["target"] = df["ddg"].astype(np.float32)
+
+    needs_site = any(c not in df.columns for c in ("site", "wt_aa", "mt_aa"))
+    if needs_site and "wt_seq" in df.columns and "mt_seq" in df.columns:
+        sites: list[int] = []
+        wt_aas: list[str] = []
+        mt_aas: list[str] = []
+        keep: list[bool] = []
+        wt_col = df["wt_seq"].astype(str).str.upper()
+        mt_col = df["mt_seq"].astype(str).str.upper()
+        for w, m in zip(wt_col, mt_col):
+            try:
+                pos = mutation_position(w, m)
+                sites.append(pos)
+                wt_aas.append(w[pos])
+                mt_aas.append(m[pos])
+                keep.append(True)
+            except MutationParseError:
+                keep.append(False)
+        df = df.loc[keep].copy()
+        df["site"] = np.asarray(sites, dtype=np.int64)
+        df["wt_aa"] = wt_aas
+        df["mt_aa"] = mt_aas
     return df
 
 

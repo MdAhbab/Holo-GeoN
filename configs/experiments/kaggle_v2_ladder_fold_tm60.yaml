@@ -28,26 +28,26 @@ cost:
   budget_cu: null
 
 sizing:
-  steps_per_epoch: 600    # ASSUMED — replace from wave0_probe_report.json
-  epochs: 15
-  sec_per_step: 0.060     # ASSUMED — replace from wave0_probe_report.json
+  steps_per_epoch: 619    # MEASURED Wave 0 T4
+  epochs: 20
+  sec_per_step: 0.067824  # MEASURED Wave 0 T4 steady state (v2_full)
   eval_overhead: 0.0      # steady epoch-derived rate already includes val/ckpt
-  strict_factor: 1.3      # unmeasured until strict run completes
-  vm_overhead_h: 0.35
-  precompute_h: 0.20
+  strict_factor: 1.3      # conservative multiplier for --strict-determinism
+  vm_overhead_h: 0.25
+  precompute_h: 0.05      # MEASURED 114.1 s on T4
   export_h: 0.02
-  external_h: 0.02
+  external_h: 0.01
 
 items:
   - {id: precompute, kind: precompute}
 
-  - {kind: train, arm: full, seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true}
+  - {kind: train, arm: full, seeds: [42, 43, 44, 45, 46], epochs: 20, strict: true, export: true}
+
+  - {kind: train, arm: no_geo_stream, seeds: [42, 43, 44, 45, 46], epochs: 20, strict: true, export: true,
+     flags: ["--no-geo-stream"]}
 
   - {kind: train, arm: v1_baseline, seeds: [42, 43, 44, 45, 46], epochs: 12, strict: true, export: true,
-     steps_per_epoch: 4782, sec_per_step: 0.117, arm_class: v1_baseline,
+     steps_per_epoch: 4806, sec_per_step: 0.222847, arm_class: v1_baseline,
      flags: ["--arch", "v1", "--nll-beta", "0.0", "--cds-dropout", "0.0", "--no-protein-batch"]}
-
-  - {kind: train, arm: no_geo_stream, seeds: [42, 43, 44, 45, 46], epochs: 15, strict: true, export: true,
-     flags: ["--no-geo-stream"]}
 
   - {id: aggregate, kind: aggregate, phase: post}

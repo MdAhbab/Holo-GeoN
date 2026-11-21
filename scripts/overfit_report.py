@@ -41,7 +41,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from src.config import load_config
+from src.config import apply_checkpoint_graph_config, load_config
 from src.data import MutationDataset, collate_graphs, move_batch
 from src.device import describe_device
 from src.encoder import ESM_DIMS, EncodingStore
@@ -116,6 +116,7 @@ def main() -> None:
 
     ckpt = os.path.join(args.run, "model_best.pt")
     state = torch.load(ckpt, map_location=device, weights_only=False)
+    apply_checkpoint_graph_config(cfg, state)
     esm_dim = state.get("esm_dim", ESM_DIMS.get(cfg.esm_model, 1280))
     kwargs = state.get("model_kwargs") or model_kwargs_from_config(
         state.get("config", {}), esm_dim)

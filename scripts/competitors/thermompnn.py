@@ -94,9 +94,26 @@ def _extract_proteinmpnn_features(repo_dir: Path, pdb_paths: dict[str, tuple[Pat
     if not ckpt.is_file():
         raise FileNotFoundError(f"Expected ThermoMPNN checkpoint at {ckpt}")
 
-    from datasets import alt_parse_PDB  # type: ignore
+    # Load ThermoMPNN's local datasets.py by explicit file path so pre-installed
+    # HuggingFace `datasets` package on Kaggle/Colab never shadows it.
+    import importlib.util
 
-    model = TransferModel.load_from_checkpoint(str(ckpt), cfg=cfg, map_location=device)
+    ds_file = repo_dir / "datasets.py"
+    if not ds_file.is_file():
+        raise FileNotFoundError(f"Expected ThermoMPNN datasets.py at {ds_file}")
+    spec = importlib.util.spec_from_file_location("thermompnn_datasets", str(ds_file))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not build module spec for {ds_file}")
+    tm_ds = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tm_ds)
+    alt_parse_PDB = tm_ds.alt_parse_PDB
+
+    try:
+        model = TransferModel.load_from_checkpoint(
+            str(ckpt), cfg=cfg, map_location=device, weights_only=False
+        )
+    except TypeError:
+        model = TransferModel.load_from_checkpoint(str(ckpt), cfg=cfg, map_location=device)
     model.eval().to(device)
     return model, alt_parse_PDB
 
@@ -183,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Retrain stability head on OUR exact MegaScale train split (frozen ProteinMPNN backbone!)
     splits = load_split_table(args.splits)
-    pairs = pd.read_parquet(args.pairs, columns=["parent", "wt_seq"]).drop_duplicates()
+    pairs = pd.read_parquet(args.pairs, columns=["parent", "wt_seq"]).drop_duplicates("wt_seq")
     splits = splits.merge(pairs, left_on="parent_seq", right_on="wt_seq", how="left")
     ms_pdbs = _resolve_pdb_map(args.pdb_dir)
 
@@ -284,6 +301,22 @@ def main(argv: list[str] | None = None) -> int:
             "seed": args.seed,
         },
     )
+
+    if args.external and args.external_pdb_dir and os.path.isfile(args.external):
+        ext_df = load_external_table(args.external)
+        ext_pdbs = _resolve_pdb_map(args.external_pdb_dir)
+        par_col = "parent" if "parent" in ext_df.columns else "uniprot_id"
+        seq_col = "wt_seq" if "wt_seq" in ext_df.columns else "parent_seq"
+        er_rids, er_preds = _score_official_table(ext_df, ext_pdbs, par_col, seq_col)
+        write_predictions(
+            out_dir / "pred_external_retrained.parquet",
+            er_rids, er_preds,
+            meta={
+                "model": "ThermoMPNN_retrained",
+                "sign": "stabilizing_positive (:+1 — trained on our targets)",
+                "seed": args.seed,
+            },
+        )
     return 0
 
 

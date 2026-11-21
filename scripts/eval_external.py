@@ -69,7 +69,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from src.config import load_config
+from src.config import apply_checkpoint_graph_config, load_config
 from src.data import (
     MutationDataset,
     collate_graphs,
@@ -125,6 +125,31 @@ TABLE_INFO: dict[str, dict[str, str]] = {
             "against the WT PDB chains. It is a different table from both "
             "FireProtDB and the MegaScale training table, not a FireProtDB "
             "subset"
+        ),
+    },
+    "s1724_thermomutdb_holdout": {
+        "title": "S1724 ThermoMutDB curated holdout (Rocklin 2026)",
+        "what": (
+            "transfer to the curated ThermoMutDB classical stability holdout "
+            "(1,433 verified single mutants across 35 PDBs / 33 unique WT "
+            "proteins, stabilizing-positive). No homology filter applied"
+        ),
+    },
+    "s1724_thermomutdb_hf25": {
+        "title": "S1724 ThermoMutDB homology-filtered (<25% identity to MegaScale)",
+        "what": (
+            "transfer to the homology-filtered (<25% MMseqs2 identity to "
+            "MegaScale) subset of S1724 ThermoMutDB (565 verified single "
+            "mutants across 22 parents / 21 unique WT proteins), excluding "
+            "the 12/33 proteins sharing >=25% homology with MegaScale"
+        ),
+    },
+    "domainome_apca_hf25": {
+        "title": "Human Domainome 1.0 aPCA (<25% identity to MegaScale)",
+        "what": (
+            "zero-shot rank transfer to Human Domainome 1.0 aPCA abundance "
+            "fitness (Beltran et al. 2025) filtered to <25% MMseqs2 identity "
+            "to MegaScale (evaluate strictly by per-domain Spearman rank)"
         ),
     },
 }
@@ -197,14 +222,14 @@ def main() -> None:
 
     key = os.path.splitext(os.path.basename(args.data))[0]
     overrides = cfg.column_overrides(key)
-    raw_df = pd.read_parquet(args.data)
-    raw_idx_map = len(raw_df)
     norm, report = load_mutation_table(
         args.data, kind="stability", overrides=overrides,
         max_protein_length=cfg.max_protein_length,
     )
-    norm["row_id"] = np.arange(len(norm), dtype=np.int64)
-    del raw_df, raw_idx_map
+    if "source_row_id" in norm.columns:
+        norm["row_id"] = norm["source_row_id"].to_numpy(dtype=np.int64)
+    else:
+        norm["row_id"] = np.arange(len(norm), dtype=np.int64)
     print(report.summary())
     sign_applied = report.notes.get("ddg_sign", "stabilizing_positive")
     print(f"[external] ddg_sign applied: {sign_applied}  "
@@ -228,6 +253,7 @@ def main() -> None:
             "[external] no rows have a cached encoding; nothing to score.")
 
     state = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    apply_checkpoint_graph_config(cfg, state)
     esm_dim = state.get("esm_dim", ESM_DIMS.get(cfg.esm_model, 1280))
     kwargs = state.get("model_kwargs")
     if kwargs is None and model_kwargs_from_config is not None:

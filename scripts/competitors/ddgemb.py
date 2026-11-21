@@ -17,6 +17,7 @@ import argparse
 import os
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -76,40 +77,95 @@ class DdgEmbTransformer(nn.Module):
         return s_mt - s_wt
 
 
-def _extract_windows(df: pd.DataFrame, store: EncodingStore, radius: int = 15) -> tuple:
-    win_len = 2 * radius + 1
-    emb_l, mask_l, wt_l, mt_l, y_l, rid_l = [], [], [], [], [], []
+@dataclass
+class _WindowIndex:
+    """
+    Compact parent-indexed storage for site-centered windows.
+
+    Stores each unique parent embedding ONCE (padded by ``radius`` on both sides)
+    in fp16 (~90 MB for all of MegaScale) and gathers ``(B, 2R+1, D)`` windows
+    on-the-fly per minibatch instead of pre-materialising ``(N_mut, 2R+1, D)``
+    (~48 GB RAM).
+    """
+
+    flat_emb: torch.Tensor    # (sum(L_i + 2R), D) float16
+    flat_mask: torch.Tensor   # (sum(L_i + 2R),) bool
+    start_idx: torch.Tensor   # (N,) int64
+    wt_idx: torch.Tensor      # (N,) int64
+    mt_idx: torch.Tensor      # (N,) int64
+    y: torch.Tensor           # (N,) float32
+    row_id: np.ndarray        # (N,) int64
+    radius: int
+    esm_dim: int
+
+    def __len__(self) -> int:
+        return int(self.y.shape[0])
+
+    def gather_batch(self, idx: torch.Tensor | np.ndarray | slice, device: torch.device):
+        if isinstance(idx, np.ndarray):
+            idx = torch.from_numpy(idx).long()
+        starts = self.start_idx[idx]
+        offsets = torch.arange(2 * self.radius + 1, dtype=torch.long).unsqueeze(0)
+        g = starts.unsqueeze(1) + offsets
+        win_emb = self.flat_emb[g].to(device=device, dtype=torch.float32)
+        win_mask = self.flat_mask[g].to(device=device)
+        return (
+            win_emb,
+            win_mask,
+            self.wt_idx[idx].to(device=device),
+            self.mt_idx[idx].to(device=device),
+            self.y[idx].to(device=device),
+        )
+
+
+def _extract_windows(df: pd.DataFrame, store: EncodingStore, radius: int = 15) -> _WindowIndex:
+    emb_chunks: list[torch.Tensor] = []
+    mask_chunks: list[torch.Tensor] = []
+    start_l: list[torch.Tensor] = []
+    wt_l: list[torch.Tensor] = []
+    mt_l: list[torch.Tensor] = []
+    y_l: list[torch.Tensor] = []
+    rid_l: list[np.ndarray] = []
     seq_col = "parent_seq" if "parent_seq" in df.columns else "wt_seq"
     tgt_col = "target" if "target" in df.columns else "ddg"
 
+    cursor = 0
+    esm_dim = 0
     for seq, grp in df.groupby(seq_col, sort=False):
         seq_s = str(seq).upper()
         if not store.has(seq_s):
             continue
-        emb = store.get(seq_s)["emb"].float()  # (L, D)
+        emb = store.get(seq_s)["emb"].to(dtype=torch.float16)  # (L, D)
         L, D = emb.shape
-        padded = torch.zeros((L + 2 * radius, D), dtype=torch.float32)
+        esm_dim = D
+        padded = torch.zeros((L + 2 * radius, D), dtype=torch.float16)
         padded[radius:radius + L] = emb
         pmask = torch.zeros((L + 2 * radius,), dtype=torch.bool)
         pmask[radius:radius + L] = True
 
         sites = np.clip(grp["site"].to_numpy(dtype=np.int64), 0, L - 1)
-        offsets = torch.arange(win_len, dtype=torch.long).unsqueeze(0)
-        idx = torch.from_numpy(sites).unsqueeze(1) + offsets  # (M, 2R+1)
-        emb_l.append(padded[idx])
-        mask_l.append(pmask[idx])
+        emb_chunks.append(padded)
+        mask_chunks.append(pmask)
+        start_l.append(torch.from_numpy(sites + cursor))
         wt_l.append(torch.tensor([aa_index(a) for a in grp["wt_aa"]], dtype=torch.long))
         mt_l.append(torch.tensor([aa_index(a) for a in grp["mt_aa"]], dtype=torch.long))
         y_l.append(torch.tensor(grp[tgt_col].to_numpy(dtype=np.float32)))
         rid_l.append(grp["row_id"].to_numpy(dtype=np.int64))
+        cursor += L + 2 * radius
 
-    return (
-        torch.cat(emb_l, dim=0),
-        torch.cat(mask_l, dim=0),
-        torch.cat(wt_l, dim=0),
-        torch.cat(mt_l, dim=0),
-        torch.cat(y_l, dim=0),
-        np.concatenate(rid_l),
+    if not emb_chunks:
+        raise RuntimeError("DDGemb: no cached parent sequences found for table")
+
+    return _WindowIndex(
+        flat_emb=torch.cat(emb_chunks, dim=0),
+        flat_mask=torch.cat(mask_chunks, dim=0),
+        start_idx=torch.cat(start_l, dim=0),
+        wt_idx=torch.cat(wt_l, dim=0),
+        mt_idx=torch.cat(mt_l, dim=0),
+        y=torch.cat(y_l, dim=0),
+        row_id=np.concatenate(rid_l),
+        radius=radius,
+        esm_dim=esm_dim,
     )
 
 
@@ -138,23 +194,23 @@ def main(argv: list[str] | None = None) -> int:
     va = _extract_windows(splits[splits["split"] == "val"], store, args.radius)
     te = _extract_windows(splits[splits["split"] == "test"], store, args.radius)
 
-    model = DdgEmbTransformer(esm_dim=tr[0].shape[-1], radius=args.radius).to(device)
+    model = DdgEmbTransformer(esm_dim=tr.esm_dim, radius=args.radius).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
     loss_fn = nn.MSELoss()
 
     best_r = -1e9
     best_state = None
     rng = np.random.default_rng(args.seed)
-    n_tr = len(tr[4])
+    n_tr = len(tr)
     for ep in range(1, args.epochs + 1):
         model.train()
         perm = rng.permutation(n_tr)
         for lo in range(0, n_tr, args.batch_size):
             idx = perm[lo:lo + args.batch_size]
             opt.zero_grad(set_to_none=True)
-            pred = model(tr[0][idx].to(device), tr[1][idx].to(device),
-                         tr[2][idx].to(device), tr[3][idx].to(device)).reshape(-1)
-            loss = loss_fn(pred, tr[4][idx].to(device))
+            we, wm, wi, mi, yb = tr.gather_batch(idx, device)
+            pred = model(we, wm, wi, mi).reshape(-1)
+            loss = loss_fn(pred, yb)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
@@ -162,11 +218,10 @@ def main(argv: list[str] | None = None) -> int:
         model.eval()
         vp = []
         with torch.no_grad():
-            for lo in range(0, len(va[4]), 512):
-                vp.append(model(va[0][lo:lo + 512].to(device), va[1][lo:lo + 512].to(device),
-                                va[2][lo:lo + 512].to(device), va[3][lo:lo + 512].to(device))
-                          .reshape(-1).cpu().numpy())
-        r = float(np.corrcoef(va[4].numpy(), np.concatenate(vp))[0, 1]) if vp else float("nan")
+            for lo in range(0, len(va), 512):
+                we, wm, wi, mi, _ = va.gather_batch(slice(lo, lo + 512), device)
+                vp.append(model(we, wm, wi, mi).reshape(-1).cpu().numpy())
+        r = float(np.corrcoef(va.y.numpy(), np.concatenate(vp))[0, 1]) if vp else float("nan")
         if np.isfinite(r) and r > best_r:
             best_r = r
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -175,18 +230,17 @@ def main(argv: list[str] | None = None) -> int:
         model.load_state_dict(best_state)
     model.eval()
 
-    def _predict_tuple(tup):
+    def _predict_index(widx: _WindowIndex):
         preds = []
         with torch.no_grad():
-            for lo in range(0, len(tup[4]), 512):
-                preds.append(model(tup[0][lo:lo + 512].to(device), tup[1][lo:lo + 512].to(device),
-                                   tup[2][lo:lo + 512].to(device), tup[3][lo:lo + 512].to(device))
-                             .reshape(-1).cpu().numpy())
+            for lo in range(0, len(widx), 512):
+                we, wm, wi, mi, _ = widx.gather_batch(slice(lo, lo + 512), device)
+                preds.append(model(we, wm, wi, mi).reshape(-1).cpu().numpy())
         return np.concatenate(preds)
 
     write_predictions(
         out_dir / "pred_test.parquet",
-        te[5], _predict_tuple(te),
+        te.row_id, _predict_index(te),
         meta={
             "model": "DDGemb_transformer_frozen_esm2",
             "sign": "stabilizing_positive (:+1)",
@@ -203,7 +257,7 @@ def main(argv: list[str] | None = None) -> int:
         ex = _extract_windows(ext_df, store, args.radius)
         write_predictions(
             out_dir / "pred_external.parquet",
-            ex[5], _predict_tuple(ex),
+            ex.row_id, _predict_index(ex),
             meta={
                 "model": "DDGemb_transformer_frozen_esm2",
                 "sign": "stabilizing_positive (:+1)",

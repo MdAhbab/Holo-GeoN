@@ -117,6 +117,18 @@ s669_holdout:
   parent: parent
   ddg_sign: stabilizing_positive
 
+# S1724 ThermoMutDB holdout (Rocklin Lab 2026, Zenodo 19411306): already
+# normalised to stabilizing_positive (negative = destabilising; mean -1.68 / -1.45).
+s1724_thermomutdb_holdout:
+  target: ddg
+  parent: parent
+  ddg_sign: stabilizing_positive
+
+s1724_thermomutdb_hf25:
+  target: ddg
+  parent: parent
+  ddg_sign: stabilizing_positive
+
 # Human Domainome 1.0 (Beltran et al., Zenodo 14356805): aPCA abundance fitness
 # (higher = more stable/abundant -> same direction as stabilizing_positive;
 # evaluate strictly by per-domain Spearman rank, NEVER kcal/mol RMSE).

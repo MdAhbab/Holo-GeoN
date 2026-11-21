@@ -1129,9 +1129,11 @@ def main() -> None:
             scaler.scale(total).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
+            scale_before = scaler.get_scale() if use_amp else 1.0
             scaler.step(opt)
             scaler.update()
-            sched.step()
+            if (not use_amp) or (scaler.get_scale() >= scale_before):
+                sched.step()
             for k, v in parts.items():
                 running[k] = running.get(k, 0.0) + v
 

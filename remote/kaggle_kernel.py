@@ -35,7 +35,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 SHARD = os.environ.get("HOLO_SHARD", "0/5")
 MANIFEST = os.environ.get("HOLO_MANIFEST", "configs/experiments/kaggle_v2_ablations.yaml")
-MAX_HOURS = os.environ.get("HOLO_MAX_HOURS", "8.5")
+MAX_HOURS = os.environ.get("HOLO_MAX_HOURS", "10.0")
 ONLY = os.environ.get("HOLO_ONLY", "").strip()
 REPO_URL = os.environ.get("HOLO_REPO_URL", "https://github.com/MdAhbab/Holo-GeoN.git")
 REPO_BRANCH = os.environ.get("HOLO_REPO_BRANCH", "version-2")
