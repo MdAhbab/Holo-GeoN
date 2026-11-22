@@ -83,13 +83,16 @@ def find_input(name: str) -> Path | None:
 
 
 def find_pretrained_ckpt(split: str, seed: int) -> Path | None:
-    """Optionally locate a matching pretrained single-mutant Holo-GeoN v2 checkpoint."""
+    """Locate a matching split-specific pretrained single-mutant Holo-GeoN v2 checkpoint."""
     inp = Path("/kaggle/input")
     if not inp.is_dir():
         return None
+    # Strictly match split-specific paths FIRST so fold_tm60 never leaks into id25!
     patterns = (
-        f"full_s{seed}/model_best.pt",
-        f"*{split}*full_s{seed}*/model_best.pt",
+        f"*{split}*full_s{seed}*.pt",
+        f"*{split}*/full_s{seed}/model_best.pt",
+        f"{split}_full_s{seed}.pt",
+        f"{split}/full_s{seed}/model_best.pt",
     )
     for pat in patterns:
         hits = sorted(inp.rglob(pat))
@@ -257,8 +260,10 @@ def main() -> int:
                             rec["test_dddg_pearson"] = (m.get("test") or {}).get("dddg_epistasis", {}).get("pearson")
                             rec["test_ddg_ab_pearson"] = (m.get("test") or {}).get("ddg_ab", {}).get("pearson")
                             rec["contact_lt8_dddg_pearson"] = (
-                                (m.get("test") or {}).get("stratified_by_distance", {})
-                                .get("contact_lt_8A", {}).get("dddg_epistasis", {}).get("pearson")
+                                (m.get("test") or {}).get("dddg_contact_lt8A", {}).get("pearson")
+                            )
+                            rec["distant_ge8_dddg_pearson"] = (
+                                (m.get("test") or {}).get("dddg_distant_ge8A", {}).get("pearson")
                             )
                         report["runs"][tag] = rec
                         if proc.returncode != 0:
