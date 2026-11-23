@@ -66,7 +66,7 @@ _CANDIDATES: dict[str, list[str]] = {
     "label": ["label", "y", "pathogenic", "is_pathogenic",
               "clinical_significance", "clnsig"],
     "gene": ["gene", "gene_symbol", "symbol", "geneinfo"],
-    "cds": ["wt_dna", "wt_cds", "ref_cds", "wt_cdna", "dna_wt", "cds_wt", "dna_seq"],
+    "cds": ["cds", "wt_dna", "wt_cds", "ref_cds", "wt_cdna", "dna_wt", "cds_wt", "dna_seq"],
     "rg": ["rg", "radius_of_gyration", "rg_exp", "rg_angstrom"],
     "value": ["value", "mfi", "intensity", "retention_time", "rt", "expression"],
     "species": ["species", "species_id", "organism"],

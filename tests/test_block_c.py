@@ -312,6 +312,11 @@ def test_competitor_models_and_common_io() -> None:
         check(loaded is not None and tuple(loaded.shape) == (len(seq_t), len(seq_t)),
               "_load_true_contact_map loads <sha1>.npy without NameError")
 
+        # detect_columns recognizes bare 'cds' column (e.g. splits_clinvar*.parquet)
+        from src.data import detect_columns
+        det = detect_columns(pd.DataFrame({"parent_seq": ["ACDE"], "cds": ["GCTTGCGATGAA"]}))
+        check(det.get("cds") == "cds", "detect_columns recognizes bare 'cds' column")
+
         # HoloBackboneV2._mix_esm normalizes each tapped layer before scalar mixing
         from src.backbone import HoloBackboneV2
         bb = HoloBackboneV2(esm_dim=16, hidden=16, out_dim=16, heads=2, n_tap_layers=4, use_multi_layer=True)
