@@ -58,16 +58,19 @@ MARKERS = ("o", "s", "^", "D", "v", "P", "X", "*")
 
 DISPLAY = {
     "holo_geon": "Holo-GeoN v2", "holo_geon_v2": "Holo-GeoN v2", "full": "Holo-GeoN v2",
+    "holo_geon_v2_lean": "Holo-GeoN v2-Lean", "v2_lean": "Holo-GeoN v2-Lean",
     "holo_geon_v1": "Holo-GeoN v1", "v1_baseline": "Holo-GeoN v1",
     "esm_mlp": "ESM-2 + MLP (matched capacity)",
     "esm_mlp_matched_capacity": "ESM-2 + MLP (matched capacity)",
     "esm2_zero_shot": "ESM-2 zero-shot",
-    "thermompnn": "ThermoMPNN", "spurs": "SPURS", "rasp": "RaSP",
+    "thermompnn": "ThermoMPNN", "spurs": "SPURS", "spurs_local": "SPURS (retrained)", "rasp": "RaSP",
     "prostata": "PROSTATA", "ddgemb": "DDGemb", "proteinmpnn_ddg": "ProteinMPNN-ddG",
 }
 
 ARM_LABEL = {
     "v1_baseline": "Holo-GeoN v1 (20.6M params)",
+    "v2_lean": "Holo-GeoN v2-Lean (no E_mech, no SSM)",
+    "multi_layer_ln": "multi-layer ESM (per-layer LN)",
     "no_esm_logits_prior": "no ESM-2 log-odds prior",
     "no_multi_layer": "no multi-layer ScalarMix",
     "no_contact_burial": "no contact-burial descriptors",
