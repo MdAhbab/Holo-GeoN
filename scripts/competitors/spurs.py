@@ -208,6 +208,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--pdb-dir", default=None)
     ap.add_argument("--external", default=None)
     ap.add_argument("--external-pdb-dir", default=None)
+    ap.add_argument("--extra-externals", nargs="*", default=[],
+                    help="Additional external holdouts as tag=parquet::pdb_dir")
     ap.add_argument("--mode", choices=["local_fusion", "upstream"], default="local_fusion")
     ap.add_argument("--work-dir", default="/tmp/competitors/SPURS")
     ap.add_argument("--out", required=True)
@@ -244,6 +246,22 @@ def main(argv: list[str] | None = None) -> int:
                 },
             )
             if args.official_external_only:
+                for spec in args.extra_externals:
+                    tag, rest = spec.split("=", 1)
+                    epq, epdb = rest.split("::", 1) if "::" in rest else (rest, None)
+                    if os.path.isfile(epq) and epdb and os.path.isdir(epdb):
+                        edf = load_external_table(epq)
+                        emap = _resolve_pdb_map(epdb)
+                        t_i = time.time()
+                        r2 = _try_upstream_spurs_external(repo_dir, edf, emap, device)
+                        if r2 is not None:
+                            write_predictions(
+                                out_dir / f"pred_{tag}_official.parquet",
+                                r2[0], r2[1],
+                                meta={"model": "SPURS_official", "implementation": "upstream_luo_group_SPURS",
+                                      "sign": "stabilizing_positive (:+1 — verify on external holdout)",
+                                      "inference_s": round(time.time() - t_i, 2), "peak_vram_gb": gpu_peak_gb()},
+                            )
                 return 0
 
     store = EncodingStore(args.cache, cache_records=512)
@@ -333,6 +351,20 @@ def main(argv: list[str] | None = None) -> int:
                 "seed": args.seed,
             },
         )
+    for spec in args.extra_externals:
+        tag, rest = spec.split("=", 1)
+        epq, epdb = rest.split("::", 1) if "::" in rest else (rest, None)
+        if os.path.isfile(epq):
+            edf = load_external_table(epq)
+            emap = _resolve_pdb_map(epdb)
+            pc = "parent" if "parent" in edf.columns else "uniprot_id"
+            ex = _build_local_fusion_arrays(edf, store, emap, par_col=pc)
+            write_predictions(
+                out_dir / f"pred_{tag}.parquet",
+                ex[5], _predict_tuple(ex),
+                meta={"model": "SPURS_retrained_fusion", "implementation": "retrained_spurs_architecture_esm2_plus_backbone3d",
+                      "sign": "stabilizing_positive (:+1)", "seed": args.seed},
+            )
     return 0
 
 

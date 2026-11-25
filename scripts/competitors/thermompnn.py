@@ -197,6 +197,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--pdb-dir", required=True, help="MegaScale AlphaFold PDB directory")
     ap.add_argument("--external", default=None, help="Optional FireProtDB holdout parquet")
     ap.add_argument("--external-pdb-dir", default=None, help="FireProtDB AlphaFold PDB dir")
+    ap.add_argument("--extra-externals", nargs="*", default=[],
+                    help="Additional external holdouts as tag=parquet::pdb_dir")
     ap.add_argument("--work-dir", default="/tmp/competitors/ThermoMPNN")
     ap.add_argument("--out", required=True)
     ap.add_argument("--epochs", type=int, default=20)
@@ -271,6 +273,21 @@ def main(argv: list[str] | None = None) -> int:
             },
         )
         if args.official_external_only:
+            for spec in args.extra_externals:
+                tag, rest = spec.split("=", 1)
+                epq, epdb = rest.split("::", 1)
+                if os.path.isfile(epq) and os.path.isdir(epdb):
+                    edf = load_external_table(epq)
+                    emap = _resolve_pdb_map(epdb)
+                    pc = "parent" if "parent" in edf.columns else "uniprot_id"
+                    sc = "wt_seq" if "wt_seq" in edf.columns else "parent_seq"
+                    t_i = time.time()
+                    rr, pp = _score_table_direct(edf, emap, pc, sc)
+                    write_predictions(
+                        out_dir / f"pred_{tag}_official.parquet", rr, pp,
+                        meta={"model": "ThermoMPNN_official", "sign": "destabilizing_positive (:-1)",
+                              "inference_s": round(time.time() - t_i, 2), "peak_vram_gb": gpu_peak_gb()},
+                    )
             return 0
 
     # Retrain stability head on OUR exact MegaScale train split (frozen ProteinMPNN backbone!)
@@ -428,6 +445,20 @@ def main(argv: list[str] | None = None) -> int:
                 "seed": args.seed,
             },
         )
+    for spec in args.extra_externals:
+        tag, rest = spec.split("=", 1)
+        epq, epdb = rest.split("::", 1)
+        if os.path.isfile(epq) and os.path.isdir(epdb):
+            edf = load_external_table(epq)
+            emap = _resolve_pdb_map(epdb)
+            pc = "parent" if "parent" in edf.columns else "uniprot_id"
+            sc = "wt_seq" if "wt_seq" in edf.columns else "parent_seq"
+            er_rids, er_preds = _score_table_direct(edf, emap, pc, sc)
+            write_predictions(
+                out_dir / f"pred_{tag}_retrained.parquet",
+                er_rids, er_preds,
+                meta={"model": "ThermoMPNN_retrained", "sign": "stabilizing_positive (:+1 — trained on our targets)", "seed": args.seed},
+            )
     return 0
 
 

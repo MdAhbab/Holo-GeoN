@@ -118,6 +118,15 @@ def resolve_pdb_path(
         for stem, val in available.items():
             if stem.upper().startswith(prefix) or normalize_pdb_stem(stem).startswith(prefix):
                 return val
+
+    # Crystal PDB with chain suffix (e.g. S669 parent '1A0F_A' -> '1A0F.pdb').
+    for key in keys:
+        if len(key) >= 6 and key[4] in ("_", "-", ".") and key[:4].isalnum():
+            pdb4 = key[:4]
+            if pdb4 in available:
+                return available[pdb4]
+            if pdb4 in norm_available:
+                return norm_available[pdb4]
     return None
 
 MAX_MISMATCH_FRACTION = 0.15

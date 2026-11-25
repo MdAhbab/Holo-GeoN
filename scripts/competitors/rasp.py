@@ -191,6 +191,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--pdb-dir", required=True)
     ap.add_argument("--external", default=None)
     ap.add_argument("--external-pdb-dir", default=None)
+    ap.add_argument("--extra-externals", nargs="*", default=[],
+                    help="Additional external holdouts as tag=parquet::pdb_dir")
     ap.add_argument("--out", required=True)
     ap.add_argument("--epochs", type=int, default=25)
     ap.add_argument("--batch-size", type=int, default=256)
@@ -286,6 +288,19 @@ def main(argv: list[str] | None = None) -> int:
                 "seed": args.seed,
             },
         )
+    for spec in args.extra_externals:
+        tag, rest = spec.split("=", 1)
+        epq, epdb = rest.split("::", 1)
+        if os.path.isfile(epq) and os.path.isdir(epdb):
+            edf = load_external_table(epq)
+            emap = _resolve_pdb_map(epdb)
+            pc = "parent" if "parent" in edf.columns else "uniprot_id"
+            ex = _build_cavity_dataset(edf, emap, par_col=pc)
+            write_predictions(
+                out_dir / f"pred_{tag}.parquet",
+                ex[4], _predict_tuple(ex),
+                meta={"model": "RaSP_cavity_retrained", "sign": "stabilizing_positive (:+1)", "seed": args.seed},
+            )
     return 0
 
 

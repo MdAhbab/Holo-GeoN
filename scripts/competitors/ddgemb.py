@@ -173,6 +173,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="DDGemb sequence-only Transformer competitor adapter")
     ap.add_argument("--splits", default="data/splits_megascale.parquet")
     ap.add_argument("--external", default=None)
+    ap.add_argument("--extra-externals", nargs="*", default=[],
+                    help="Additional external holdouts as tag=parquet")
     ap.add_argument("--cache", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--radius", type=int, default=15)
@@ -264,6 +266,17 @@ def main(argv: list[str] | None = None) -> int:
                 "seed": args.seed,
             },
         )
+
+    for spec in args.extra_externals:
+        tag, epq = spec.split("=", 1)
+        if os.path.isfile(epq):
+            edf = load_external_table(epq)
+            ex = _extract_windows(edf, store, args.radius)
+            write_predictions(
+                out_dir / f"pred_{tag}.parquet",
+                ex.row_id, _predict_index(ex),
+                meta={"model": "DDGemb_transformer_frozen_esm2", "sign": "stabilizing_positive (:+1)", "seed": args.seed},
+            )
     return 0
 
 

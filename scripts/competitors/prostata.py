@@ -101,6 +101,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="PROSTATA 5-head sequence-only competitor adapter")
     ap.add_argument("--splits", default="data/splits_megascale.parquet")
     ap.add_argument("--external", default=None)
+    ap.add_argument("--extra-externals", nargs="*", default=[],
+                    help="Additional external holdouts as tag=parquet")
     ap.add_argument("--cache", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--epochs", type=int, default=20)
@@ -197,6 +199,21 @@ def main(argv: list[str] | None = None) -> int:
             ex[5], _predict_tuple(ex),
             meta={"model": "PROSTATA_5head_frozen_esm2", "sign": "stabilizing_positive (:+1)"},
         )
+
+    for spec in args.extra_externals:
+        tag, epq = spec.split("=", 1)
+        if os.path.isfile(epq):
+            edf = load_external_table(epq)
+            if "parent_seq" not in edf.columns and "wt_seq" in edf.columns:
+                edf["parent_seq"] = edf["wt_seq"]
+            if "target" not in edf.columns and "ddg" in edf.columns:
+                edf["target"] = edf["ddg"]
+            ex = _build_arrays(edf, store)
+            write_predictions(
+                out_dir / f"pred_{tag}.parquet",
+                ex[5], _predict_tuple(ex),
+                meta={"model": "PROSTATA_5head_frozen_esm2", "sign": "stabilizing_positive (:+1)", "seed": args.seed},
+            )
     return 0
 
 
