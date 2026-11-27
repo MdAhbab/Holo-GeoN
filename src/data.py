@@ -737,6 +737,7 @@ class _ParentGraphCache:
         self.max_entries = int(max_entries)
         self._base: dict[str, dict] = {}
         self._khops: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._khop_tables: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def get_whole(self, seq: str, record: dict) -> dict | None:
         length = record["emb"].shape[0]
@@ -760,6 +761,53 @@ class _ParentGraphCache:
         if len(self._khops) < self.max_entries * 64:
             self._khops[key] = (m1, m2)
         return m1, m2
+
+    def get_khop_tables(self, seq: str, edge_geo: torch.Tensor, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        ``(n, n)`` bool tables ``N1[s]`` / ``N2[s]`` = the 1-hop / k-hop mask of
+        site ``s``, i.e. exactly :func:`khop_neighborhood` stacked over every
+        site. Indexing it replaces a Python loop of ``K`` khop calls and a
+        ``torch.stack`` per item; the values are identical.
+        """
+        hit = self._khop_tables.get(seq)
+        if hit is not None:
+            return hit
+        hops2 = self.cfg.get("neighborhood_hops", 2)
+        n1 = torch.stack([khop_neighborhood(edge_geo, i, n, hops=1) for i in range(n)], dim=0)
+        n2 = torch.stack([khop_neighborhood(edge_geo, i, n, hops=hops2) for i in range(n)], dim=0)
+        if len(self._khop_tables) < self.max_entries:
+            self._khop_tables[seq] = (n1, n2)
+        return n1, n2
+
+
+# Graph structure depends only on these config keys (plus window and the encoder
+# cache directory). Datasets built in one process with the same values - the
+# train / val / test / train_eval loaders of a run - share ONE cache, so each
+# parent's graph is built once per process instead of once per dataset and,
+# via fork, once per DataLoader worker.
+_GRAPH_CFG_KEYS = (
+    "true_contact_edges", "true_contacts_dir", "graph_top_k", "contact_min_sep",
+    "geo_threshold", "eps", "delta", "mech_max_degree", "neighborhood_hops",
+    "use_str_stream", "str_topology_only",
+)
+_SHARED_GRAPH_CACHES: dict[tuple, _ParentGraphCache] = {}
+
+
+def get_shared_graph_cache(cfg: dict, window: int, store=None) -> _ParentGraphCache:
+    key = (
+        str(getattr(store, "cache_dir", id(store))),
+        int(window),
+        tuple((k, repr(cfg.get(k))) for k in _GRAPH_CFG_KEYS),
+    )
+    cache = _SHARED_GRAPH_CACHES.get(key)
+    if cache is None:
+        cache = _ParentGraphCache(cfg, window)
+        _SHARED_GRAPH_CACHES[key] = cache
+    return cache
+
+
+def clear_shared_graph_caches() -> None:
+    _SHARED_GRAPH_CACHES.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -808,7 +856,7 @@ class MutationDataset(Dataset):
         self.target = target
         self.noise_std = float(noise_std)
         self.cds_dropout = float(cds_dropout)
-        self._graph_cache = _ParentGraphCache(self.cfg, self.window)
+        self._graph_cache = get_shared_graph_cache(self.cfg, self.window, self.store)
 
     def __len__(self) -> int:
         return len(self.df)
@@ -884,7 +932,7 @@ class ProteinBatchMutationDataset(Dataset):
         self.cds_dropout = float(cds_dropout)
         self.seed = int(seed)
         self.epoch = 0
-        self._graph_cache = _ParentGraphCache(self.cfg, self.window)
+        self._graph_cache = get_shared_graph_cache(self.cfg, self.window, self.store)
 
         # Group row indices by parent_seq
         self._groups: list[tuple[str, np.ndarray]] = []
@@ -908,6 +956,25 @@ class ProteinBatchMutationDataset(Dataset):
         self.epoch = int(epoch)
         self._rebuild_chunks(self.epoch)
 
+    def prewarm(self) -> int:
+        """
+        Build every whole-protein graph and k-hop table this dataset will need
+        in the CURRENT process. Call before creating a multi-worker DataLoader
+        on a fork platform: workers inherit the (read-only) cache copy-on-write
+        instead of each rebuilding it, and non-persistent evaluation workers no
+        longer rebuild it every epoch. Pure caching; outputs are unchanged.
+        Returns the number of proteins cached.
+        """
+        n_cached = 0
+        for seq, _idxs in self._groups:
+            rec = self.store.get(seq)
+            base = self._graph_cache.get_whole(seq, rec)
+            if base is None:
+                continue
+            self._graph_cache.get_khop_tables(seq, base["edge_geo"], base["n"])
+            n_cached += 1
+        return n_cached
+
     def _rebuild_chunks(self, epoch: int) -> None:
         rng = np.random.default_rng(self.seed * 1_000_003 + epoch * 7_919)
         chunks: list[tuple[str, np.ndarray]] = []
@@ -927,6 +994,7 @@ class ProteinBatchMutationDataset(Dataset):
         drop_cds = self.train and self.cds_dropout > 0.0 and float(torch.rand(())) < self.cds_dropout
 
         base = self._graph_cache.get_whole(seq, rec)
+        shared_graph = base is not None
         if base is None:
             # Fallback if a protein exceeds window: center on the first mutation
             base = build_sample_graph(rec, int(self._site[idxs[0]]), self.window, self.cfg, drop_cds=drop_cds)
@@ -944,11 +1012,18 @@ class ProteinBatchMutationDataset(Dataset):
 
         n = base["n"]
         local_sites = np.clip(self._site[idxs] - start_off, 0, n - 1)
-        m1_list, m2_list = [], []
-        for s in local_sites:
-            m1, m2 = self._graph_cache.get_khops(seq, base["edge_geo"], int(s), n)
-            m1_list.append(m1)
-            m2_list.append(m2)
+        if shared_graph:
+            n1_tab, n2_tab = self._graph_cache.get_khop_tables(seq, base["edge_geo"], n)
+            sites_t = torch.from_numpy(local_sites.astype(np.int64))
+            neigh_1, neigh_2 = n1_tab[sites_t], n2_tab[sites_t]
+        else:
+            # A site-centred crop is specific to this chunk: never cache its
+            # k-hop masks under the whole-protein (seq, site) key.
+            hops2 = self.cfg.get("neighborhood_hops", 2)
+            neigh_1 = torch.stack([khop_neighborhood(base["edge_geo"], int(s), n, hops=1)
+                                   for s in local_sites], dim=0)
+            neigh_2 = torch.stack([khop_neighborhood(base["edge_geo"], int(s), n, hops=hops2)
+                                   for s in local_sites], dim=0)
 
         item = {
             "esm": base["esm"],
@@ -962,8 +1037,8 @@ class ProteinBatchMutationDataset(Dataset):
             "length": base["length"],
             "truncated": base["truncated"],
             "sites": torch.from_numpy(local_sites.astype(np.int64)),
-            "neigh_1hop": torch.stack(m1_list, dim=0),      # (K, n)
-            "neigh_2hop": torch.stack(m2_list, dim=0),      # (K, n)
+            "neigh_1hop": neigh_1,                          # (K, n)
+            "neigh_2hop": neigh_2,                          # (K, n)
             "wt_idx": torch.from_numpy(self._wt_idx[idxs]),
             "mt_idx": torch.from_numpy(self._mt_idx[idxs]),
             "y": torch.from_numpy(self._y[idxs]),
@@ -1355,6 +1430,8 @@ __all__ = [
     "build_sample_graph",
     "MutationDataset",
     "ProteinBatchMutationDataset",
+    "get_shared_graph_cache",
+    "clear_shared_graph_caches",
     "SequenceDataset",
     "collate_graphs",
     "collate_protein_batch",

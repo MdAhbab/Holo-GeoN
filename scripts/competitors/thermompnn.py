@@ -40,6 +40,11 @@ from scripts.competitors.common import (
     gpu_peak_gb,
     load_external_table,
     load_split_table,
+    match_group_pdb,
+    parse_extra_external_spec,
+    row_id_array,
+    safe_pearson,
+    target_array,
     write_predictions,
 )
 from src.geometry import (
@@ -54,7 +59,9 @@ from src.substitution import AA_ORDER, aa_index
 THERMOMPNN_URL = "https://github.com/Kuhlman-Lab/ThermoMPNN.git"
 
 
-def _resolve_pdb_map(pdb_dir: str) -> dict[str, Path]:
+def _resolve_pdb_map(pdb_dir: str | None) -> dict[str, Path]:
+    if not pdb_dir or not os.path.isdir(pdb_dir):
+        return {}
     return {
         normalize_pdb_stem(p.name): p
         for p in Path(pdb_dir).rglob("*.pdb")
@@ -62,6 +69,8 @@ def _resolve_pdb_map(pdb_dir: str) -> dict[str, Path]:
 
 
 def _match_pdb(parent: str, pdb_map: dict[str, Path]) -> Path | None:
+    if not pdb_map:
+        return None
     hit = resolve_pdb_path(str(parent), pdb_map)
     return Path(hit) if hit is not None else None
 
@@ -88,6 +97,8 @@ def _forward_thermompnn_head(
     (``light_attention`` + ``both_out`` + ``ddg_out`` + ``subtract_mut``) over
     a batch of pre-extracted frozen ProteinMPNN residue features ``(B, D)``.
     """
+    if res_feats.size(0) == 0:
+        return res_feats.new_empty((0,))
     x = res_feats
     if getattr(model, "lightattn", False):
         x_in = x.unsqueeze(-1)  # (B, D, 1)
@@ -124,7 +135,7 @@ def _extract_mpnn_residue_features(
         if n_final > 0:
             parts.append(torch.cat(all_mpnn_hid[:n_final], dim=-1))
         parts.append(mpnn_embed)
-        return torch.cat(parts, dim=-1)[0].detach().cpu()
+        return torch.cat(parts, dim=-1)[0].detach().cpu().float()
 
 
 class _AttrDict(dict):
@@ -194,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="ThermoMPNN competitor adapter")
     ap.add_argument("--splits", default="data/splits_megascale.parquet")
     ap.add_argument("--pairs", default="data/megascale_ddg_pairs.parquet")
-    ap.add_argument("--pdb-dir", required=True, help="MegaScale AlphaFold PDB directory")
+    ap.add_argument("--pdb-dir", default=None, help="MegaScale AlphaFold PDB directory")
     ap.add_argument("--external", default=None, help="Optional FireProtDB holdout parquet")
     ap.add_argument("--external-pdb-dir", default=None, help="FireProtDB AlphaFold PDB dir")
     ap.add_argument("--extra-externals", nargs="*", default=[],
@@ -209,6 +220,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="Score ThermoMPNN official checkpoint on external holdout only (no retrain)")
     args = ap.parse_args(argv)
 
+    if not args.official_external_only and not args.pdb_dir:
+        ap.error("--pdb-dir is required unless --official-external-only is set")
+
     t0 = time.time()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -216,7 +230,9 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    repo_dir = clone_repo(THERMOMPNN_URL, Path(args.work_dir))
+    repo_dir = Path(args.work_dir)
+    if not (repo_dir / "transfer_model.py").is_file():
+        repo_dir = clone_repo(THERMOMPNN_URL, repo_dir)
     if str(repo_dir) not in sys.path:
         sys.path.append(str(repo_dir))
 
@@ -225,37 +241,59 @@ def main(argv: list[str] | None = None) -> int:
 
     def _score_table_direct(df: pd.DataFrame, pdb_map: dict[str, Path],
                             par_col: str, seq_col: str) -> tuple[np.ndarray, np.ndarray]:
+        if len(df) == 0 or not pdb_map:
+            return np.empty((0,), np.int64), np.empty((0,), np.float32)
+        if par_col not in df.columns:
+            par_col = "uniprot_id" if "uniprot_id" in df.columns else ""
+        if not par_col or seq_col not in df.columns or any(c not in df.columns for c in ("site", "wt_aa", "mt_aa")):
+            return np.empty((0,), np.int64), np.empty((0,), np.float32)
+
         rids, preds = [], []
         for parent, grp in df.groupby(par_col, sort=False):
-            pfile = _match_pdb(str(parent), pdb_map)
+            pfile = match_group_pdb(parent, grp, pdb_map, _match_pdb)
             if pfile is None:
                 continue
-            pdb_list = alt_parse_PDB(str(pfile))
+            try:
+                pdb_list = alt_parse_PDB(str(pfile))
+            except Exception as exc:
+                print(f"[thermompnn] WARNING: skipping PDB {pfile} ({exc})", flush=True)
+                continue
             if not pdb_list or "seq" not in pdb_list[0]:
                 continue
-            pdb_seq = str(pdb_list[0]["seq"]).upper()
-            wt_seq = str(grp[seq_col].iloc[0]).upper()
+            pdb_seq = str(pdb_list[0]["seq"]).strip().upper()
+            wt_seq = str(grp[seq_col].iloc[0]).strip().upper()
+            if not pdb_seq or not wt_seq:
+                continue
             off, _, _err = align_to_sequence(pdb_seq, wt_seq)
             if off is None:
                 continue
             mut_list = []
             valid_rids = []
-            for r in grp.itertuples(index=False):
-                site = int(r.site) + off
-                w, m_aa = str(r.wt_aa).upper(), str(r.mt_aa).upper()
+            grp_rids = row_id_array(grp)
+            for rid_val, r in zip(grp_rids, grp.itertuples(index=False)):
+                raw_site = getattr(r, "site", None)
+                raw_w = getattr(r, "wt_aa", None)
+                raw_m = getattr(r, "mt_aa", None)
+                if raw_site is None or pd.isna(raw_site) or pd.isna(raw_w) or pd.isna(raw_m):
+                    continue
+                site = int(raw_site) + off
+                w, m_aa = str(raw_w).strip().upper(), str(raw_m).strip().upper()
                 if 0 <= site < len(pdb_seq) and w in aa_to_tm and m_aa in aa_to_tm:
                     mut_list.append(type("M", (), {"position": site, "wildtype": w, "mutation": m_aa})())
-                    valid_rids.append(int(r.row_id))
+                    valid_rids.append(int(rid_val))
             if not mut_list:
                 continue
             with torch.no_grad():
                 out_list, _ = model(pdb_list, mut_list)
             for rid, item in zip(valid_rids, out_list):
+                if item is None or "ddG" not in item:
+                    continue
+                val = item["ddG"]
                 rids.append(rid)
-                preds.append(float(item["ddG"].item()))
+                preds.append(float(val.item()) if hasattr(val, "item") else float(val))
         return np.asarray(rids, np.int64), np.asarray(preds, np.float32)
 
-    if args.external and args.external_pdb_dir:
+    if args.external and args.external_pdb_dir and os.path.isfile(args.external):
         ext_df = load_external_table(args.external)
         ext_pdbs = _resolve_pdb_map(args.external_pdb_dir)
         par_col = "parent" if "parent" in ext_df.columns else "uniprot_id"
@@ -272,28 +310,35 @@ def main(argv: list[str] | None = None) -> int:
                 "peak_vram_gb": gpu_peak_gb(),
             },
         )
-        if args.official_external_only:
-            for spec in args.extra_externals:
-                tag, rest = spec.split("=", 1)
-                epq, epdb = rest.split("::", 1)
-                if os.path.isfile(epq) and os.path.isdir(epdb):
-                    edf = load_external_table(epq)
-                    emap = _resolve_pdb_map(epdb)
-                    pc = "parent" if "parent" in edf.columns else "uniprot_id"
-                    sc = "wt_seq" if "wt_seq" in edf.columns else "parent_seq"
-                    t_i = time.time()
-                    rr, pp = _score_table_direct(edf, emap, pc, sc)
-                    write_predictions(
-                        out_dir / f"pred_{tag}_official.parquet", rr, pp,
-                        meta={"model": "ThermoMPNN_official", "sign": "destabilizing_positive (:-1)",
-                              "inference_s": round(time.time() - t_i, 2), "peak_vram_gb": gpu_peak_gb()},
-                    )
-            return 0
+    if args.official_external_only:
+        for spec in args.extra_externals:
+            tag, epq, epdb = parse_extra_external_spec(spec)
+            if os.path.isfile(epq) and epdb and os.path.isdir(epdb):
+                edf = load_external_table(epq)
+                emap = _resolve_pdb_map(epdb)
+                pc = "parent" if "parent" in edf.columns else "uniprot_id"
+                sc = "wt_seq" if "wt_seq" in edf.columns else "parent_seq"
+                t_i = time.time()
+                rr, pp = _score_table_direct(edf, emap, pc, sc)
+                write_predictions(
+                    out_dir / f"pred_{tag}_official.parquet", rr, pp,
+                    meta={"model": "ThermoMPNN_official", "sign": "destabilizing_positive (:-1)",
+                          "inference_s": round(time.time() - t_i, 2), "peak_vram_gb": gpu_peak_gb()},
+                )
+            else:
+                print(
+                    f"[thermompnn] WARNING: skipping extra external {tag!r} "
+                    f"(requires both parquet {epq!r} and pdb_dir {epdb!r})",
+                    flush=True,
+                )
+        return 0
 
     # Retrain stability head on OUR exact MegaScale train split (frozen ProteinMPNN backbone!)
     splits = load_split_table(args.splits)
-    pairs = pd.read_parquet(args.pairs, columns=["parent", "wt_seq"]).drop_duplicates("wt_seq")
-    splits = splits.merge(pairs, left_on="parent_seq", right_on="wt_seq", how="left")
+    if args.pairs and os.path.isfile(args.pairs) and "parent" not in splits.columns:
+        pairs = pd.read_parquet(args.pairs, columns=["parent", "wt_seq"]).drop_duplicates("wt_seq")
+        pairs["wt_seq"] = pairs["wt_seq"].astype(str).str.strip().str.upper()
+        splits = splits.merge(pairs, left_on="parent_seq", right_on="wt_seq", how="left")
     ms_pdbs = _resolve_pdb_map(args.pdb_dir)
 
     # Re-initialize ONLY the trainable ddG head (keep frozen ProteinMPNN backbone!)
@@ -309,42 +354,65 @@ def main(argv: list[str] | None = None) -> int:
     opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=1e-4)
     loss_fn = nn.MSELoss()
 
-    def _build_split_tensors(sub_df: pd.DataFrame):
+    def _build_split_tensors(sub_df: pd.DataFrame, feat_dim: int = 384):
         feats_list, wt_list, mt_list, y_list, rid_list = [], [], [], [], []
         n_proteins = 0
-        for parent, grp in sub_df.groupby("parent", sort=False):
-            pfile = _match_pdb(str(parent), ms_pdbs)
-            if pfile is None:
-                continue
-            pdb_list = alt_parse_PDB(str(pfile))
-            if not pdb_list or "seq" not in pdb_list[0]:
-                continue
-            pdb_seq = str(pdb_list[0]["seq"]).upper()
-            wt_seq = str(grp["parent_seq"].iloc[0]).upper()
-            off, _, _err = align_to_sequence(pdb_seq, wt_seq)
-            if off is None:
-                continue
-            res_emb = _extract_mpnn_residue_features(model, pdb_list, tied_featurize, device)
-            pos_idx, w_idx, m_idx, ys, rids = [], [], [], [], []
-            for r in grp.itertuples(index=False):
-                site = int(r.site) + off
-                w, m_aa = str(r.wt_aa).upper(), str(r.mt_aa).upper()
-                if 0 <= site < res_emb.size(0) and w in aa_to_tm and m_aa in aa_to_tm:
-                    pos_idx.append(site)
-                    w_idx.append(aa_to_tm[w])
-                    m_idx.append(aa_to_tm[m_aa])
-                    ys.append(float(r.target))
-                    rids.append(int(r.row_id))
-            if pos_idx:
-                n_proteins += 1
-                feats_list.append(res_emb[torch.tensor(pos_idx, dtype=torch.long)])
-                wt_list.append(torch.tensor(w_idx, dtype=torch.long))
-                mt_list.append(torch.tensor(m_idx, dtype=torch.long))
-                y_list.append(torch.tensor(ys, dtype=torch.float32))
-                rid_list.append(np.asarray(rids, dtype=np.int64))
+        par_col = "parent" if "parent" in sub_df.columns else ("uniprot_id" if "uniprot_id" in sub_df.columns else None)
+        seq_col = "parent_seq" if "parent_seq" in sub_df.columns else ("wt_seq" if "wt_seq" in sub_df.columns else None)
+        if (
+            len(sub_df) > 0
+            and ms_pdbs
+            and par_col is not None
+            and seq_col is not None
+            and all(c in sub_df.columns for c in ("site", "wt_aa", "mt_aa"))
+        ):
+            for parent, grp in sub_df.groupby(par_col, sort=False):
+                pfile = match_group_pdb(parent, grp, ms_pdbs, _match_pdb)
+                if pfile is None:
+                    continue
+                try:
+                    pdb_list = alt_parse_PDB(str(pfile))
+                except Exception as exc:
+                    print(f"[thermompnn] WARNING: skipping PDB {pfile} ({exc})", flush=True)
+                    continue
+                if not pdb_list or "seq" not in pdb_list[0]:
+                    continue
+                pdb_seq = str(pdb_list[0]["seq"]).strip().upper()
+                wt_seq = str(grp[seq_col].iloc[0]).strip().upper()
+                if not pdb_seq or not wt_seq:
+                    continue
+                off, _, _err = align_to_sequence(pdb_seq, wt_seq)
+                if off is None:
+                    continue
+                res_emb = _extract_mpnn_residue_features(model, pdb_list, tied_featurize, device)
+                feat_dim = int(res_emb.shape[-1])
+                pos_idx, w_idx, m_idx, ys, rids = [], [], [], [], []
+                grp_y = target_array(grp)
+                grp_rids = row_id_array(grp)
+                for y_val, rid_val, r in zip(grp_y, grp_rids, grp.itertuples(index=False)):
+                    raw_site = getattr(r, "site", None)
+                    raw_w = getattr(r, "wt_aa", None)
+                    raw_m = getattr(r, "mt_aa", None)
+                    if raw_site is None or pd.isna(raw_site) or pd.isna(raw_w) or pd.isna(raw_m):
+                        continue
+                    site = int(raw_site) + off
+                    w, m_aa = str(raw_w).strip().upper(), str(raw_m).strip().upper()
+                    if 0 <= site < res_emb.size(0) and w in aa_to_tm and m_aa in aa_to_tm:
+                        pos_idx.append(site)
+                        w_idx.append(aa_to_tm[w])
+                        m_idx.append(aa_to_tm[m_aa])
+                        ys.append(float(y_val))
+                        rids.append(int(rid_val))
+                if pos_idx:
+                    n_proteins += 1
+                    feats_list.append(res_emb[torch.tensor(pos_idx, dtype=torch.long)])
+                    wt_list.append(torch.tensor(w_idx, dtype=torch.long))
+                    mt_list.append(torch.tensor(m_idx, dtype=torch.long))
+                    y_list.append(torch.tensor(ys, dtype=torch.float32))
+                    rid_list.append(np.asarray(rids, dtype=np.int64))
         if not feats_list:
             return (
-                torch.empty((0, 384), dtype=torch.float32),
+                torch.empty((0, feat_dim), dtype=torch.float32),
                 torch.empty((0,), dtype=torch.long),
                 torch.empty((0,), dtype=torch.long),
                 torch.empty((0,), dtype=torch.float32),
@@ -362,8 +430,11 @@ def main(argv: list[str] | None = None) -> int:
 
     print("[thermompnn] Extracting frozen ProteinMPNN residue features for train/val/test ...", flush=True)
     tr_X, tr_w, tr_m, tr_y, _tr_r, n_tr = _build_split_tensors(splits[splits["split"] == "train"])
-    va_X, va_w, va_m, va_y, _va_r, n_va = _build_split_tensors(splits[splits["split"] == "val"])
-    te_X, te_w, te_m, _te_y, te_rids, n_te = _build_split_tensors(splits[splits["split"] == "test"])
+    if len(tr_y) == 0:
+        raise RuntimeError("ThermoMPNN: no training mutations aligned to PDB structures")
+    feat_dim = int(tr_X.shape[-1])
+    va_X, va_w, va_m, va_y, _va_r, n_va = _build_split_tensors(splits[splits["split"] == "val"], feat_dim=feat_dim)
+    te_X, te_w, te_m, _te_y, te_rids, n_te = _build_split_tensors(splits[splits["split"] == "test"], feat_dim=feat_dim)
     print(
         f"[thermompnn] Proteins: train={n_tr} ({len(tr_y)}), val={n_va} ({len(va_y)}), "
         f"test={n_te} ({len(te_rids)})",
@@ -379,8 +450,8 @@ def main(argv: list[str] | None = None) -> int:
                 p = _forward_thermompnn_head(
                     model, X[s:e].to(device), w[s:e].to(device), m[s:e].to(device)
                 )
-                preds.append(p.detach().cpu().numpy().astype(np.float32))
-        return np.concatenate(preds) if preds else np.empty((0,), dtype=np.float32)
+                preds.append(p.detach().cpu().float().numpy().astype(np.float32))
+        return np.concatenate(preds).astype(np.float32) if preds else np.empty((0,), dtype=np.float32)
 
     best_r = -1e9
     best_state = None
@@ -392,7 +463,7 @@ def main(argv: list[str] | None = None) -> int:
         order = rng.permutation(n_train)
         for s in range(0, n_train, args.batch_size):
             idx = order[s:min(s + args.batch_size, n_train)]
-            idx_t = torch.from_numpy(idx)
+            idx_t = torch.from_numpy(idx).long()
             opt.zero_grad(set_to_none=True)
             pred = _forward_thermompnn_head(
                 model, tr_X[idx_t].to(device), tr_w[idx_t].to(device), tr_m[idx_t].to(device)
@@ -403,7 +474,7 @@ def main(argv: list[str] | None = None) -> int:
             opt.step()
 
         vp = _predict_batched(va_X, va_w, va_m)
-        r = float(np.corrcoef(va_y.numpy(), vp)[0, 1]) if len(vp) > 1 else float("nan")
+        r = safe_pearson(va_y.numpy(), vp)
         print(f"[thermompnn] epoch {ep}/{args.epochs}  val_pearson={r:.4f}", flush=True)
         if np.isfinite(r) and r > best_r:
             best_r = r
@@ -422,7 +493,7 @@ def main(argv: list[str] | None = None) -> int:
             "model": "ThermoMPNN_retrained",
             "sign": "stabilizing_positive (:+1 — trained on our targets)",
             "trainable_params": sum(p.numel() for p in trainable),
-            "best_val_pearson": round(best_r, 4),
+            "best_val_pearson": round(best_r, 4) if best_state is not None and np.isfinite(best_r) else None,
             "wall_clock_s": round(time.time() - t0, 2),
             "test_inference_s": round(time.time() - t_te, 2),
             "peak_vram_gb": gpu_peak_gb(),
@@ -446,9 +517,8 @@ def main(argv: list[str] | None = None) -> int:
             },
         )
     for spec in args.extra_externals:
-        tag, rest = spec.split("=", 1)
-        epq, epdb = rest.split("::", 1)
-        if os.path.isfile(epq) and os.path.isdir(epdb):
+        tag, epq, epdb = parse_extra_external_spec(spec)
+        if os.path.isfile(epq) and epdb and os.path.isdir(epdb):
             edf = load_external_table(epq)
             emap = _resolve_pdb_map(epdb)
             pc = "parent" if "parent" in edf.columns else "uniprot_id"
@@ -458,6 +528,12 @@ def main(argv: list[str] | None = None) -> int:
                 out_dir / f"pred_{tag}_retrained.parquet",
                 er_rids, er_preds,
                 meta={"model": "ThermoMPNN_retrained", "sign": "stabilizing_positive (:+1 — trained on our targets)", "seed": args.seed},
+            )
+        else:
+            print(
+                f"[thermompnn] WARNING: skipping extra external {tag!r} "
+                f"(requires both parquet {epq!r} and pdb_dir {epdb!r})",
+                flush=True,
             )
     return 0
 

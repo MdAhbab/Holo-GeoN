@@ -21,12 +21,16 @@ from tests import helpers
 
 def main() -> int:
     from tests import (
+        test_a100_suite_smoke,
+        test_a100_ui_capture,
         test_app,
         test_app_v2,
         test_block_c,
         test_cli,
+        test_competitors_smoke,
         test_dataset_etl,
         test_epistasis_etl,
+        test_fast_eval,
         test_figures,
         test_invariants,
         test_pipeline,
@@ -50,6 +54,10 @@ def main() -> int:
         ("Holo-GeoN v2 & geometry invariants", test_v2.TESTS),
         ("Block C epistasis / competitors / Zenodo", test_block_c.TESTS),
         ("paper figures & tables", test_figures.TESTS),
+        ("fast batched eval & shared graph cache", test_fast_eval.TESTS),
+        ("A100 UI capture selectors & backend schemas", test_a100_ui_capture.TESTS),
+        ("competitors adapters & edge cases", test_competitors_smoke.TESTS),
+        ("A100 unified suite end-to-end smoke", test_a100_suite_smoke.TESTS),
     ]
 
     errors: list[str] = []

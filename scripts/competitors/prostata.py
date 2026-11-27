@@ -30,6 +30,13 @@ from scripts.competitors.common import (
     gpu_peak_gb,
     load_external_table,
     load_split_table,
+    lookup_store_seq,
+    parse_extra_external_spec,
+    row_id_array,
+    safe_aa_index,
+    safe_pearson,
+    target_array,
+    valid_site_mask,
     write_predictions,
 )
 from src.encoder import EncodingStore
@@ -60,9 +67,9 @@ class ProstataFiveHead(nn.Module):
     def forward(self, h_site: torch.Tensor, h_global: torch.Tensor,
                 wt_idx: torch.Tensor, mt_idx: torch.Tensor) -> torch.Tensor:
         hs = self.proj(h_site)
-        hg = self.proj(h_global)
-        ew = self.aa(wt_idx)
-        em = self.aa(mt_idx)
+        hg = self.proj(h_global).to(hs.dtype)
+        ew = self.aa(wt_idx).to(hs.dtype)
+        em = self.aa(mt_idx).to(hs.dtype)
         p1 = self.h1(torch.cat([hs, ew, em], dim=-1))
         p2 = self.h2_s(torch.cat([hs, em], dim=-1)) - self.h2_s(torch.cat([hs, ew], dim=-1))
         p3 = self.h3(torch.cat([hs, hg, ew, em], dim=-1))
@@ -71,22 +78,43 @@ class ProstataFiveHead(nn.Module):
         return (p1 + p2 + p3 + p4 + p5) / 5.0
 
 
-def _build_arrays(df: pd.DataFrame, store: EncodingStore):
+def _build_arrays(df: pd.DataFrame, store: EncodingStore, esm_dim: int = 0):
     hs_l, hg_l, wt_l, mt_l, y_l, rid_l = [], [], [], [], [], []
-    for seq, grp in df.groupby("parent_seq", sort=False):
-        if not store.has(str(seq)):
-            continue
-        rec = store.get(str(seq))
-        emb = rec["emb"].float()
-        g_vec = emb.mean(dim=0)
-        L = emb.shape[0]
-        sites = np.clip(grp["site"].to_numpy(dtype=np.int64), 0, L - 1)
-        hs_l.append(emb[sites])
-        hg_l.append(g_vec.unsqueeze(0).expand(len(sites), -1))
-        wt_l.append(torch.tensor([aa_index(a) for a in grp["wt_aa"]], dtype=torch.long))
-        mt_l.append(torch.tensor([aa_index(a) for a in grp["mt_aa"]], dtype=torch.long))
-        y_l.append(torch.tensor(grp["target"].to_numpy(dtype=np.float32)))
-        rid_l.append(grp["row_id"].to_numpy(dtype=np.int64))
+    seq_col = "parent_seq" if "parent_seq" in df.columns else ("wt_seq" if "wt_seq" in df.columns else None)
+
+    if len(df) > 0 and seq_col is not None and all(c in df.columns for c in ("site", "wt_aa", "mt_aa")):
+        for seq, grp in df.groupby(seq_col, sort=False):
+            seq_key_str = lookup_store_seq(store, str(seq))
+            if seq_key_str is None:
+                continue
+            rec = store.get(seq_key_str)
+            emb = rec["emb"].float()
+            L = int(emb.shape[0])
+            if L <= 0:
+                continue
+            esm_dim = int(emb.shape[-1])
+            in_bounds, sites = valid_site_mask(grp["site"], L)
+            if sites.size == 0:
+                continue
+            grp_ok = grp if bool(in_bounds.all()) else grp.loc[in_bounds]
+            g_vec = emb.mean(dim=0)
+            hs_l.append(emb[sites])
+            hg_l.append(g_vec.unsqueeze(0).expand(len(sites), -1))
+            wt_l.append(torch.tensor([safe_aa_index(a) for a in grp_ok["wt_aa"]], dtype=torch.long))
+            mt_l.append(torch.tensor([safe_aa_index(a) for a in grp_ok["mt_aa"]], dtype=torch.long))
+            y_l.append(torch.from_numpy(target_array(grp_ok)))
+            rid_l.append(row_id_array(grp_ok))
+
+    if not hs_l:
+        return (
+            torch.empty((0, esm_dim), dtype=torch.float32),
+            torch.empty((0, esm_dim), dtype=torch.float32),
+            torch.empty((0,), dtype=torch.long),
+            torch.empty((0,), dtype=torch.long),
+            torch.empty((0,), dtype=torch.float32),
+            np.empty((0,), dtype=np.int64),
+        )
+
     return (
         torch.cat(hs_l, dim=0),
         torch.cat(hg_l, dim=0),
@@ -102,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--splits", default="data/splits_megascale.parquet")
     ap.add_argument("--external", default=None)
     ap.add_argument("--extra-externals", nargs="*", default=[],
-                    help="Additional external holdouts as tag=parquet")
+                    help="Additional external holdouts as tag=parquet (or tag=parquet::pdb_dir)")
     ap.add_argument("--cache", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--epochs", type=int, default=20)
@@ -117,13 +145,16 @@ def main(argv: list[str] | None = None) -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     store = EncodingStore(args.cache, cache_records=512)
     out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     splits = load_split_table(args.splits)
     tr = _build_arrays(splits[splits["split"] == "train"], store)
-    va = _build_arrays(splits[splits["split"] == "val"], store)
-    te = _build_arrays(splits[splits["split"] == "test"], store)
+    if len(tr[4]) == 0:
+        raise RuntimeError("PROSTATA: no training rows matched cached parent sequences")
+    esm_dim = int(tr[0].shape[-1])
+    va = _build_arrays(splits[splits["split"] == "val"], store, esm_dim=esm_dim)
+    te = _build_arrays(splits[splits["split"] == "test"], store, esm_dim=esm_dim)
 
-    esm_dim = tr[0].shape[-1]
     model = ProstataFiveHead(esm_dim=esm_dim).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     loss_fn = nn.MSELoss()
@@ -137,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
         model.train()
         perm = rng.permutation(n_tr)
         for lo in range(0, n_tr, args.batch_size):
-            idx = perm[lo:lo + args.batch_size]
+            idx = torch.from_numpy(perm[lo:lo + args.batch_size]).long()
             opt.zero_grad(set_to_none=True)
             pred = model(tr[0][idx].to(device), tr[1][idx].to(device),
                          tr[2][idx].to(device), tr[3][idx].to(device)).reshape(-1)
@@ -152,9 +183,9 @@ def main(argv: list[str] | None = None) -> int:
             for lo in range(0, len(va[4]), 1024):
                 vp.append(model(va[0][lo:lo + 1024].to(device), va[1][lo:lo + 1024].to(device),
                                 va[2][lo:lo + 1024].to(device), va[3][lo:lo + 1024].to(device))
-                          .reshape(-1).cpu().numpy())
-            vp_arr = np.concatenate(vp)
-            r = float(np.corrcoef(va[4].numpy(), vp_arr)[0, 1])
+                          .reshape(-1).detach().cpu().float().numpy())
+            vp_arr = np.concatenate(vp) if vp else np.empty((0,), dtype=np.float32)
+            r = safe_pearson(va[4].numpy(), vp_arr)
         if np.isfinite(r) and r > best_r:
             best_r = r
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -169,8 +200,8 @@ def main(argv: list[str] | None = None) -> int:
             for lo in range(0, len(tup[4]), 1024):
                 preds.append(model(tup[0][lo:lo + 1024].to(device), tup[1][lo:lo + 1024].to(device),
                                    tup[2][lo:lo + 1024].to(device), tup[3][lo:lo + 1024].to(device))
-                             .reshape(-1).cpu().numpy())
-        return np.concatenate(preds)
+                             .reshape(-1).detach().cpu().float().numpy())
+        return np.concatenate(preds).astype(np.float32) if preds else np.empty((0,), dtype=np.float32)
 
     te_preds = _predict_tuple(te)
     write_predictions(
@@ -180,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
             "model": "PROSTATA_5head_frozen_esm2",
             "sign": "stabilizing_positive (:+1)",
             "trainable_params": sum(p.numel() for p in model.parameters()),
-            "best_val_pearson": round(best_r, 4),
+            "best_val_pearson": round(best_r, 4) if best_state is not None and np.isfinite(best_r) else None,
             "wall_clock_s": round(time.time() - t0, 2),
             "peak_vram_gb": gpu_peak_gb(),
             "seed": args.seed,
@@ -189,26 +220,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.external and os.path.isfile(args.external):
         ext_df = load_external_table(args.external)
-        if "parent_seq" not in ext_df.columns and "wt_seq" in ext_df.columns:
-            ext_df["parent_seq"] = ext_df["wt_seq"]
-        if "target" not in ext_df.columns and "ddg" in ext_df.columns:
-            ext_df["target"] = ext_df["ddg"]
-        ex = _build_arrays(ext_df, store)
+        ex = _build_arrays(ext_df, store, esm_dim=esm_dim)
         write_predictions(
             out_dir / "pred_external.parquet",
             ex[5], _predict_tuple(ex),
-            meta={"model": "PROSTATA_5head_frozen_esm2", "sign": "stabilizing_positive (:+1)"},
+            meta={"model": "PROSTATA_5head_frozen_esm2", "sign": "stabilizing_positive (:+1)", "seed": args.seed},
         )
 
     for spec in args.extra_externals:
-        tag, epq = spec.split("=", 1)
+        tag, epq, _epdb = parse_extra_external_spec(spec)
         if os.path.isfile(epq):
             edf = load_external_table(epq)
-            if "parent_seq" not in edf.columns and "wt_seq" in edf.columns:
-                edf["parent_seq"] = edf["wt_seq"]
-            if "target" not in edf.columns and "ddg" in edf.columns:
-                edf["target"] = edf["ddg"]
-            ex = _build_arrays(edf, store)
+            ex = _build_arrays(edf, store, esm_dim=esm_dim)
             write_predictions(
                 out_dir / f"pred_{tag}.parquet",
                 ex[5], _predict_tuple(ex),

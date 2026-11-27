@@ -145,9 +145,26 @@ def endless(loader):
 # ---------------------------------------------------------------------------
 # Loader construction
 # ---------------------------------------------------------------------------
+def _fork_workers() -> bool:
+    """True when DataLoader workers are forked (they then inherit the parent's
+    in-memory graph cache copy-on-write, so ``prewarm()`` in the parent is enough)."""
+    import multiprocessing as mp
+    method = mp.get_start_method(allow_none=True)
+    if method is None:
+        method = "fork" if sys.platform.startswith("linux") else "spawn"
+    return method == "fork"
+
+
 def _loader(dataset, batch_size: int, shuffle: bool, workers: int,
             seed: int = 42, collate_fn=collate_graphs) -> DataLoader:
-    """A DataLoader whose shuffle order and worker RNG are reproducible."""
+    """A DataLoader whose shuffle order and worker RNG are reproducible.
+
+    Workers are kept alive across epochs for the shuffling train loader (its
+    in-worker graph cache survives) and - on platforms that cannot fork - for
+    the evaluation loaders too, otherwise every epoch would re-spawn them and
+    rebuild every parent graph from scratch. Where workers are forked the
+    caller pre-warms the parent-graph cache instead (``prewarm_dataset``).
+    """
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -155,9 +172,19 @@ def _loader(dataset, batch_size: int, shuffle: bool, workers: int,
         num_workers=workers,
         collate_fn=collate_fn,
         drop_last=False,
-        persistent_workers=workers > 0 and shuffle,
+        persistent_workers=workers > 0 and (shuffle or not _fork_workers()),
         **loader_kwargs(seed, workers),
     )
+
+
+def prewarm_dataset(ds, workers: int, label: str = "") -> None:
+    """Build every parent graph in THIS process before workers fork (see
+    ``ProteinBatchMutationDataset.prewarm``). Pure caching: outputs unchanged."""
+    if workers > 0 and _fork_workers() and hasattr(ds, "prewarm"):
+        t0 = time.time()
+        n = ds.prewarm()
+        print(f"[data] prewarmed {n} parent graphs{(' (' + label + ')') if label else ''} "
+              f"in {time.time() - t0:.1f}s; forked workers inherit them", flush=True)
 
 
 def _sequence_loader(dataset, node_budget: int, max_batch: int, shuffle: bool,
@@ -239,6 +266,7 @@ def build_split_loaders(
                 muts_per_protein=pb_muts, train=(split == "train"),
                 noise_std=noise, cds_dropout=cds_drop, seed=int(cfg.seed),
             )
+            prewarm_dataset(ds, cfg.num_workers, split)
             out[split] = _loader(
                 ds, pb_prots, split == "train", cfg.num_workers, cfg.seed,
                 collate_fn=collate_protein_batch,
@@ -258,6 +286,7 @@ def build_split_loaders(
                     sub, store, cfg, target=target,
                     muts_per_protein=pb_muts, train=False, seed=int(cfg.seed),
                 )
+                prewarm_dataset(sub_ds, cfg.num_workers, "train_eval")
                 out["train_eval"] = _loader(
                     sub_ds, pb_prots, False, cfg.num_workers, cfg.seed,
                     collate_fn=collate_protein_batch,

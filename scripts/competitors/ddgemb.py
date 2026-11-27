@@ -31,6 +31,13 @@ from scripts.competitors.common import (
     gpu_peak_gb,
     load_external_table,
     load_split_table,
+    lookup_store_seq,
+    parse_extra_external_spec,
+    row_id_array,
+    safe_aa_index,
+    safe_pearson,
+    target_array,
+    valid_site_mask,
     write_predictions,
 )
 from src.encoder import EncodingStore
@@ -66,14 +73,17 @@ class DdgEmbTransformer(nn.Module):
     def forward(self, win_emb: torch.Tensor, win_mask: torch.Tensor,
                 wt_idx: torch.Tensor, mt_idx: torch.Tensor) -> torch.Tensor:
         # win_emb: (B, 2R+1, esm_dim), win_mask: (B, 2R+1) True=valid
-        h = self.proj(win_emb) + self.pos_emb
+        if win_emb.shape[0] == 0:
+            return win_emb.new_empty((0, 1))
+        h = self.proj(win_emb)
+        h = h + self.pos_emb.to(dtype=h.dtype)
         h = self.encoder(h, src_key_padding_mask=~win_mask)
         h_center = h[:, self.radius, :]
-        w = win_mask.float().unsqueeze(-1)
+        w = win_mask.to(dtype=h.dtype).unsqueeze(-1)
         h_pool = (h * w).sum(dim=1) / w.sum(dim=1).clamp(min=1.0)
         ctx = torch.cat([h_center, h_pool], dim=-1)
-        s_mt = self.head(torch.cat([ctx, self.aa(mt_idx)], dim=-1))
-        s_wt = self.head(torch.cat([ctx, self.aa(wt_idx)], dim=-1))
+        s_mt = self.head(torch.cat([ctx, self.aa(mt_idx).to(dtype=ctx.dtype)], dim=-1))
+        s_wt = self.head(torch.cat([ctx, self.aa(wt_idx).to(dtype=ctx.dtype)], dim=-1))
         return s_mt - s_wt
 
 
@@ -118,7 +128,14 @@ class _WindowIndex:
         )
 
 
-def _extract_windows(df: pd.DataFrame, store: EncodingStore, radius: int = 15) -> _WindowIndex:
+def _extract_windows(
+    df: pd.DataFrame,
+    store: EncodingStore,
+    radius: int = 15,
+    *,
+    esm_dim: int = 0,
+    allow_empty: bool = True,
+) -> _WindowIndex:
     emb_chunks: list[torch.Tensor] = []
     mask_chunks: list[torch.Tensor] = []
     start_l: list[torch.Tensor] = []
@@ -126,35 +143,52 @@ def _extract_windows(df: pd.DataFrame, store: EncodingStore, radius: int = 15) -
     mt_l: list[torch.Tensor] = []
     y_l: list[torch.Tensor] = []
     rid_l: list[np.ndarray] = []
-    seq_col = "parent_seq" if "parent_seq" in df.columns else "wt_seq"
-    tgt_col = "target" if "target" in df.columns else "ddg"
+    seq_col = "parent_seq" if "parent_seq" in df.columns else ("wt_seq" if "wt_seq" in df.columns else None)
 
     cursor = 0
-    esm_dim = 0
-    for seq, grp in df.groupby(seq_col, sort=False):
-        seq_s = str(seq).upper()
-        if not store.has(seq_s):
-            continue
-        emb = store.get(seq_s)["emb"].to(dtype=torch.float16)  # (L, D)
-        L, D = emb.shape
-        esm_dim = D
-        padded = torch.zeros((L + 2 * radius, D), dtype=torch.float16)
-        padded[radius:radius + L] = emb
-        pmask = torch.zeros((L + 2 * radius,), dtype=torch.bool)
-        pmask[radius:radius + L] = True
+    if len(df) > 0 and seq_col is not None and all(c in df.columns for c in ("site", "wt_aa", "mt_aa")):
+        for seq, grp in df.groupby(seq_col, sort=False):
+            seq_key_str = lookup_store_seq(store, str(seq))
+            if seq_key_str is None:
+                continue
+            emb = store.get(seq_key_str)["emb"].to(dtype=torch.float16)  # (L, D)
+            L, D = int(emb.shape[0]), int(emb.shape[1])
+            if L <= 0:
+                continue
+            esm_dim = D
+            in_bounds, sites = valid_site_mask(grp["site"], L)
+            if sites.size == 0:
+                continue
+            grp_ok = grp if bool(in_bounds.all()) else grp.loc[in_bounds]
 
-        sites = np.clip(grp["site"].to_numpy(dtype=np.int64), 0, L - 1)
-        emb_chunks.append(padded)
-        mask_chunks.append(pmask)
-        start_l.append(torch.from_numpy(sites + cursor))
-        wt_l.append(torch.tensor([aa_index(a) for a in grp["wt_aa"]], dtype=torch.long))
-        mt_l.append(torch.tensor([aa_index(a) for a in grp["mt_aa"]], dtype=torch.long))
-        y_l.append(torch.tensor(grp[tgt_col].to_numpy(dtype=np.float32)))
-        rid_l.append(grp["row_id"].to_numpy(dtype=np.int64))
-        cursor += L + 2 * radius
+            padded = torch.zeros((L + 2 * radius, D), dtype=torch.float16)
+            padded[radius:radius + L] = emb
+            pmask = torch.zeros((L + 2 * radius,), dtype=torch.bool)
+            pmask[radius:radius + L] = True
+
+            emb_chunks.append(padded)
+            mask_chunks.append(pmask)
+            start_l.append(torch.from_numpy(sites + cursor).long())
+            wt_l.append(torch.tensor([safe_aa_index(a) for a in grp_ok["wt_aa"]], dtype=torch.long))
+            mt_l.append(torch.tensor([safe_aa_index(a) for a in grp_ok["mt_aa"]], dtype=torch.long))
+            y_l.append(torch.from_numpy(target_array(grp_ok)))
+            rid_l.append(row_id_array(grp_ok))
+            cursor += L + 2 * radius
 
     if not emb_chunks:
-        raise RuntimeError("DDGemb: no cached parent sequences found for table")
+        if not allow_empty:
+            raise RuntimeError("DDGemb: no cached parent sequences found for table")
+        return _WindowIndex(
+            flat_emb=torch.empty((0, esm_dim), dtype=torch.float16),
+            flat_mask=torch.empty((0,), dtype=torch.bool),
+            start_idx=torch.empty((0,), dtype=torch.long),
+            wt_idx=torch.empty((0,), dtype=torch.long),
+            mt_idx=torch.empty((0,), dtype=torch.long),
+            y=torch.empty((0,), dtype=torch.float32),
+            row_id=np.empty((0,), dtype=np.int64),
+            radius=radius,
+            esm_dim=esm_dim,
+        )
 
     return _WindowIndex(
         flat_emb=torch.cat(emb_chunks, dim=0),
@@ -174,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--splits", default="data/splits_megascale.parquet")
     ap.add_argument("--external", default=None)
     ap.add_argument("--extra-externals", nargs="*", default=[],
-                    help="Additional external holdouts as tag=parquet")
+                    help="Additional external holdouts as tag=parquet (or tag=parquet::pdb_dir)")
     ap.add_argument("--cache", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--radius", type=int, default=15)
@@ -190,11 +224,12 @@ def main(argv: list[str] | None = None) -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     store = EncodingStore(args.cache, cache_records=512)
     out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     splits = load_split_table(args.splits)
-    tr = _extract_windows(splits[splits["split"] == "train"], store, args.radius)
-    va = _extract_windows(splits[splits["split"] == "val"], store, args.radius)
-    te = _extract_windows(splits[splits["split"] == "test"], store, args.radius)
+    tr = _extract_windows(splits[splits["split"] == "train"], store, args.radius, allow_empty=False)
+    va = _extract_windows(splits[splits["split"] == "val"], store, args.radius, esm_dim=tr.esm_dim)
+    te = _extract_windows(splits[splits["split"] == "test"], store, args.radius, esm_dim=tr.esm_dim)
 
     model = DdgEmbTransformer(esm_dim=tr.esm_dim, radius=args.radius).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
@@ -222,8 +257,9 @@ def main(argv: list[str] | None = None) -> int:
         with torch.no_grad():
             for lo in range(0, len(va), 512):
                 we, wm, wi, mi, _ = va.gather_batch(slice(lo, lo + 512), device)
-                vp.append(model(we, wm, wi, mi).reshape(-1).cpu().numpy())
-        r = float(np.corrcoef(va.y.numpy(), np.concatenate(vp))[0, 1]) if vp else float("nan")
+                vp.append(model(we, wm, wi, mi).reshape(-1).detach().cpu().float().numpy())
+        vp_arr = np.concatenate(vp) if vp else np.empty((0,), dtype=np.float32)
+        r = safe_pearson(va.y.numpy(), vp_arr)
         if np.isfinite(r) and r > best_r:
             best_r = r
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -237,8 +273,8 @@ def main(argv: list[str] | None = None) -> int:
         with torch.no_grad():
             for lo in range(0, len(widx), 512):
                 we, wm, wi, mi, _ = widx.gather_batch(slice(lo, lo + 512), device)
-                preds.append(model(we, wm, wi, mi).reshape(-1).cpu().numpy())
-        return np.concatenate(preds)
+                preds.append(model(we, wm, wi, mi).reshape(-1).detach().cpu().float().numpy())
+        return np.concatenate(preds).astype(np.float32) if preds else np.empty((0,), dtype=np.float32)
 
     write_predictions(
         out_dir / "pred_test.parquet",
@@ -247,7 +283,7 @@ def main(argv: list[str] | None = None) -> int:
             "model": "DDGemb_transformer_frozen_esm2",
             "sign": "stabilizing_positive (:+1)",
             "trainable_params": sum(p.numel() for p in model.parameters()),
-            "best_val_pearson": round(best_r, 4),
+            "best_val_pearson": round(best_r, 4) if best_state is not None and np.isfinite(best_r) else None,
             "wall_clock_s": round(time.time() - t0, 2),
             "peak_vram_gb": gpu_peak_gb(),
             "seed": args.seed,
@@ -256,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.external and os.path.isfile(args.external):
         ext_df = load_external_table(args.external)
-        ex = _extract_windows(ext_df, store, args.radius)
+        ex = _extract_windows(ext_df, store, args.radius, esm_dim=tr.esm_dim)
         write_predictions(
             out_dir / "pred_external.parquet",
             ex.row_id, _predict_index(ex),
@@ -268,10 +304,10 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     for spec in args.extra_externals:
-        tag, epq = spec.split("=", 1)
+        tag, epq, _epdb = parse_extra_external_spec(spec)
         if os.path.isfile(epq):
             edf = load_external_table(epq)
-            ex = _extract_windows(edf, store, args.radius)
+            ex = _extract_windows(edf, store, args.radius, esm_dim=tr.esm_dim)
             write_predictions(
                 out_dir / f"pred_{tag}.parquet",
                 ex.row_id, _predict_index(ex),

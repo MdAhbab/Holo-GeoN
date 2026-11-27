@@ -32,6 +32,13 @@ from scripts.competitors.common import (
     gpu_peak_gb,
     load_external_table,
     load_split_table,
+    match_group_pdb,
+    parse_extra_external_spec,
+    row_id_array,
+    safe_aa_index,
+    safe_pearson,
+    target_array,
+    valid_site_mask,
     write_predictions,
 )
 from src.geometry import (
@@ -58,12 +65,14 @@ def extract_cavity_features(seq: str, coords: np.ndarray, plddt: np.ndarray) -> 
       * 3-ch local burial / half-sphere exposure (HSE-up, HSE-down, neighbor count)
     """
     L = len(seq)
+    feats = np.zeros((L, CAVITY_DIM), dtype=np.float32)
+    if L == 0:
+        return feats
     cb = coords[:, 3, :]  # (L, 3)
     ca = coords[:, 1, :]
     valid = np.isfinite(cb).all(axis=-1) & np.isfinite(ca).all(axis=-1)
-    aa_ids = np.array([aa_index(c) for c in seq], dtype=np.int64)
+    aa_ids = np.array([safe_aa_index(c) for c in seq], dtype=np.int64)
 
-    feats = np.zeros((L, CAVITY_DIM), dtype=np.float32)
     if not valid.any():
         return feats
 
@@ -92,10 +101,12 @@ def extract_cavity_features(seq: str, coords: np.ndarray, plddt: np.ndarray) -> 
         col += len(AA_ORDER) + 1
         prev_r = r_cut
 
-    # 9-ch SE(3)-invariant backbone geometry
+    # 9-ch SE(3)-invariant backbone geometry (guard NaN coords/plddt against NaN*0 contamination)
+    coords_safe = np.where(np.isfinite(coords), coords, 0.0)
+    plddt_safe = np.where(np.isfinite(plddt), plddt, 0.0)
     ng = node_geometry(
-        torch.from_numpy(coords).float(),
-        torch.from_numpy(plddt).float(),
+        torch.from_numpy(coords_safe).float(),
+        torch.from_numpy(plddt_safe).float(),
         torch.from_numpy(valid.astype(np.float32)),
     ).numpy()
     feats[:, col:col + STR_NODE_DIM] = ng
@@ -134,18 +145,24 @@ class RaspDownstreamMLP(nn.Module):
 
     def _score(self, cav: torch.Tensor, aa_idx: torch.Tensor) -> torch.Tensor:
         idx = aa_idx.clamp(0, len(AA_ORDER))
-        return self.net(torch.cat([cav, self.aa(idx), self.aa_bio[idx].to(cav.dtype)], dim=-1))
+        return self.net(
+            torch.cat([cav, self.aa(idx).to(cav.dtype), self.aa_bio[idx].to(cav.dtype)], dim=-1)
+        )
 
     def forward(self, cav: torch.Tensor, wt_idx: torch.Tensor, mt_idx: torch.Tensor) -> torch.Tensor:
         c = self.cav_norm(cav)
         return self._score(c, mt_idx) - self._score(c, wt_idx)
 
 
-def _resolve_pdb_map(pdb_dir: str) -> dict[str, Path]:
+def _resolve_pdb_map(pdb_dir: str | None) -> dict[str, Path]:
+    if not pdb_dir or not os.path.isdir(pdb_dir):
+        return {}
     return {normalize_pdb_stem(p.name): p for p in Path(pdb_dir).rglob("*.pdb")}
 
 
 def _match_pdb(parent: str, pdb_map: dict[str, Path]) -> Path | None:
+    if not pdb_map:
+        return None
     hit = resolve_pdb_path(str(parent), pdb_map)
     return Path(hit) if hit is not None else None
 
@@ -153,27 +170,50 @@ def _match_pdb(parent: str, pdb_map: dict[str, Path]) -> Path | None:
 def _build_cavity_dataset(df: pd.DataFrame, pdb_map: dict[str, Path],
                           par_col: str = "parent") -> tuple:
     cav_l, wt_l, mt_l, y_l, rid_l = [], [], [], [], []
-    seq_col = "parent_seq" if "parent_seq" in df.columns else "wt_seq"
-    tgt_col = "target" if "target" in df.columns else "ddg"
+    seq_col = "parent_seq" if "parent_seq" in df.columns else ("wt_seq" if "wt_seq" in df.columns else None)
+    if par_col not in df.columns:
+        par_col = "uniprot_id" if "uniprot_id" in df.columns else ""
 
-    for parent, grp in df.groupby(par_col, sort=False):
-        pfile = _match_pdb(str(parent), pdb_map)
-        if pfile is None:
-            continue
-        pseq, coords, plddt, _ = parse_pdb_backbone(str(pfile))
-        wt_seq = str(grp[seq_col].iloc[0]).upper()
-        off, _, _ = align_to_sequence(pseq, wt_seq)
-        if off is None or off + len(wt_seq) > len(pseq):
-            continue
-        c_sl = coords[off:off + len(wt_seq)]
-        p_sl = plddt[off:off + len(wt_seq)]
-        cav = extract_cavity_features(wt_seq, c_sl, p_sl)
-        sites = np.clip(grp["site"].to_numpy(dtype=np.int64), 0, len(wt_seq) - 1)
-        cav_l.append(torch.from_numpy(cav[sites]))
-        wt_l.append(torch.tensor([aa_index(a) for a in grp["wt_aa"]], dtype=torch.long))
-        mt_l.append(torch.tensor([aa_index(a) for a in grp["mt_aa"]], dtype=torch.long))
-        y_l.append(torch.tensor(grp[tgt_col].to_numpy(dtype=np.float32)))
-        rid_l.append(grp["row_id"].to_numpy(dtype=np.int64))
+    if (
+        len(df) > 0
+        and pdb_map
+        and par_col
+        and seq_col is not None
+        and all(c in df.columns for c in ("site", "wt_aa", "mt_aa"))
+    ):
+        for parent, grp in df.groupby(par_col, sort=False):
+            pfile = match_group_pdb(parent, grp, pdb_map, _match_pdb)
+            if pfile is None:
+                continue
+            pseq, coords, plddt, _ = parse_pdb_backbone(str(pfile))
+            wt_seq = str(grp[seq_col].iloc[0]).strip().upper()
+            if not wt_seq:
+                continue
+            off, _, _ = align_to_sequence(pseq, wt_seq)
+            if off is None or off + len(wt_seq) > len(pseq):
+                continue
+            in_bounds, sites = valid_site_mask(grp["site"], len(wt_seq))
+            if sites.size == 0:
+                continue
+            grp_ok = grp if bool(in_bounds.all()) else grp.loc[in_bounds]
+
+            c_sl = coords[off:off + len(wt_seq)]
+            p_sl = plddt[off:off + len(wt_seq)]
+            cav = extract_cavity_features(wt_seq, c_sl, p_sl)
+            cav_l.append(torch.from_numpy(cav[sites]))
+            wt_l.append(torch.tensor([safe_aa_index(a) for a in grp_ok["wt_aa"]], dtype=torch.long))
+            mt_l.append(torch.tensor([safe_aa_index(a) for a in grp_ok["mt_aa"]], dtype=torch.long))
+            y_l.append(torch.from_numpy(target_array(grp_ok)))
+            rid_l.append(row_id_array(grp_ok))
+
+    if not cav_l:
+        return (
+            torch.empty((0, CAVITY_DIM), dtype=torch.float32),
+            torch.empty((0,), dtype=torch.long),
+            torch.empty((0,), dtype=torch.long),
+            torch.empty((0,), dtype=torch.float32),
+            np.empty((0,), dtype=np.int64),
+        )
 
     return (
         torch.cat(cav_l, dim=0),
@@ -205,14 +245,18 @@ def main(argv: list[str] | None = None) -> int:
     np.random.seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     splits = load_split_table(args.splits)
     if args.pairs and os.path.isfile(args.pairs) and "parent" not in splits.columns:
         pairs = pd.read_parquet(args.pairs, columns=["parent", "wt_seq"]).drop_duplicates("wt_seq")
+        pairs["wt_seq"] = pairs["wt_seq"].astype(str).str.strip().str.upper()
         splits = splits.merge(pairs, left_on="parent_seq", right_on="wt_seq", how="left")
     ms_pdbs = _resolve_pdb_map(args.pdb_dir)
 
     tr = _build_cavity_dataset(splits[splits["split"] == "train"], ms_pdbs)
+    if len(tr[3]) == 0:
+        raise RuntimeError("RaSP: no training mutations aligned to PDB structures")
     va = _build_cavity_dataset(splits[splits["split"] == "val"], ms_pdbs)
     te = _build_cavity_dataset(splits[splits["split"] == "test"], ms_pdbs)
 
@@ -228,7 +272,7 @@ def main(argv: list[str] | None = None) -> int:
         model.train()
         perm = rng.permutation(n_tr)
         for lo in range(0, n_tr, args.batch_size):
-            idx = perm[lo:lo + args.batch_size]
+            idx = torch.from_numpy(perm[lo:lo + args.batch_size]).long()
             opt.zero_grad(set_to_none=True)
             pred = model(tr[0][idx].to(device), tr[1][idx].to(device), tr[2][idx].to(device)).reshape(-1)
             loss = loss_fn(pred, tr[3][idx].to(device))
@@ -241,8 +285,9 @@ def main(argv: list[str] | None = None) -> int:
         with torch.no_grad():
             for lo in range(0, len(va[3]), 1024):
                 vp.append(model(va[0][lo:lo + 1024].to(device), va[1][lo:lo + 1024].to(device),
-                                va[2][lo:lo + 1024].to(device)).reshape(-1).cpu().numpy())
-        r = float(np.corrcoef(va[3].numpy(), np.concatenate(vp))[0, 1]) if vp else float("nan")
+                                va[2][lo:lo + 1024].to(device)).reshape(-1).detach().cpu().float().numpy())
+        vp_arr = np.concatenate(vp) if vp else np.empty((0,), dtype=np.float32)
+        r = safe_pearson(va[3].numpy(), vp_arr)
         if np.isfinite(r) and r > best_r:
             best_r = r
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -256,8 +301,8 @@ def main(argv: list[str] | None = None) -> int:
         with torch.no_grad():
             for lo in range(0, len(tup[3]), 1024):
                 preds.append(model(tup[0][lo:lo + 1024].to(device), tup[1][lo:lo + 1024].to(device),
-                                   tup[2][lo:lo + 1024].to(device)).reshape(-1).cpu().numpy())
-        return np.concatenate(preds)
+                                   tup[2][lo:lo + 1024].to(device)).reshape(-1).detach().cpu().float().numpy())
+        return np.concatenate(preds).astype(np.float32) if preds else np.empty((0,), dtype=np.float32)
 
     write_predictions(
         out_dir / "pred_test.parquet",
@@ -267,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
             "implementation": "3d_cavity_microenvironment_mlp",
             "sign": "stabilizing_positive (:+1)",
             "trainable_params": sum(p.numel() for p in model.parameters()),
-            "best_val_pearson": round(best_r, 4),
+            "best_val_pearson": round(best_r, 4) if best_state is not None and np.isfinite(best_r) else None,
             "wall_clock_s": round(time.time() - t0, 2),
             "peak_vram_gb": gpu_peak_gb(),
             "seed": args.seed,
@@ -289,9 +334,8 @@ def main(argv: list[str] | None = None) -> int:
             },
         )
     for spec in args.extra_externals:
-        tag, rest = spec.split("=", 1)
-        epq, epdb = rest.split("::", 1)
-        if os.path.isfile(epq) and os.path.isdir(epdb):
+        tag, epq, epdb = parse_extra_external_spec(spec)
+        if os.path.isfile(epq) and epdb and os.path.isdir(epdb):
             edf = load_external_table(epq)
             emap = _resolve_pdb_map(epdb)
             pc = "parent" if "parent" in edf.columns else "uniprot_id"
@@ -300,6 +344,12 @@ def main(argv: list[str] | None = None) -> int:
                 out_dir / f"pred_{tag}.parquet",
                 ex[4], _predict_tuple(ex),
                 meta={"model": "RaSP_cavity_retrained", "sign": "stabilizing_positive (:+1)", "seed": args.seed},
+            )
+        else:
+            print(
+                f"[rasp] WARNING: skipping extra external {tag!r} "
+                f"(requires both parquet {epq!r} and pdb_dir {epdb!r})",
+                flush=True,
             )
     return 0
 

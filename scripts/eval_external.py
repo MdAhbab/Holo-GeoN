@@ -79,6 +79,7 @@ from src.data import (
 )
 from src.device import describe_device
 from src.encoder import ESM_DIMS, EncodingStore
+from src.fast_eval import predict_table
 from src.metrics import format_report, regression_metrics
 from src.model import HoloGeoN
 from src.provenance import provenance
@@ -207,6 +208,9 @@ def main() -> None:
     ap.add_argument("--cache", default=None)
     ap.add_argument("--device", default=None)
     ap.add_argument("--out", default=os.path.join("runs", "main"))
+    ap.add_argument("--rowwise", action="store_true",
+                    help="score row-by-row with MutationDataset (legacy, slow) instead of "
+                         "the per-protein batched fast path; same numbers either way")
     args = ap.parse_args()
 
     cfg = load_config(args.config, overrides={"cache": args.cache, "device": args.device})
@@ -262,12 +266,15 @@ def main() -> None:
     model.load_state_dict(state["model"])
     model.eval()
 
-    loader = DataLoader(
-        MutationDataset(norm, store, cfg, target="target"),
-        batch_size=cfg.batch_size, shuffle=False,
-        num_workers=cfg.num_workers, collate_fn=collate_graphs,
-    )
-    mu, sigma, y = predict(model, loader, device)
+    # Per-protein batched scoring (graph built once per protein, all of its
+    # mutations in batched forward passes; proteins longer than cfg.window use
+    # the row-wise MutationDataset path). Rows come back in ``norm`` order and
+    # match the legacy loader to float rounding - see tests/test_fast_eval.py.
+    mu, sigma, y, info = predict_table(model, norm, store, cfg, device, target="target",
+                                       rowwise=True if args.rowwise else None)
+    print(f"[external] scored {info['rows']:,} rows: {info['fast_rows']:,} batched over "
+          f"{info['fast_proteins']:,} proteins, {info['rowwise_rows']:,} row-wise "
+          f"({info.get('seconds', 0)} s)", flush=True)
     metrics = regression_metrics(y, mu)
 
     # Also write common-format per-row predictions so scripts/score_predictions.py
