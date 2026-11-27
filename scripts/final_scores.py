@@ -57,7 +57,12 @@ def main() -> None:
 
     metrics = read(os.path.join(args.run, "metrics.json"))
     calib = read(os.path.join(args.run, "calibration.json"))
-    ext = read(os.path.join(args.run, "external_fireprotdb.json"))
+    # This report's EXTERNAL block describes the MegaScale-free FireProtDB table,
+    # so read that table's own file. external_fireprotdb.json is the legacy name:
+    # runs made before results were keyed by table wrote only it, and in a
+    # directory holding several fireprotdb* tables it is whichever ran last.
+    ext = (read(os.path.join(args.run, "external_fireprotdb_holdout.json"))
+           or read(os.path.join(args.run, "external_fireprotdb.json")))
     contacts = read(os.path.join("results", "contacts", "contact_sanity.json"))
     base_s = read(os.path.join("runs", "baselines", "stability", "baselines.json"))
     base_p = read(os.path.join("runs", "baselines", "pathogenicity", "baselines.json"))

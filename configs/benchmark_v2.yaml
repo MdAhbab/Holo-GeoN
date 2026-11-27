@@ -1,0 +1,86 @@
+# configs/benchmark_v2.yaml — Holo-GeoN v2 (~2.5M trainable params) stability benchmark config.
+#
+# Key upgrades over v1 (configs/benchmark.yaml):
+#   * arch: v2 (~2.5M trainable params vs 20.6M in v1 — 8.2x compression)
+#   * Single-pass EsmForMaskedLM cache: multi-layer scalar-mix + 20-AA WT-marginal
+#     log-odds prior + site Shannon entropy + contact-topology burial channels
+#   * beta-NLL (nll_beta: 0.5) preventing 1/sigma^2 memorisation collapse
+#   * CDS modality dropout (cds_dropout: 0.5) fixing FireProtDB OOD covariate shift
+#   * Protein-Batch multi-mutation training (protein_batch: true -> 15-40x faster epochs)
+
+esm_model: facebook/esm2_t33_650M_UR50D
+cache: /tmp/holo/cache/esm2_650M_v2
+device: cuda
+
+window: 256
+contact_top_k: 24
+contact_min_sep: 3
+
+out_root: runs
+stability_data: data/megascale_ddg_pairs.parquet
+clinvar_data: null
+external_data: data/fireprotdb_holdout.parquet
+idr_data: null
+mfi_data: null
+proteomics_data: null
+max_protein_length: 5000
+
+split_method: mmseqs
+identity: 0.25
+coverage: 0.80
+seed: 42
+strict_determinism: false
+
+graph_top_k: 16
+geo_threshold: 0.30
+eps: 0.10
+delta: 0.10
+mech_max_degree: 8
+neighborhood_hops: 2
+
+# --- Holo-GeoN v2 architecture ---
+arch: v2
+hidden: 256
+out_dim: 256
+gat_heads: 4
+aa_dim: 32
+dropout: 0.15
+feat_dropout: 0.25
+drop_edge: 0.20
+use_ssm: true
+use_mech_stream: true
+use_geo_stream: true
+use_str_stream: false
+str_topology_only: false
+true_contact_edges: false
+use_multi_layer: false
+use_contact_burial: true
+use_esm_logits_prior: true
+use_contact_gate: true
+site_anchored_readout: true
+
+# --- Training (Protein-Batch + beta-NLL + CDS modality dropout) ---
+epochs: 20
+batch_size: 64
+protein_batch: true
+proteins_per_batch: 8
+muts_per_protein: 64
+lr: 0.0005
+weight_decay: 0.01
+warmup_frac: 0.05
+early_stop_patience: 6
+grad_clip: 1.0
+amp: true
+num_workers: 4
+max_rows: null
+nll_beta: 0.5
+cds_dropout: 0.5
+task_sampling_temperature: 0.5
+max_sequence_nodes: 2048
+sequence_node_budget: null
+three_state_sigma: 0.5
+record_cache_size: 512
+embed_noise_std: 0.0
+
+ablation_metrics:
+  stability: pearson

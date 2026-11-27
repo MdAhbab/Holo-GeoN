@@ -103,6 +103,45 @@ fireprotdb_holdout:
   parent: parent
   ddg_sign: destabilizing_positive
 
+# Homology-filtered (<25% identity to MegaScale via MMseqs2) subset of FireProtDB:
+# same destabilizing_positive source sign as fireprotdb_holdout!
+fireprotdb_hf25:
+  target: ddg
+  parent: parent
+  ddg_sign: destabilizing_positive
+
+# S669 (Pancotti et al., Zenodo 7568094): Experimental_DDG_dir is ALREADY
+# stabilizing_positive (negative = destabilising).
+s669_holdout:
+  target: ddg
+  parent: parent
+  ddg_sign: stabilizing_positive
+
+# S1724 ThermoMutDB holdout (Rocklin Lab 2026, Zenodo 19411306): already
+# normalised to stabilizing_positive (negative = destabilising; mean -1.68 / -1.45).
+s1724_thermomutdb_holdout:
+  target: ddg
+  parent: parent
+  ddg_sign: stabilizing_positive
+
+s1724_thermomutdb_hf25:
+  target: ddg
+  parent: parent
+  ddg_sign: stabilizing_positive
+
+# Human Domainome 1.0 (Beltran et al., Zenodo 14356805): aPCA abundance fitness
+# (higher = more stable/abundant -> same direction as stabilizing_positive;
+# evaluate strictly by per-domain Spearman rank, NEVER kcal/mol RMSE).
+domainome_apca_holdout:
+  target: target
+  parent: parent
+  ddg_sign: stabilizing_positive
+
+domainome_apca_hf25:
+  target: target
+  parent: parent
+  ddg_sign: stabilizing_positive
+
 # Whole-sequence tables (IDR / MFI / proteomics). Add a block per file, keyed by
 # its basename without the extension. `parent` is effectively required for any
 # deep-mutational-scan-shaped table - see the note above.

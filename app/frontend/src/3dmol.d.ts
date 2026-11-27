@@ -35,6 +35,7 @@ declare module '3dmol' {
   export interface GLViewer {
     addModel(data: string, format: string): unknown
     setStyle(sel: Record<string, unknown>, style: StyleSpec): void
+    addStyle(sel: Record<string, unknown>, style: StyleSpec): void
     zoomTo(): void
     render(): void
     clear(): void

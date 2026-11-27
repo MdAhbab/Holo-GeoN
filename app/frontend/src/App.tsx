@@ -1,25 +1,42 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, type ComponentType } from 'react'
 import { getHealth, getHistory, getHistoryItem } from './api'
-import type { HealthResponse } from './types'
-import type { DdgResponse, ScanResponse, IdrResponse, CompareResponse } from './types'
-import { setDdg, setScan, setIdr, setCompare } from './store'
+import type {
+  HealthResponse,
+  TabProps,
+  DdgResponse,
+  ScanResponse,
+  EpistasisResponse,
+  IdrResponse,
+  CompareResponse,
+} from './types'
+import { setDdg, setScan, setEpistasis, setIdr, setCompare } from './store'
 
-import DdgTab from './tabs/DdgTab'
-import ScanTab from './tabs/ScanTab'
-import IdrTab from './tabs/IdrTab'
-import CompareTab from './tabs/CompareTab'
-import ExportTab from './tabs/ExportTab'
-import HistoryTab from './tabs/HistoryTab'
+import DdgTabBase from './tabs/DdgTab'
+import ScanTabBase from './tabs/ScanTab'
+import EpistasisTabBase from './tabs/EpistasisTab'
+import IdrTabBase from './tabs/IdrTab'
+import CompareTabBase from './tabs/CompareTab'
+import ExportTabBase from './tabs/ExportTab'
+import HistoryTabBase from './tabs/HistoryTab'
 
 import './styles.css'
 
+const DdgTab = DdgTabBase as ComponentType<TabProps>
+const ScanTab = ScanTabBase as ComponentType<TabProps>
+const EpistasisTab = EpistasisTabBase as ComponentType<TabProps>
+const IdrTab = IdrTabBase as ComponentType<TabProps>
+const CompareTab = CompareTabBase as ComponentType<TabProps>
+const ExportTab = ExportTabBase as ComponentType<TabProps>
+const HistoryTab = HistoryTabBase as ComponentType<TabProps>
+
 const TABS = [
-  { id: 'ddg',     label: 'ΔΔG Predictor' },
-  { id: 'scan',    label: 'Stability Landscape' },
-  { id: 'idr',     label: 'IDR Ensemble' },
-  { id: 'compare', label: 'AlphaFold Compare' },
-  { id: 'export',  label: 'Export' },
-  { id: 'history', label: 'History' },
+  { id: 'ddg',       label: 'ΔΔG Predictor' },
+  { id: 'scan',      label: 'Stability Landscape' },
+  { id: 'epistasis', label: 'Double-Mutant Epistasis' },
+  { id: 'idr',       label: 'IDR Ensemble' },
+  { id: 'compare',   label: 'AlphaFold Compare' },
+  { id: 'export',    label: 'Export' },
+  { id: 'history',   label: 'History' },
 ] as const
 
 type TabId = (typeof TABS)[number]['id']
@@ -39,16 +56,31 @@ export default function App() {
     async function hydrate() {
       try {
         const items = await getHistory()
-        const kinds = ['ddg', 'scan', 'idr', 'compare'] as const
+        const kinds = ['ddg', 'scan', 'epistasis', 'idr', 'compare'] as const
         await Promise.all(kinds.map(async (kind) => {
           const latest = items.find((it) => it.kind === kind)
           if (!latest) return
           try {
             const record = await getHistoryItem(latest.id)
-            if (kind === 'ddg') setDdg(record.response as unknown as DdgResponse)
-            else if (kind === 'scan') setScan(record.response as unknown as ScanResponse & { sequence?: string })
-            else if (kind === 'idr') setIdr(record.response as unknown as IdrResponse)
-            else if (kind === 'compare') setCompare(record.response as unknown as CompareResponse)
+            if (kind === 'ddg') {
+              setDdg(record.response as unknown as DdgResponse)
+            } else if (kind === 'scan') {
+              const seq = typeof record.request?.sequence === 'string' ? record.request.sequence : undefined
+              setScan({
+                ...(record.response as unknown as ScanResponse),
+                ...(seq ? { sequence: seq } : {}),
+              })
+            } else if (kind === 'epistasis') {
+              const wtSeq = typeof record.request?.wt_sequence === 'string' ? record.request.wt_sequence : undefined
+              setEpistasis({
+                ...(record.response as unknown as EpistasisResponse),
+                ...(wtSeq ? { wt_sequence: wtSeq } : {}),
+              })
+            } else if (kind === 'idr') {
+              setIdr(record.response as unknown as IdrResponse)
+            } else if (kind === 'compare') {
+              setCompare(record.response as unknown as CompareResponse)
+            }
           } catch {
             // ignore individual record fetch failures
           }
@@ -60,16 +92,46 @@ export default function App() {
     hydrate()
   }, [])
 
+  const caps = health?.capabilities
+
   return (
     <>
       <header className="app-header">
-        <h1>Holo-GeoN</h1>
-        <p>Protein Stability, Interaction &amp; Expression — Graph Neural Network Predictions</p>
+        <div className="app-header-main">
+          <div>
+            <h1>Holo-GeoN</h1>
+            <p>
+              Protein Stability, Epistasis &amp; Coding-Sequence Aware Graph Neural Network — Structure-Free Default (WT/Mutant Swap Equivariant, Not SE(3)/E(3)-Equivariant)
+            </p>
+          </div>
+          {caps && (
+            <div className="header-cap-pills" aria-label="Server capabilities">
+              <span
+                className={`cap-pill ${caps.epistasis.available ? 'cap-on' : 'cap-off'}`}
+                title={caps.epistasis.reason ?? (caps.epistasis.source ? `Source: ${caps.epistasis.source}` : 'Epistasis head trained')}
+              >
+                Epistasis: {caps.epistasis.available ? 'Ready' : 'Unavailable'}
+              </span>
+              <span
+                className={`cap-pill ${caps.cds.available ? 'cap-on' : 'cap-off'}`}
+                title={caps.cds.reason ?? 'ViennaRNA available for real coding sequences'}
+              >
+                CDS (ViennaRNA): {caps.cds.available ? 'Ready' : 'Unavailable'}
+              </span>
+              <span
+                className={`cap-pill ${caps.invariant_3d.available ? 'cap-on' : 'cap-off'}`}
+                title={caps.invariant_3d.reason ?? `3D SE(3)-invariant weights: ${caps.invariant_3d.weights_path ?? 'loaded'}`}
+              >
+                3D SE(3)-Invariant: {caps.invariant_3d.available ? 'Ready' : 'Unavailable'}
+              </span>
+            </div>
+          )}
+        </div>
       </header>
 
       {health && !health.ready && (
-        <div className="error-banner">
-          <span style={{ fontSize: '1.1rem' }}>⚠</span>
+        <div className="error-banner" role="alert">
+          <span aria-hidden="true" style={{ fontSize: '1.1rem' }}>⚠</span>
           <span>
             <strong>No model loaded — predictions are unavailable.</strong>{' '}
             This interface does not approximate results when a checkpoint is
@@ -82,8 +144,8 @@ export default function App() {
       )}
 
       {health?.ready && !health.uncertainty_calibrated && (
-        <div className="warn-banner">
-          <span style={{ fontSize: '1.1rem' }}>⚠</span>
+        <div className="warn-banner" role="status">
+          <span aria-hidden="true" style={{ fontSize: '1.1rem' }}>⚠</span>
           <span>
             <strong>Uncertainty not calibrated.</strong> Confidence intervals come
             from the model's predicted sigma, but no calibration run has measured
@@ -95,8 +157,8 @@ export default function App() {
       )}
 
       {health?.ready && health.untrained_heads.length > 0 && (
-        <div className="warn-banner">
-          <span style={{ fontSize: '1.1rem' }}>⚠</span>
+        <div className="warn-banner" role="status">
+          <span aria-hidden="true" style={{ fontSize: '1.1rem' }}>⚠</span>
           <span>
             <strong>Untrained heads:</strong> {health.untrained_heads.join(', ')}.
             No data was supplied for these tasks, so they were never trained and
@@ -109,8 +171,11 @@ export default function App() {
         {TABS.map((tab) => (
           <button
             key={tab.id}
+            id={`tab-${tab.id}`}
+            type="button"
             role="tab"
             aria-selected={activeTab === tab.id}
+            aria-controls={`panel-${tab.id}`}
             className={`tab-btn${activeTab === tab.id ? ' active' : ''}`}
             onClick={() => setActiveTab(tab.id)}
           >
@@ -119,13 +184,19 @@ export default function App() {
         ))}
       </nav>
 
-      <main className="tab-content" role="tabpanel">
-        {activeTab === 'ddg'     && <DdgTab />}
-        {activeTab === 'scan'    && <ScanTab />}
-        {activeTab === 'idr'     && <IdrTab />}
-        {activeTab === 'compare' && <CompareTab />}
-        {activeTab === 'export'  && <ExportTab />}
-        {activeTab === 'history' && <HistoryTab />}
+      <main
+        id={`panel-${activeTab}`}
+        className="tab-content"
+        role="tabpanel"
+        aria-labelledby={`tab-${activeTab}`}
+      >
+        {activeTab === 'ddg'       && <DdgTab health={health} />}
+        {activeTab === 'scan'      && <ScanTab health={health} />}
+        {activeTab === 'epistasis' && <EpistasisTab health={health} />}
+        {activeTab === 'idr'       && <IdrTab health={health} />}
+        {activeTab === 'compare'   && <CompareTab health={health} />}
+        {activeTab === 'export'    && <ExportTab health={health} />}
+        {activeTab === 'history'   && <HistoryTab health={health} />}
       </main>
     </>
   )

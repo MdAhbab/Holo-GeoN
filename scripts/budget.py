@@ -122,25 +122,30 @@ def main() -> None:
         """
         Bytes of per-edge GATv2 message tensors retained for backward.
 
-        ``(E, heads, out_channels)`` fp32, in each of 4 convolutions (2 layers
-        x 2 streams). Round-2 review, R2-02: this term carried a spurious
-        ``/ 2``, halving it to 1.23 GB where the tensors actually kept are
-        2.46 GB - matching round 1's independent 2.38 GB estimate. The edge
-        lists here are already DIRECTED (both orientations are materialised by
-        the graph builder), so there is no double count to divide out.
+        v1 uses ``concat=True`` so each head outputs ``hidden`` channels
+        (4 convs x E x heads x hidden). v2 uses ``concat=True`` with
+        ``out_channels = hidden // heads`` (total width ``hidden``, 4 convs
+        plus optional 2 E_str convs), cutting GATv2 edge activations by ~4x.
         """
-        return 4.0 * n_edges * kwargs["gat_heads"] * cfg.hidden * 4
+        n_streams = (int(cfg.use_geo_stream) + int(cfg.use_mech_stream)
+                     + int(cfg.get("use_str_stream", False)))
+        n_convs = max(1, 2 * n_streams)
+        if cfg.get("arch", "v1") == "v2":
+            return float(n_convs) * n_edges * cfg.hidden * 4
+        return float(n_convs) * n_edges * kwargs["gat_heads"] * cfg.hidden * 4
 
     def scan_term(nodes_per_batch: int, width: int) -> float:
         """
         Bytes of associative-scan buffers retained by autograd.
 
-        a_prev/x_prev are allocated and a_c/x_c rewritten at each of
-        ceil(log2 width) steps, all held for backward.
+        v1 scans at ``esm_dim`` (1280); v2 scans at ``hidden`` (256, bidirectional
+        = 2 passes -> still 2.5x smaller than v1).
         """
         if not cfg.use_ssm:
             return 0.0
         steps = max(1, math.ceil(math.log2(max(width, 2))))
+        if cfg.get("arch", "v1") == "v2":
+            return steps * 4.0 * nodes_per_batch * (2 * cfg.hidden) * 4
         return steps * 4.0 * nodes_per_batch * esm_dim * 4
 
     gat_bytes = gat_term(e_geo + e_mech)

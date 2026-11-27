@@ -48,10 +48,11 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.config import load_config
+from src.config import apply_checkpoint_graph_config, load_config
 from src.data import MutationDataset, build_sample_graph, collate_graphs, move_batch
 from src.device import describe_device
 from src.encoder import ESM_DIMS, EncodingStore, EsmEncoder
+from src.fast_eval import predict_table
 from src.codon_tables import cai_matched_codon, get_cai_weights
 from src.features import mechanistic_features
 from src.model import HoloGeoN, model_kwargs_from_config
@@ -129,6 +130,9 @@ def calibration_report(mu: np.ndarray, sigma: np.ndarray, y: np.ndarray) -> dict
         "n": int(len(y)),
         "coverage_observed": coverage,
         "coverage_nominal": {f"{int(p * 100)}%": p for p in Z_FOR_NOMINAL},
+        # the PIT reliability curve behind the ECE, so a figure can draw it
+        "reliability": {"nominal": [round(float(g), 4) for g in grid],
+                        "empirical": [round(float(e), 5) for e in empirical]},
         "expected_calibration_error": ece,
         "max_calibration_error": float(np.max(np.abs(empirical - grid))),
         "max_coverage_gap": max_gap,
@@ -292,6 +296,8 @@ def main() -> None:
     ap.add_argument("--encode-mutants", action="store_true",
                     help="embed mutant proteins on the fly for the reversibility check")
     ap.add_argument("--reversibility-limit", type=int, default=500)
+    ap.add_argument("--rowwise", action="store_true",
+                    help="score row-by-row with MutationDataset instead of batched per-protein fast path")
     args = ap.parse_args()
 
     cfg = load_config(args.config, overrides={"cache": args.cache, "device": args.device})
@@ -301,6 +307,7 @@ def main() -> None:
     store = EncodingStore(cfg.cache)
 
     state = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    apply_checkpoint_graph_config(cfg, state)
     esm_dim = state.get("esm_dim", ESM_DIMS.get(cfg.esm_model, 1280))
     kwargs = state.get("model_kwargs") or model_kwargs_from_config(
         state.get("config", {}), esm_dim
@@ -314,14 +321,10 @@ def main() -> None:
     if part.empty:
         raise SystemExit(f"{args.splits}: split {args.split!r} is empty")
 
-    def _loader_for(frame):
-        return DataLoader(
-            MutationDataset(frame, store, cfg, target="target"),
-            batch_size=cfg.batch_size, shuffle=False,
-            num_workers=cfg.num_workers, collate_fn=collate_graphs,
-        )
-
-    mu, sigma, y = predict_split(model, _loader_for(part), device)
+    mu, sigma, y, _ = predict_table(
+        model, part, store, cfg, device, target="target",
+        rowwise=True if args.rowwise else None,
+    )
     report = {"provenance": provenance(),
               "checkpoint": args.checkpoint, "splits": args.splits,
               "split": args.split,
@@ -332,7 +335,10 @@ def main() -> None:
     # circular, so if there is no val split the scale is not fitted at all.
     val = df[df.split == "val"]
     if len(val):
-        v_mu, v_sigma, v_y = predict_split(model, _loader_for(val), device)
+        v_mu, v_sigma, v_y, _ = predict_table(
+            model, val, store, cfg, device, target="target",
+            rowwise=True if args.rowwise else None,
+        )
         scale = fit_variance_scale(v_mu, v_sigma, v_y)
         report["variance_scale"] = {
             "scale": scale,

@@ -75,17 +75,21 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 ARMS: dict[str, list[str]] = {
     "full": [],
-    # The paper's distinguishing contribution.
+    "v1_baseline": ["--arch", "v1", "--nll-beta", "0.0", "--cds-dropout", "0.0", "--no-protein-batch"],
     "no_mech_stream": ["--no-mech-stream"],
-    # The two arms the architecture's narrative actually rests on. Round-1
-    # review, R1-27: neither existed. src/readout.py argues the site anchoring
-    # is the fix for the 1/L dilution problem, and scripts/contact_sanity.py
-    # calls the contact graph "the check that justifies building a graph at
-    # all" - but the grid measured neither, so the two load-bearing claims had
-    # no ablation behind them.
     "global_pool_readout": ["--global-pool-readout"],
     "no_geo_stream": ["--no-geo-stream"],
     "no_ssm": ["--no-ssm"],
+    "no_esm_logits_prior": ["--no-esm-logits-prior"],
+    "no_multi_layer": ["--no-multi-layer"],
+    "multi_layer_ln": ["--use-multi-layer"],
+    "no_contact_burial": ["--no-contact-burial"],
+    "standard_nll": ["--nll-beta", "0.0"],
+    "no_cds_dropout": ["--cds-dropout", "0.0"],
+    "str_only": ["--no-geo-stream", "--use-str-stream"],
+    "both_streams": ["--use-str-stream"],
+    "str_topology_only": ["--no-geo-stream", "--use-str-stream", "--str-topology-only"],
+    "true_contact_edges": ["--true-contact-edges"],
 }
 
 

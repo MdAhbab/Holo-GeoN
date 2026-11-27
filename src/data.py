@@ -24,6 +24,7 @@ An exclusion that is not counted is a silent change to the evaluation set.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -31,11 +32,18 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from src.encoder import EncodingStore
+from src.encoder import EncodingStore, seq_key
 from src.features import CH_CAI, CH_MRNA, CH_VALID, N_MECH_CHANNELS, mechanistic_features
+from src.geometry import STR_NODE_DIM
 from src.graphs import (
+    EDGE_DIM,
+    N_TOPO_CHANNELS,
+    STR_EDGE_DIM,
     build_geometric_graph,
     build_mechanistic_graph,
+    build_structure_graph,
+    build_true_contact_graph,
+    contact_topology_features,
     khop_neighborhood,
     window_edges,
 )
@@ -46,15 +54,19 @@ from src.windowing import MutationParseError, mutation_position, window_bounds
 # of these per dataset; see src/config.py.
 _CANDIDATES: dict[str, list[str]] = {
     "wt_seq": ["wt_seq", "wildtype_seq", "seq_wt", "ref_seq", "wild_seq",
-               "wildtype", "reference_seq", "source_sequence", "ref_protein"],
+               "wildtype", "reference_seq", "source_sequence", "ref_protein",
+               "parent_seq"],
     "mt_seq": ["mt_seq", "mutant_seq", "seq_mt", "alt_seq", "mut_seq",
                "mutant", "alternate_seq", "target_sequence", "alt_protein"],
+    "site": ["site"],
+    "wt_aa": ["wt_aa", "ref_aa"],
+    "mt_aa": ["mt_aa", "mut_aa", "alt_aa"],
     "target": ["ddg", "ddG", "delta_delta_g", "ddg_exp", "DDG_mean", "target", "score"],
     "sigma": ["ddg_std", "ddG_std", "DDG_std", "ddg_err", "sigma", "std_err"],
     "label": ["label", "y", "pathogenic", "is_pathogenic",
               "clinical_significance", "clnsig"],
     "gene": ["gene", "gene_symbol", "symbol", "geneinfo"],
-    "cds": ["wt_dna", "wt_cds", "ref_cds", "wt_cdna", "dna_wt", "cds_wt", "dna_seq"],
+    "cds": ["cds", "wt_dna", "wt_cds", "ref_cds", "wt_cdna", "dna_wt", "cds_wt", "dna_seq"],
     "rg": ["rg", "radius_of_gyration", "rg_exp", "rg_angstrom"],
     "value": ["value", "mfi", "intensity", "retention_time", "rt", "expression"],
     "species": ["species", "species_id", "organism"],
@@ -211,7 +223,11 @@ def load_mutation_table(
         report.rows_in = len(df)
 
     col = detect_columns(df, overrides)
-    needed = ["wt_seq", "mt_seq"] + (["target"] if kind == "stability" else ["label"])
+    has_mt_seq = col["mt_seq"] is not None
+    has_site_cols = all(col[k] is not None for k in ("site", "wt_aa", "mt_aa"))
+    needed = ["wt_seq"] + (["target"] if kind == "stability" else ["label"])
+    if not has_mt_seq and not has_site_cols:
+        needed.append("mt_seq")
     missing = [k for k in needed if col[k] is None]
     if missing:
         raise ValueError(
@@ -227,29 +243,61 @@ def load_mutation_table(
         _reject_legacy_integer_labels(df[col["label"]], path)
 
     wt = df[col["wt_seq"]].astype(str).str.upper()
-    mt = df[col["mt_seq"]].astype(str).str.upper()
+    mt = df[col["mt_seq"]].astype(str).str.upper() if has_mt_seq else None
+    site_ser = df[col["site"]] if (not has_mt_seq and has_site_cols) else None
+    wt_aa_ser = df[col["wt_aa"]].astype(str).str.strip().str.upper() if (not has_mt_seq and has_site_cols) else None
+    mt_aa_ser = df[col["mt_aa"]].astype(str).str.strip().str.upper() if (not has_mt_seq and has_site_cols) else None
 
     records: list[dict] = []
     for i in range(len(df)):
-        w, m = wt.iat[i], mt.iat[i]
-        if not w or not m or w == "NAN" or m == "NAN":
+        w = wt.iat[i]
+        if not w or w == "NAN":
             report.drop("missing_sequence")
             continue
         if len(w) > max_protein_length:
             report.drop("protein_too_long")
             continue
-        try:
-            site = mutation_position(w, m)
-        except MutationParseError as exc:
-            reason = "length_mismatch_indel" if "length mismatch" in str(exc) else "not_single_substitution"
-            report.drop(reason)
-            continue
+
+        if has_mt_seq:
+            m = mt.iat[i]
+            if not m or m == "NAN":
+                report.drop("missing_sequence")
+                continue
+            try:
+                site = mutation_position(w, m)
+            except MutationParseError as exc:
+                reason = "length_mismatch_indel" if "length mismatch" in str(exc) else "not_single_substitution"
+                report.drop(reason)
+                continue
+            wa = w[site]
+            ma = m[site]
+        else:
+            try:
+                raw_site = site_ser.iat[i]
+                if pd.isna(raw_site):
+                    raise ValueError("nan site")
+                site = int(raw_site)
+            except (TypeError, ValueError):
+                report.drop("unparseable_site")
+                continue
+            wa = wt_aa_ser.iat[i]
+            ma = mt_aa_ser.iat[i]
+            if not (0 <= site < len(w)):
+                report.drop("site_out_of_bounds")
+                continue
+            if len(wa) != 1 or len(ma) != 1 or wa == ma:
+                report.drop("not_single_substitution")
+                continue
+            if w[site] != wa:
+                report.drop("wt_aa_mismatch")
+                continue
 
         rec: dict = {
+            "source_row_id": i,
             "parent_seq": w,
             "site": site,
-            "wt_aa": w[site],
-            "mt_aa": m[site],
+            "wt_aa": wa,
+            "mt_aa": ma,
         }
         if kind == "stability":
             try:
@@ -519,31 +567,52 @@ def filter_to_cache(
 # ---------------------------------------------------------------------------
 # Graph assembly
 # ---------------------------------------------------------------------------
+def _load_true_contact_map(seq: str, true_contacts_dir: str | None) -> torch.Tensor | None:
+    if not true_contacts_dir:
+        return None
+    path = os.path.join(true_contacts_dir, seq_key(seq) + ".npy")
+    if not os.path.isfile(path):
+        return None
+    return torch.from_numpy(np.load(path))
+
+
+def _apply_cds_dropout(
+    mech: torch.Tensor, n: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Zero CDS-derived channels (mRNA/CAI/valid) and replace E_mech with self-loops."""
+    mech_d = mech.clone()
+    mech_d[:, CH_MRNA] = 0.0
+    mech_d[:, CH_CAI] = 0.0
+    mech_d[:, CH_VALID] = 0.0
+    loops = torch.arange(n, dtype=torch.long)
+    ei = torch.stack([loops, loops], dim=0)
+    ea = torch.zeros((n, EDGE_DIM), dtype=torch.float32)
+    ea[:, 0] = 1.0
+    return mech_d, ei, ea
+
+
 def build_sample_graph(
     record: dict,
     site: int | None,
     window: int,
     cfg: dict,
     max_nodes: int | None = None,
+    drop_cds: bool = False,
 ) -> dict:
     """
-    Build both edge sets for one cached protein.
+    Build all graph streams and v2 node features for one cached protein.
 
-    ``record`` is an :class:`EncodingStore` entry. ``site`` is the mutation
-    position in whole-protein coordinates.
-
-    With a ``site``, the graph covers a ``window``-long slice centred on it, so
-    the mutation is always present and always in context.
-
-    With ``site is None`` — the whole-sequence tasks — the graph covers the
-    **entire protein**, not a window. Round-1 review, R1-07: anchoring at 0 and
-    windowing gave those heads residues [0, window) only, which is precisely the
-    head truncation this project exists to remove. It is worst for the radius of
-    gyration, which is dominated by chain length (R_g = R_0 N^v): a 900-residue
-    and a 300-residue chain sharing an N-terminus were indistinguishable, and
-    the mask could not even recover the length. ``max_nodes`` caps pathological
-    inputs; when it bites, the caller is told via ``truncated`` rather than
-    finding out from a silently short mask.
+    Supports:
+      * ``E_geo`` (predicted ESM-2 contacts, or real C-beta contacts when
+        ``cfg["true_contact_edges"]`` is True — Arm E in ``GEOMETRIC_PLAN.md``)
+      * ``E_mech`` (translational coupling; optionally masked via ``drop_cds``
+        during training for CDS modality dropout)
+      * ``E_str`` (optional SE(3)-invariant 3D coordinate stream when
+        ``cfg["use_str_stream"]`` is True — Arms B/C/D)
+      * ``topo`` (6-channel structure-free contact-burial/packing + entropy)
+      * ``layer_embs`` (optional multi-layer ESM-2 taps)
+      * ``wt_logprobs`` (optional 20-AA WT-marginal log-probabilities)
+      * ``neighborhood_1hop`` and ``neighborhood`` (1-hop vs k-hop site masks)
     """
     emb = record["emb"]
     length = emb.shape[0]
@@ -562,45 +631,183 @@ def build_sample_graph(
 
     mech = record.get("mech")
     if mech is None:
-        # No precomputed mechanistic channels: protein-only, which is exactly
-        # what mech_valid == 0 encodes. E_mech is then empty by construction.
         mech = mechanistic_features(record["seq"][start:end], None, n)
     else:
         mech = mech[start:end].float()
 
-    ce, cp = window_edges(record["contact_edges"], record["contact_probs"], start, end)
-    edge_geo, attr_geo = build_geometric_graph(
-        n, ce, cp,
-        top_k=cfg.get("graph_top_k", 16),
-        threshold=cfg.get("geo_threshold", 0.30),
-    )
-    edge_mech, attr_mech = build_mechanistic_graph(
-        mech[:, CH_CAI], mech[:, CH_MRNA], mech[:, CH_VALID],
-        eps=cfg.get("eps", 0.10),
-        delta=cfg.get("delta", 0.10),
-        max_degree=cfg.get("mech_max_degree", 8),
-    )
+    # E_geo: predicted ESM-2 contacts OR real C-beta contact map (Arm E)
+    if cfg.get("true_contact_edges"):
+        tmap = _load_true_contact_map(record["seq"], cfg.get("true_contacts_dir"))
+        if tmap is not None and tmap.shape[0] >= end:
+            edge_geo, attr_geo = build_true_contact_graph(
+                n, tmap[start:end, start:end],
+                top_k=cfg.get("graph_top_k", 16),
+                min_sep=cfg.get("contact_min_sep", 3),
+            )
+        else:
+            ce, cp = window_edges(record["contact_edges"], record["contact_probs"], start, end)
+            edge_geo, attr_geo = build_geometric_graph(
+                n, ce, cp,
+                top_k=cfg.get("graph_top_k", 16),
+                threshold=cfg.get("geo_threshold", 0.30),
+            )
+    else:
+        ce, cp = window_edges(record["contact_edges"], record["contact_probs"], start, end)
+        edge_geo, attr_geo = build_geometric_graph(
+            n, ce, cp,
+            top_k=cfg.get("graph_top_k", 16),
+            threshold=cfg.get("geo_threshold", 0.30),
+        )
+
+    if drop_cds:
+        mech, edge_mech, attr_mech = _apply_cds_dropout(mech, n)
+    else:
+        edge_mech, attr_mech = build_mechanistic_graph(
+            mech[:, CH_CAI], mech[:, CH_MRNA], mech[:, CH_VALID],
+            eps=cfg.get("eps", 0.10),
+            delta=cfg.get("delta", 0.10),
+            max_degree=cfg.get("mech_max_degree", 8),
+        )
+
+    ent = record.get("site_entropy")
+    ent_slice = ent[start:end].float() if ent is not None else None
+    topo = contact_topology_features(n, edge_geo, attr_geo, mech, site_entropy=ent_slice)
 
     local_site = anchor - start
+    neighborhood_1hop = khop_neighborhood(edge_geo, local_site, n, hops=1)
     neighborhood = khop_neighborhood(
         edge_geo, local_site, n, hops=cfg.get("neighborhood_hops", 2)
     )
-    return {
+
+    sample = {
         "esm": esm,
         "mech": mech,
+        "topo": topo,
         "edge_geo": edge_geo,
         "attr_geo": attr_geo,
         "edge_mech": edge_mech,
         "attr_mech": attr_mech,
         "site": local_site,
+        "neighborhood_1hop": neighborhood_1hop,
         "neighborhood": neighborhood,
         "n": n,
-        # True chain length, independent of how many residues this graph holds.
-        # The whole-sequence heads need it explicitly: pooling cannot recover a
-        # length the graph does not span.
         "length": length,
         "truncated": truncated,
     }
+
+    if record.get("layer_embs") is not None:
+        sample["layer_embs"] = record["layer_embs"][:, start:end].float()
+    if record.get("wt_logprobs") is not None:
+        lp_win = record["wt_logprobs"][start:end].float()
+        sample["wt_logprobs"] = lp_win
+        sample["wt_logprobs_site"] = lp_win[local_site]
+
+    if cfg.get("use_str_stream"):
+        coords = record.get("coords")
+        plddt = record.get("plddt")
+        cvalid = record.get("coord_valid")
+        c_slice = coords[start:end] if coords is not None else None
+        p_slice = plddt[start:end] if plddt is not None else None
+        v_slice = cvalid[start:end] if cvalid is not None else None
+        e_str, a_str, s_node = build_structure_graph(
+            c_slice, p_slice, v_slice, n,
+            topology_only=bool(cfg.get("str_topology_only", False)),
+        )
+        sample["edge_str"] = e_str
+        sample["attr_str"] = a_str
+        sample["str_node"] = s_node
+    return sample
+
+
+# ---------------------------------------------------------------------------
+# Parent-level graph cache (avoids rebuilding identical graphs 740x/epoch)
+# ---------------------------------------------------------------------------
+class _ParentGraphCache:
+    """
+    Caches whole-protein graph structures for parents with ``L <= window``.
+
+    On MegaScale (412 parents, L in [32, 72], window 256), every mutation of a
+    parent shares the exact same ``E_geo``, ``E_mech``, ``topo``, and optional
+    ``E_str``. Caching once per parent cuts CPU graph construction by ~740x.
+    """
+
+    def __init__(self, cfg: dict, window: int, max_entries: int = 1024):
+        self.cfg = cfg
+        self.window = int(window)
+        self.max_entries = int(max_entries)
+        self._base: dict[str, dict] = {}
+        self._khops: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._khop_tables: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def get_whole(self, seq: str, record: dict) -> dict | None:
+        length = record["emb"].shape[0]
+        if length > self.window:
+            return None
+        cached = self._base.get(seq)
+        if cached is not None:
+            return cached
+        g = build_sample_graph(record, 0, self.window, self.cfg, drop_cds=False)
+        if len(self._base) < self.max_entries:
+            self._base[seq] = g
+        return g
+
+    def get_khops(self, seq: str, edge_geo: torch.Tensor, site: int, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (seq, site)
+        hit = self._khops.get(key)
+        if hit is not None:
+            return hit
+        m1 = khop_neighborhood(edge_geo, site, n, hops=1)
+        m2 = khop_neighborhood(edge_geo, site, n, hops=self.cfg.get("neighborhood_hops", 2))
+        if len(self._khops) < self.max_entries * 64:
+            self._khops[key] = (m1, m2)
+        return m1, m2
+
+    def get_khop_tables(self, seq: str, edge_geo: torch.Tensor, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        ``(n, n)`` bool tables ``N1[s]`` / ``N2[s]`` = the 1-hop / k-hop mask of
+        site ``s``, i.e. exactly :func:`khop_neighborhood` stacked over every
+        site. Indexing it replaces a Python loop of ``K`` khop calls and a
+        ``torch.stack`` per item; the values are identical.
+        """
+        hit = self._khop_tables.get(seq)
+        if hit is not None:
+            return hit
+        hops2 = self.cfg.get("neighborhood_hops", 2)
+        n1 = torch.stack([khop_neighborhood(edge_geo, i, n, hops=1) for i in range(n)], dim=0)
+        n2 = torch.stack([khop_neighborhood(edge_geo, i, n, hops=hops2) for i in range(n)], dim=0)
+        if len(self._khop_tables) < self.max_entries:
+            self._khop_tables[seq] = (n1, n2)
+        return n1, n2
+
+
+# Graph structure depends only on these config keys (plus window and the encoder
+# cache directory). Datasets built in one process with the same values - the
+# train / val / test / train_eval loaders of a run - share ONE cache, so each
+# parent's graph is built once per process instead of once per dataset and,
+# via fork, once per DataLoader worker.
+_GRAPH_CFG_KEYS = (
+    "true_contact_edges", "true_contacts_dir", "graph_top_k", "contact_min_sep",
+    "geo_threshold", "eps", "delta", "mech_max_degree", "neighborhood_hops",
+    "use_str_stream", "str_topology_only",
+)
+_SHARED_GRAPH_CACHES: dict[tuple, _ParentGraphCache] = {}
+
+
+def get_shared_graph_cache(cfg: dict, window: int, store=None) -> _ParentGraphCache:
+    key = (
+        str(getattr(store, "cache_dir", id(store))),
+        int(window),
+        tuple((k, repr(cfg.get(k))) for k in _GRAPH_CFG_KEYS),
+    )
+    cache = _SHARED_GRAPH_CACHES.get(key)
+    if cache is None:
+        cache = _ParentGraphCache(cfg, window)
+        _SHARED_GRAPH_CACHES[key] = cache
+    return cache
+
+
+def clear_shared_graph_caches() -> None:
+    _SHARED_GRAPH_CACHES.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -640,21 +847,42 @@ class MutationDataset(Dataset):
     """
 
     def __init__(self, df: pd.DataFrame, store: EncodingStore, cfg,
-                 target: str = "target", noise_std: float = 0.0):
+                 target: str = "target", noise_std: float = 0.0,
+                 cds_dropout: float = 0.0):
         self.df = df.reset_index(drop=True)
         self.store = store
         self.cfg = cfg if isinstance(cfg, dict) else cfg.as_dict()
         self.window = int(self.cfg.get("window", 256))
         self.target = target
         self.noise_std = float(noise_std)
+        self.cds_dropout = float(cds_dropout)
+        self._graph_cache = get_shared_graph_cache(self.cfg, self.window, self.store)
 
     def __len__(self) -> int:
         return len(self.df)
 
     def __getitem__(self, i: int) -> dict:
         row = self.df.iloc[i]
-        rec = self.store.get(row["parent_seq"])
-        g = build_sample_graph(rec, int(row["site"]), self.window, self.cfg)
+        seq = row["parent_seq"]
+        site = int(row["site"])
+        rec = self.store.get(seq)
+        drop_cds = self.cds_dropout > 0.0 and float(torch.rand(())) < self.cds_dropout
+
+        base = self._graph_cache.get_whole(seq, rec)
+        if base is not None:
+            g = dict(base)
+            s_clamped = min(site, g["n"] - 1)
+            m1, m2 = self._graph_cache.get_khops(seq, g["edge_geo"], s_clamped, g["n"])
+            g["site"] = s_clamped
+            g["neighborhood_1hop"] = m1
+            g["neighborhood"] = m2
+            if "wt_logprobs" in base:
+                g["wt_logprobs_site"] = base["wt_logprobs"][s_clamped]
+            if drop_cds:
+                g["mech"], g["edge_mech"], g["attr_mech"] = _apply_cds_dropout(g["mech"], g["n"])
+        else:
+            g = build_sample_graph(rec, site, self.window, self.cfg, drop_cds=drop_cds)
+
         if self.noise_std > 0.0:
             g["esm"] = g["esm"] + self.noise_std * torch.randn_like(g["esm"])
         g["wt_idx"] = aa_index(row["wt_aa"])
@@ -662,6 +890,169 @@ class MutationDataset(Dataset):
         g["y"] = float(row[self.target])
         g["sigma"] = float(row["sigma"]) if "sigma" in row and pd.notna(row["sigma"]) else float("nan")
         return g
+
+
+class ProteinBatchMutationDataset(Dataset):
+    """
+    Parent-grouped mutation dataset for 15-40x faster MegaScale training.
+
+    Each item represents one parent protein (with ``L <= window``) paired with
+    a chunk of ``muts_per_protein`` mutations. Running the backbone ONCE per
+    parent protein and gathering all mutation contexts in parallel via
+    :meth:`MultiScaleSiteReadout.gather_protein_batch` eliminates ~98% of
+    redundant backbone forward passes while balancing gradient weight across
+    proteins of different mutation counts.
+
+    During training, each epoch iterates over ``visits_per_parent`` disjoint
+    shuffled chunks per parent (covering the entire dataset once per epoch).
+    During evaluation (``train=False``), every row is visited deterministically
+    in exact order without duplication.
+    """
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        store: EncodingStore,
+        cfg,
+        target: str = "target",
+        muts_per_protein: int = 64,
+        train: bool = True,
+        noise_std: float = 0.0,
+        cds_dropout: float = 0.0,
+        seed: int = 42,
+    ):
+        self.df = df.reset_index(drop=True)
+        self.store = store
+        self.cfg = cfg if isinstance(cfg, dict) else cfg.as_dict()
+        self.window = int(self.cfg.get("window", 256))
+        self.target = target
+        self.muts_per_protein = max(int(muts_per_protein), 1)
+        self.train = bool(train)
+        self.noise_std = float(noise_std)
+        self.cds_dropout = float(cds_dropout)
+        self.seed = int(seed)
+        self.epoch = 0
+        self._graph_cache = get_shared_graph_cache(self.cfg, self.window, self.store)
+
+        # Group row indices by parent_seq
+        self._groups: list[tuple[str, np.ndarray]] = []
+        for seq, grp in self.df.groupby("parent_seq", sort=False):
+            self._groups.append((str(seq), grp.index.to_numpy(dtype=np.int64)))
+
+        # Pre-extract fast numpy arrays for O(1) mutation slicing
+        self._site = self.df["site"].to_numpy(dtype=np.int64)
+        self._wt_idx = np.array([aa_index(a) for a in self.df["wt_aa"]], dtype=np.int64)
+        self._mt_idx = np.array([aa_index(a) for a in self.df["mt_aa"]], dtype=np.int64)
+        self._y = self.df[self.target].to_numpy(dtype=np.float32)
+        if "sigma" in self.df.columns:
+            self._sigma = pd.to_numeric(self.df["sigma"], errors="coerce").to_numpy(dtype=np.float32)
+        else:
+            self._sigma = np.full(len(self.df), np.nan, dtype=np.float32)
+
+        self._chunks: list[tuple[str, np.ndarray]] = []
+        self._rebuild_chunks(epoch=0)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+        self._rebuild_chunks(self.epoch)
+
+    def prewarm(self) -> int:
+        """
+        Build every whole-protein graph and k-hop table this dataset will need
+        in the CURRENT process. Call before creating a multi-worker DataLoader
+        on a fork platform: workers inherit the (read-only) cache copy-on-write
+        instead of each rebuilding it, and non-persistent evaluation workers no
+        longer rebuild it every epoch. Pure caching; outputs are unchanged.
+        Returns the number of proteins cached.
+        """
+        n_cached = 0
+        for seq, _idxs in self._groups:
+            rec = self.store.get(seq)
+            base = self._graph_cache.get_whole(seq, rec)
+            if base is None:
+                continue
+            self._graph_cache.get_khop_tables(seq, base["edge_geo"], base["n"])
+            n_cached += 1
+        return n_cached
+
+    def _rebuild_chunks(self, epoch: int) -> None:
+        rng = np.random.default_rng(self.seed * 1_000_003 + epoch * 7_919)
+        chunks: list[tuple[str, np.ndarray]] = []
+        m = self.muts_per_protein
+        for seq, idxs in self._groups:
+            arr = rng.permutation(idxs) if self.train else idxs
+            for start in range(0, len(arr), m):
+                chunks.append((seq, arr[start:start + m]))
+        self._chunks = chunks
+
+    def __len__(self) -> int:
+        return len(self._chunks)
+
+    def __getitem__(self, i: int) -> dict:
+        seq, idxs = self._chunks[i]
+        rec = self.store.get(seq)
+        drop_cds = self.train and self.cds_dropout > 0.0 and float(torch.rand(())) < self.cds_dropout
+
+        base = self._graph_cache.get_whole(seq, rec)
+        shared_graph = base is not None
+        if base is None:
+            # Fallback if a protein exceeds window: center on the first mutation
+            base = build_sample_graph(rec, int(self._site[idxs[0]]), self.window, self.cfg, drop_cds=drop_cds)
+            start_off = max(0, min(int(self._site[idxs[0]]), base["length"] - 1) - base["site"])
+        else:
+            base = dict(base)
+            start_off = 0
+            if drop_cds:
+                base["mech"], base["edge_mech"], base["attr_mech"] = _apply_cds_dropout(
+                    base["mech"], base["n"]
+                )
+
+        if self.train and self.noise_std > 0.0:
+            base["esm"] = base["esm"] + self.noise_std * torch.randn_like(base["esm"])
+
+        n = base["n"]
+        local_sites = np.clip(self._site[idxs] - start_off, 0, n - 1)
+        if shared_graph:
+            n1_tab, n2_tab = self._graph_cache.get_khop_tables(seq, base["edge_geo"], n)
+            sites_t = torch.from_numpy(local_sites.astype(np.int64))
+            neigh_1, neigh_2 = n1_tab[sites_t], n2_tab[sites_t]
+        else:
+            # A site-centred crop is specific to this chunk: never cache its
+            # k-hop masks under the whole-protein (seq, site) key.
+            hops2 = self.cfg.get("neighborhood_hops", 2)
+            neigh_1 = torch.stack([khop_neighborhood(base["edge_geo"], int(s), n, hops=1)
+                                   for s in local_sites], dim=0)
+            neigh_2 = torch.stack([khop_neighborhood(base["edge_geo"], int(s), n, hops=hops2)
+                                   for s in local_sites], dim=0)
+
+        item = {
+            "esm": base["esm"],
+            "mech": base["mech"],
+            "topo": base["topo"],
+            "edge_geo": base["edge_geo"],
+            "attr_geo": base["attr_geo"],
+            "edge_mech": base["edge_mech"],
+            "attr_mech": base["attr_mech"],
+            "n": n,
+            "length": base["length"],
+            "truncated": base["truncated"],
+            "sites": torch.from_numpy(local_sites.astype(np.int64)),
+            "neigh_1hop": neigh_1,                          # (K, n)
+            "neigh_2hop": neigh_2,                          # (K, n)
+            "wt_idx": torch.from_numpy(self._wt_idx[idxs]),
+            "mt_idx": torch.from_numpy(self._mt_idx[idxs]),
+            "y": torch.from_numpy(self._y[idxs]),
+            "sigma": torch.from_numpy(self._sigma[idxs]),
+        }
+        if "layer_embs" in base:
+            item["layer_embs"] = base["layer_embs"]
+        if "wt_logprobs" in base:
+            item["wt_logprobs_site"] = base["wt_logprobs"][item["sites"]]
+        if "edge_str" in base:
+            item["edge_str"] = base["edge_str"]
+            item["attr_str"] = base["attr_str"]
+            item["str_node"] = base["str_node"]
+        return item
 
 
 class SequenceDataset(Dataset):
@@ -827,16 +1218,39 @@ def collate_graphs(samples: list[dict]) -> dict:
 
     esm = torch.zeros(b, L, d)
     mech = torch.zeros(b, L, N_MECH_CHANNELS)
+    topo = torch.zeros(b, L, N_TOPO_CHANNELS)
     mask = torch.zeros(b, L, dtype=torch.bool)
     neighborhood = torch.zeros(b, L, dtype=torch.bool)
+    neighborhood_1hop = torch.zeros(b, L, dtype=torch.bool)
 
-    eg, ag, em, am = [], [], [], []
+    has_layers = all("layer_embs" in s for s in samples)
+    layer_embs = (
+        torch.zeros(b, samples[0]["layer_embs"].shape[0], L, d)
+        if has_layers else None
+    )
+    has_lp = all("wt_logprobs" in s for s in samples)
+    wt_logprobs = (
+        torch.zeros(b, L, samples[0]["wt_logprobs"].shape[-1])
+        if has_lp else None
+    )
+    has_str = all("edge_str" in s for s in samples)
+    str_node = torch.zeros(b, L, STR_NODE_DIM) if has_str else None
+    str_edge_dim = samples[0]["attr_str"].shape[-1] if has_str else STR_EDGE_DIM
+
+    eg, ag, em, am, es, as_ = [], [], [], [], [], []
     for i, s in enumerate(samples):
         n = s["n"]
         esm[i, :n] = s["esm"]
         mech[i, :n] = s["mech"]
+        if "topo" in s:
+            topo[i, :n] = s["topo"]
         mask[i, :n] = True
         neighborhood[i, :n] = s["neighborhood"]
+        neighborhood_1hop[i, :n] = s.get("neighborhood_1hop", s["neighborhood"])
+        if layer_embs is not None:
+            layer_embs[i, :, :n] = s["layer_embs"]
+        if wt_logprobs is not None:
+            wt_logprobs[i, :n] = s["wt_logprobs"]
         off = i * L
         if s["edge_geo"].numel():
             eg.append(s["edge_geo"] + off)
@@ -844,46 +1258,160 @@ def collate_graphs(samples: list[dict]) -> dict:
         if s["edge_mech"].numel():
             em.append(s["edge_mech"] + off)
             am.append(s["attr_mech"])
+        if has_str:
+            str_node[i, :n] = s["str_node"]
+            if s["edge_str"].numel():
+                es.append(s["edge_str"] + off)
+                as_.append(s["attr_str"])
 
-    def _cat(edges, attrs):
+    def _cat(edges, attrs, edim=EDGE_DIM):
         if not edges:
-            return torch.zeros((2, 0), dtype=torch.long), torch.zeros((0, 3))
+            return torch.zeros((2, 0), dtype=torch.long), torch.zeros((0, edim))
         return torch.cat(edges, dim=1), torch.cat(attrs, dim=0)
 
-    edge_geo, attr_geo = _cat(eg, ag)
-    edge_mech, attr_mech = _cat(em, am)
+    edge_geo, attr_geo = _cat(eg, ag, EDGE_DIM)
+    edge_mech, attr_mech = _cat(em, am, EDGE_DIM)
 
     batch = {
         "esm": esm,
         "mech": mech,
+        "topo": topo,
         "mask": mask,
         "edge_geo": edge_geo,
         "attr_geo": attr_geo,
         "edge_mech": edge_mech,
         "attr_mech": attr_mech,
         "site": torch.tensor([s["site"] for s in samples], dtype=torch.long),
-        # Round-1 review, R1-07 asked for the node cap to be "applied AND
-        # reported"; round 2 found it applied and reported to nobody - the flag
-        # was set in build_sample_graph, dropped here, and a repo-wide grep found
-        # no consumer. It now reaches the batch, and scripts/train.py counts it
-        # into metrics.json, so a run that silently truncated proteins says so.
         "truncated": torch.tensor([bool(s.get("truncated", False))
                                    for s in samples], dtype=torch.bool),
         "neighborhood_mask": neighborhood,
+        "neighborhood_1hop": neighborhood_1hop,
         "wt_idx": torch.tensor([s["wt_idx"] for s in samples], dtype=torch.long),
         "mt_idx": torch.tensor([s["mt_idx"] for s in samples], dtype=torch.long),
         "y": torch.tensor([s["y"] for s in samples], dtype=torch.float32),
         "sigma": torch.tensor([s["sigma"] for s in samples], dtype=torch.float32),
-        # True chain length per sample. The whole-sequence heads consume it
-        # directly; a pool over the graph cannot recover it.
         "seq_length": torch.tensor(
             [float(s.get("length", s["n"])) for s in samples], dtype=torch.float32
         ),
     }
+    if layer_embs is not None:
+        batch["layer_embs"] = layer_embs
+    if wt_logprobs is not None:
+        batch["wt_logprobs"] = wt_logprobs
+    if has_str:
+        edge_str, attr_str = _cat(es, as_, str_edge_dim)
+        batch["edge_str"] = edge_str
+        batch["attr_str"] = attr_str
+        batch["str_node"] = str_node
     if "species_id" in samples[0]:
         batch["species_id"] = torch.tensor(
             [s["species_id"] for s in samples], dtype=torch.long
         )
+    return batch
+
+
+def collate_protein_batch(items: list[dict]) -> dict:
+    """
+    Collate ``P`` parent protein graphs from :class:`ProteinBatchMutationDataset`
+    alongside all ``M`` flattened mutations pointing into ``prot_idx in [0, P)``.
+    """
+    p = len(items)
+    L = max(it["n"] for it in items)
+    d = items[0]["esm"].shape[-1]
+
+    esm = torch.zeros(p, L, d)
+    mech = torch.zeros(p, L, N_MECH_CHANNELS)
+    topo = torch.zeros(p, L, N_TOPO_CHANNELS)
+    mask = torch.zeros(p, L, dtype=torch.bool)
+
+    has_layers = all("layer_embs" in it for it in items)
+    layer_embs = (
+        torch.zeros(p, items[0]["layer_embs"].shape[0], L, d)
+        if has_layers else None
+    )
+    has_lp_site = all("wt_logprobs_site" in it for it in items)
+    has_str = all("edge_str" in it for it in items)
+    str_node = torch.zeros(p, L, STR_NODE_DIM) if has_str else None
+    str_edge_dim = items[0]["attr_str"].shape[-1] if has_str else STR_EDGE_DIM
+
+    eg, ag, em, am, es, as_ = [], [], [], [], [], []
+    prot_idxs, sites, wt_l, mt_l, y_l, sig_l, lp_l = [], [], [], [], [], [], []
+    n1_rows, n2_rows = [], []
+
+    for i, it in enumerate(items):
+        n = it["n"]
+        k = int(it["sites"].numel())
+        esm[i, :n] = it["esm"]
+        mech[i, :n] = it["mech"]
+        topo[i, :n] = it["topo"]
+        mask[i, :n] = True
+        if layer_embs is not None:
+            layer_embs[i, :, :n] = it["layer_embs"]
+        off = i * L
+        if it["edge_geo"].numel():
+            eg.append(it["edge_geo"] + off)
+            ag.append(it["attr_geo"])
+        if it["edge_mech"].numel():
+            em.append(it["edge_mech"] + off)
+            am.append(it["attr_mech"])
+        if has_str:
+            str_node[i, :n] = it["str_node"]
+            if it["edge_str"].numel():
+                es.append(it["edge_str"] + off)
+                as_.append(it["attr_str"])
+
+        prot_idxs.append(torch.full((k,), i, dtype=torch.long))
+        sites.append(it["sites"])
+        wt_l.append(it["wt_idx"])
+        mt_l.append(it["mt_idx"])
+        y_l.append(it["y"])
+        sig_l.append(it["sigma"])
+        if has_lp_site:
+            lp_l.append(it["wt_logprobs_site"])
+        m1_pad = torch.zeros((k, L), dtype=torch.bool)
+        m2_pad = torch.zeros((k, L), dtype=torch.bool)
+        m1_pad[:, :n] = it["neigh_1hop"]
+        m2_pad[:, :n] = it["neigh_2hop"]
+        n1_rows.append(m1_pad)
+        n2_rows.append(m2_pad)
+
+    def _cat(edges, attrs, edim=EDGE_DIM):
+        if not edges:
+            return torch.zeros((2, 0), dtype=torch.long), torch.zeros((0, edim))
+        return torch.cat(edges, dim=1), torch.cat(attrs, dim=0)
+
+    edge_geo, attr_geo = _cat(eg, ag, EDGE_DIM)
+    edge_mech, attr_mech = _cat(em, am, EDGE_DIM)
+
+    batch = {
+        "esm": esm,
+        "mech": mech,
+        "topo": topo,
+        "mask": mask,
+        "edge_geo": edge_geo,
+        "attr_geo": attr_geo,
+        "edge_mech": edge_mech,
+        "attr_mech": attr_mech,
+        "prot_idx": torch.cat(prot_idxs, dim=0),
+        "site": torch.cat(sites, dim=0),
+        "neighborhood_1hop": torch.cat(n1_rows, dim=0),
+        "neighborhood_mask": torch.cat(n2_rows, dim=0),
+        "wt_idx": torch.cat(wt_l, dim=0),
+        "mt_idx": torch.cat(mt_l, dim=0),
+        "y": torch.cat(y_l, dim=0),
+        "sigma": torch.cat(sig_l, dim=0),
+        "truncated": torch.tensor([bool(it.get("truncated", False)) for it in items], dtype=torch.bool),
+        "seq_length": torch.tensor([float(it["length"]) for it in items], dtype=torch.float32),
+    }
+    if layer_embs is not None:
+        batch["layer_embs"] = layer_embs
+    if has_lp_site:
+        batch["wt_logprobs_site"] = torch.cat(lp_l, dim=0)
+    if has_str:
+        edge_str, attr_str = _cat(es, as_, str_edge_dim)
+        batch["edge_str"] = edge_str
+        batch["attr_str"] = attr_str
+        batch["str_node"] = str_node
     return batch
 
 
@@ -901,7 +1429,11 @@ __all__ = [
     "filter_to_cache",
     "build_sample_graph",
     "MutationDataset",
+    "ProteinBatchMutationDataset",
+    "get_shared_graph_cache",
+    "clear_shared_graph_caches",
     "SequenceDataset",
     "collate_graphs",
+    "collate_protein_batch",
     "move_batch",
 ]

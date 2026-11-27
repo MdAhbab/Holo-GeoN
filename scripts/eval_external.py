@@ -18,6 +18,25 @@ protein is anywhere in the run.
 proteins from 67 organisms at a median length of 228. It shares no measurement
 with the training table by construction.
 
+Three tables are scored with this script, and each gets its own result file,
+named after the data file's stem (the same ``key`` used for column overrides in
+``configs/data.yaml`` and for ``pred_{key}.parquet``):
+
+* ``fireprotdb_holdout.parquet`` - FireProtDB with all MegaScale-sourced rows
+  removed (no homology filter).
+* ``fireprotdb_hf25.parquet``    - the subset of that table whose proteins are
+  under 25% identity to MegaScale (MMseqs2).
+* ``s669_holdout.parquet``       - S669, a separate 669-mutation literature
+  holdout whose wild-type residues are verified against the WT PDB chains.
+
+They used to share one output name, ``external_fireprotdb.json``, so evaluating
+several into one directory silently kept only the last. The result is now
+``external_{key}.json``. The old name is still written, for ``fireprotdb*``
+tables only, because ``run.py``, ``scripts/final_scores.py``,
+``scripts/remote_job.py`` and earlier run artifacts read it; the files differ
+only in name, so with several ``fireprotdb*`` tables in one directory the
+legacy file is whichever of them ran last. Read ``external_{key}.json``.
+
 Two things this reports that a plain metric would hide
 ------------------------------------------------------
 * **Rows dropped for want of a cached encoding.** An external table's proteins
@@ -33,6 +52,8 @@ Two things this reports that a plain metric would hide
 Usage
 -----
 python -m scripts.eval_external --checkpoint runs/main/model_best.pt
+python -m scripts.eval_external --checkpoint runs/main/model_best.pt \\
+    --data data/s669_holdout.parquet          # -> runs/main/external_s669_holdout.json
 """
 from __future__ import annotations
 
@@ -48,7 +69,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from src.config import load_config
+from src.config import apply_checkpoint_graph_config, load_config
 from src.data import (
     MutationDataset,
     collate_graphs,
@@ -58,6 +79,7 @@ from src.data import (
 )
 from src.device import describe_device
 from src.encoder import ESM_DIMS, EncodingStore
+from src.fast_eval import predict_table
 from src.metrics import format_report, regression_metrics
 from src.model import HoloGeoN
 from src.provenance import provenance
@@ -67,6 +89,101 @@ try:                                    # same fallback calibration.py uses
     from scripts.train import model_kwargs_from_config
 except Exception:                       # pragma: no cover
     model_kwargs_from_config = None
+
+
+# The result file's name before results were keyed by table. Still written for
+# ``fireprotdb*`` tables (see the module docstring); readers should prefer
+# ``external_{key}.json``.
+LEGACY_RESULT_JSON = "external_fireprotdb.json"
+
+# What each known table measures, keyed by the data file's stem. ``title`` heads
+# the printed report; ``what`` goes into the JSON as ``what_this_measures``.
+TABLE_INFO: dict[str, dict[str, str]] = {
+    "fireprotdb_holdout": {
+        "title": "FireProtDB (no MegaScale rows)",
+        "what": (
+            "transfer to proteins the run never saw: FireProtDB with all "
+            "MegaScale-sourced rows removed, so no measurement is shared with "
+            "the training table. No homology filter is applied, so a protein "
+            "can still be similar to a MegaScale training domain"
+        ),
+    },
+    "fireprotdb_hf25": {
+        "title": "FireProtDB homology-filtered (<25% identity to MegaScale)",
+        "what": (
+            "transfer to proteins dissimilar to the training table: the "
+            "homology-filtered subset of the MegaScale-free FireProtDB holdout, "
+            "keeping only proteins under 25% sequence identity to MegaScale "
+            "(MMseqs2 search). Shares no measurement with the training table, "
+            "and no kept protein reached 25% identity to a MegaScale sequence"
+        ),
+    },
+    "s669_holdout": {
+        "title": "S669 (669-mutation literature holdout)",
+        "what": (
+            "transfer to a separate literature holdout: S669 (Pancotti et al. "
+            "2022), 669 mutations whose wild-type residues were verified "
+            "against the WT PDB chains. It is a different table from both "
+            "FireProtDB and the MegaScale training table, not a FireProtDB "
+            "subset"
+        ),
+    },
+    "s1724_thermomutdb_holdout": {
+        "title": "S1724 ThermoMutDB curated holdout (Rocklin 2026)",
+        "what": (
+            "transfer to the curated ThermoMutDB classical stability holdout "
+            "(1,433 verified single mutants across 35 PDBs / 33 unique WT "
+            "proteins, stabilizing-positive). No homology filter applied"
+        ),
+    },
+    "s1724_thermomutdb_hf25": {
+        "title": "S1724 ThermoMutDB homology-filtered (<25% identity to MegaScale)",
+        "what": (
+            "transfer to the homology-filtered (<25% MMseqs2 identity to "
+            "MegaScale) subset of S1724 ThermoMutDB (565 verified single "
+            "mutants across 22 parents / 21 unique WT proteins), excluding "
+            "the 12/33 proteins sharing >=25% homology with MegaScale"
+        ),
+    },
+    "domainome_apca_hf25": {
+        "title": "Human Domainome 1.0 aPCA (<25% identity to MegaScale)",
+        "what": (
+            "zero-shot rank transfer to Human Domainome 1.0 aPCA abundance "
+            "fitness (Beltran et al. 2025) filtered to <25% MMseqs2 identity "
+            "to MegaScale (evaluate strictly by per-domain Spearman rank)"
+        ),
+    },
+}
+
+
+def describe_table(key: str) -> dict[str, str]:
+    """Title and ``what_this_measures`` text for the table with file stem ``key``."""
+    info = TABLE_INFO.get(key)
+    if info is not None:
+        return dict(info)
+    # An unregistered table must not inherit another table's description.
+    return {
+        "title": key,
+        "what": (
+            f"transfer to the external table {key!r}, which the run never "
+            f"saw. No description is registered for this table in "
+            f"scripts/eval_external.py (TABLE_INFO), so check how it was built "
+            f"before reading the number"
+        ),
+    }
+
+
+def result_paths(out_dir: str, key: str) -> list[str]:
+    """JSON files to write for table ``key``: the keyed one, then the legacy one.
+
+    The legacy ``external_fireprotdb.json`` is added when, and only when, the key
+    starts with ``fireprotdb``; other tables never write it.
+    """
+    paths = [os.path.join(out_dir, f"external_{key}.json")]
+    legacy = os.path.join(out_dir, LEGACY_RESULT_JSON)
+    if key.startswith("fireprotdb") and legacy not in paths:
+        paths.append(legacy)
+    return paths
 
 
 @torch.no_grad()
@@ -91,6 +208,9 @@ def main() -> None:
     ap.add_argument("--cache", default=None)
     ap.add_argument("--device", default=None)
     ap.add_argument("--out", default=os.path.join("runs", "main"))
+    ap.add_argument("--rowwise", action="store_true",
+                    help="score row-by-row with MutationDataset (legacy, slow) instead of "
+                         "the per-protein batched fast path; same numbers either way")
     args = ap.parse_args()
 
     cfg = load_config(args.config, overrides={"cache": args.cache, "device": args.device})
@@ -110,6 +230,10 @@ def main() -> None:
         args.data, kind="stability", overrides=overrides,
         max_protein_length=cfg.max_protein_length,
     )
+    if "source_row_id" in norm.columns:
+        norm["row_id"] = norm["source_row_id"].to_numpy(dtype=np.int64)
+    else:
+        norm["row_id"] = np.arange(len(norm), dtype=np.int64)
     print(report.summary())
     sign_applied = report.notes.get("ddg_sign", "stabilizing_positive")
     print(f"[external] ddg_sign applied: {sign_applied}  "
@@ -133,6 +257,7 @@ def main() -> None:
             "[external] no rows have a cached encoding; nothing to score.")
 
     state = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    apply_checkpoint_graph_config(cfg, state)
     esm_dim = state.get("esm_dim", ESM_DIMS.get(cfg.esm_model, 1280))
     kwargs = state.get("model_kwargs")
     if kwargs is None and model_kwargs_from_config is not None:
@@ -141,23 +266,39 @@ def main() -> None:
     model.load_state_dict(state["model"])
     model.eval()
 
-    loader = DataLoader(
-        MutationDataset(norm, store, cfg, target="target"),
-        batch_size=cfg.batch_size, shuffle=False,
-        num_workers=cfg.num_workers, collate_fn=collate_graphs,
-    )
-    mu, sigma, y = predict(model, loader, device)
+    # Per-protein batched scoring (graph built once per protein, all of its
+    # mutations in batched forward passes; proteins longer than cfg.window use
+    # the row-wise MutationDataset path). Rows come back in ``norm`` order and
+    # match the legacy loader to float rounding - see tests/test_fast_eval.py.
+    mu, sigma, y, info = predict_table(model, norm, store, cfg, device, target="target",
+                                       rowwise=True if args.rowwise else None)
+    print(f"[external] scored {info['rows']:,} rows: {info['fast_rows']:,} batched over "
+          f"{info['fast_proteins']:,} proteins, {info['rowwise_rows']:,} row-wise "
+          f"({info.get('seconds', 0)} s)", flush=True)
     metrics = regression_metrics(y, mu)
 
+    # Also write common-format per-row predictions so scripts/score_predictions.py
+    # can compute cluster-bootstrap CIs and paired competitor comparisons directly.
+    if "row_id" in norm.columns:
+        row_ids = norm["row_id"].to_numpy(dtype=np.int64)
+    else:
+        row_ids = np.arange(len(norm), dtype=np.int64)
+    pred_path = os.path.join(args.out, f"pred_{key}.parquet")
+    pd.DataFrame({
+        "row_id": row_ids,
+        "y_true": y.astype(np.float32),
+        "y_pred": mu.astype(np.float32),
+        "y_sigma": sigma.astype(np.float32),
+    }).to_parquet(pred_path, index=False)
+
+    table = describe_table(key)
     out = {
         "provenance": provenance(),
         "checkpoint": args.checkpoint,
         "data": args.data,
-        "what_this_measures": (
-            "transfer to proteins the run never saw: FireProtDB with all "
-            "MegaScale-sourced rows removed, so no measurement is shared with "
-            "the training table"
-        ),
+        "table_key": key,
+        "predictions_parquet": pred_path,
+        "what_this_measures": table["what"],
         "ddg_sign_applied": sign_applied,
         "rows_scored": int(len(y)),
         "rows_without_cached_encoding": int(n_uncached),
@@ -169,13 +310,17 @@ def main() -> None:
             "median": float(np.median(sigma)) if len(sigma) else float("nan"),
         },
     }
-    path = os.path.join(args.out, "external_fireprotdb.json")
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(out, fh, indent=2)
+    paths = result_paths(args.out, key)
+    for p in paths:
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump(out, fh, indent=2)
 
-    print("\n" + format_report(metrics, title="External test — FireProtDB (no MegaScale rows)"))
+    print("\n" + format_report(metrics, title=f"External test — {table['title']}"))
     print(f"\n[external] {len(y)} rows over {out['distinct_proteins']} proteins")
-    print(f"[external] wrote {path}")
+    print(f"[external] wrote {paths[0]}")
+    for legacy in paths[1:]:
+        print(f"[external] wrote {legacy}  (legacy name, same content; the last "
+              f"fireprotdb* table written to {args.out} owns it)")
 
 
 if __name__ == "__main__":

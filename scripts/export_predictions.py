@@ -29,10 +29,11 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from src.config import load_config
+from src.config import apply_checkpoint_graph_config, load_config
 from src.data import LoadReport, MutationDataset, collate_graphs, filter_to_cache, move_batch
 from src.device import describe_device
 from src.encoder import ESM_DIMS, EncodingStore
+from src.fast_eval import predict_table
 from src.model import HoloGeoN, model_kwargs_from_config
 
 
@@ -56,6 +57,9 @@ def main() -> None:
     ap.add_argument("--cache", default=None)
     ap.add_argument("--device", default=None)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--rowwise", action="store_true",
+                    help="score row-by-row with MutationDataset (legacy, slow) instead of "
+                         "the per-protein batched fast path; same numbers either way")
     args = ap.parse_args()
 
     cfg = load_config(args.config, overrides={"cache": args.cache, "device": args.device})
@@ -72,16 +76,23 @@ def main() -> None:
         raise SystemExit("no rows with a cached encoding; run precompute first")
 
     state = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    apply_checkpoint_graph_config(cfg, state)
     esm_dim = state.get("esm_dim", ESM_DIMS.get(cfg.esm_model, 1280))
     kwargs = state.get("model_kwargs") or model_kwargs_from_config(state.get("config", {}), esm_dim)
     model = HoloGeoN(**kwargs).to(device)
     model.load_state_dict(state["model"])
     model.eval()
 
-    loader = DataLoader(MutationDataset(part, store, cfg, target="target"),
-                        batch_size=cfg.batch_size, shuffle=False,
-                        num_workers=cfg.num_workers, collate_fn=collate_graphs)
-    mu, sigma = _predict(model, loader, device)
+    # Per-protein batched scoring: each parent's graph is built once and every
+    # one of its mutations is scored in a batched forward pass (proteins longer
+    # than cfg.window fall back to the row-wise path). Results come back in
+    # ``part`` order, identical to the legacy MutationDataset loader to float
+    # rounding (see tests/test_fast_eval.py).
+    mu, sigma, _y, info = predict_table(model, part, store, cfg, device, target="target",
+                                        rowwise=True if args.rowwise else None)
+    print(f"[export] scored {info['rows']:,} rows: {info['fast_rows']:,} batched over "
+          f"{info['fast_proteins']:,} proteins, {info['rowwise_rows']:,} row-wise "
+          f"({info.get('seconds', 0)} s)", flush=True)
     if len(mu) != len(part):
         raise SystemExit(f"predicted {len(mu)} rows for {len(part)} inputs: refusing to "
                          f"write misaligned predictions")

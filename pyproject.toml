@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "holo-geon"
+version = "2.0.0"
+description = "Structure-free evolutionary & contact-graph neural network for protein stability (ddG) and epistasis."
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.scripts]
+hologe = "holo:main"
+holo-geon = "holo:main"
+
+[tool.setuptools]
+py-modules = ["holo", "run", "runapp"]
+packages = ["src", "scripts"]

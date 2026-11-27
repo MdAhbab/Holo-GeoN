@@ -1,0 +1,42 @@
+# Headline benchmark on one Colab A100 (NVIDIA A100-SXM4-40GB), 100 compute units.
+#
+#   python -m scripts.remote_job --manifest configs/experiments/colab_a100_benchmark.yaml --plan
+#
+# Everything that goes in the paper's comparison table runs on THIS GPU type
+# (same GPU for every compared model and seed).
+
+name: colab_a100_benchmark
+platform: colab_a100
+config: configs/benchmark.yaml
+cache: /content/holo/cache/esm2_650M
+out_root: /content/holo/runs/colab_a100_benchmark
+num_workers: 4
+
+cost:
+  gpu: A100
+  cu_per_hour: 8.16       # measured on NVIDIA A100-SXM4-40GB
+  budget_cu: 100
+  reserve_cu: 10          # watchdog floor: stop below this, never spend it
+
+sizing:
+  steps_per_epoch: 4782   # ceil(305,995 train rows / 64); stability-only epoch
+  epochs: 12
+  sec_per_step: 0.040     # ASSUMED, replace with the measured value
+  eval_overhead: 0.10     # per-epoch validation + test pass
+  strict_factor: 1.3
+  vm_overhead_h: 0.30     # VM start, pip installs, Drive mount, idle
+  precompute_h: 0.15      # 176 + 412 proteins through ESM-2 650M
+  external_h: 0.03
+  baselines_h: 0.40
+
+cut_order:
+  - "competitor_retrain_*"
+  - "*_s46"
+  - "*_s45"
+  - baselines
+
+items:
+  - {id: precompute, kind: precompute}
+  - {kind: train, arm: full, seeds: [42, 43, 44, 45, 46], epochs: 12}
+  - {id: baselines, kind: baselines, phase: post, flags: ["--zero-shot-limit", "2000"], est_hours: 0.40}
+  - {id: aggregate, kind: aggregate, phase: post}

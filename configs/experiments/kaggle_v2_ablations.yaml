@@ -1,0 +1,73 @@
+# configs/experiments/kaggle_v2_ablations.yaml
+# Full Holo-GeoN v2 component + v1-comparison ablation suite across 4 Kaggle T4 accounts.
+#
+#   python -m scripts.remote_job --manifest configs/experiments/kaggle_v2_ablations.yaml --plan
+#   python -m scripts.remote_job --manifest configs/experiments/kaggle_v2_ablations.yaml --shard 0/5 ...
+#
+# With Protein-Batch training (P=8 parents x M=64 muts = 512 rows/step -> ~600 steps/epoch
+# instead of 4,782) and 10.1x parameter compression (2.04M vs 20.6M), each 12-epoch v2 arm
+# is projected at ~0.12-0.25 h on a single T4 (MEASURE FIRST in a 10-min T4 probe!).
+
+name: kaggle_v2_ablations
+platform: kaggle_t4
+config: configs/benchmark_v2.yaml
+splits_file: data/splits_megascale_id25.parquet
+external_file: data/fireprotdb_hf25.parquet
+external_files:
+  - data/fireprotdb_hf25.parquet
+  - data/fireprotdb_holdout.parquet
+  - data/s669_holdout.parquet
+  - data/s1724_thermomutdb_hf25.parquet
+cache: /tmp/holo/cache/esm2_650M_v2
+out_root: /tmp/holo/runs/kaggle_v2_ablations
+num_workers: 4
+
+cost:
+  gpu: T4
+  cu_per_hour: 0
+  budget_cu: null
+
+sizing:
+  steps_per_epoch: 619    # MEASURED Wave 0 T4 (Protein-Batch P=8 x M=64 on id25)
+  epochs: 20
+  sec_per_step: 0.067824  # MEASURED Wave 0 T4 steady state (v2_full: 41.98 s/epoch)
+  eval_overhead: 0.0      # steady epoch rate already includes val/ckpt
+  strict_factor: 1.3      # conservative multiplier for --strict-determinism
+  vm_overhead_h: 0.25
+  precompute_h: 0.05      # MEASURED 114.1 s on T4 with FP16 ESM-2 (commit f3a19f6)
+  export_h: 0.02
+  external_h: 0.01
+
+items:
+  - {id: precompute, kind: precompute}
+
+  # Headline Holo-GeoN v2 (~2.04M params)
+  - {kind: train, arm: full,                seeds: [42, 43, 44, 45, 46], epochs: 20, strict: true, export: true}
+
+  # v2 feature & loss ablations (one axis removed at a time — all 10 v2 arms run
+  # and persist FIRST (~3.3 h/shard) before legacy v1_baseline begins)
+  - {kind: train, arm: no_esm_logits_prior, seeds: [42, 43, 44, 45, 46], epochs: 20, strict: true, export: true,
+     flags: ["--no-esm-logits-prior"]}
+  - {kind: train, arm: no_multi_layer,      seeds: [42, 43, 44, 45, 46], epochs: 20, strict: true, export: true,
+     flags: ["--no-multi-layer"]}
+  - {kind: train, arm: no_contact_burial,   seeds: [42, 43, 44, 45, 46], epochs: 20, strict: true, export: true,
+     flags: ["--no-contact-burial"]}
+  - {kind: train, arm: standard_nll,        seeds: [42, 43, 44, 45, 46], epochs: 20, strict: true, export: true,
+     flags: ["--nll-beta", "0.0"]}
+  - {kind: train, arm: no_cds_dropout,      seeds: [42, 43, 44, 45, 46], epochs: 20, strict: true, export: true,
+     flags: ["--cds-dropout", "0.0"]}
+  - {kind: train, arm: no_mech_stream,      seeds: [42, 43, 44, 45, 46], epochs: 20, strict: true, export: true,
+     flags: ["--no-mech-stream"]}
+  - {kind: train, arm: no_geo_stream,       seeds: [42, 43, 44, 45, 46], epochs: 20, strict: true, export: true,
+     flags: ["--no-geo-stream"]}
+  - {kind: train, arm: no_ssm,              seeds: [42, 43, 44, 45, 46], epochs: 20, strict: true, export: true,
+     flags: ["--no-ssm"]}
+  - {kind: train, arm: global_pool_readout, seeds: [42, 43, 44, 45, 46], epochs: 20, strict: true, export: true,
+     flags: ["--global-pool-readout"]}
+
+  # Legacy v1 baseline (20.6M params, standard NLL, no CDS dropout) directly paired on same seeds!
+  - {kind: train, arm: v1_baseline,         seeds: [42, 43, 44, 45, 46], epochs: 12, strict: true, export: true,
+     steps_per_epoch: 4806, sec_per_step: 0.222847, arm_class: v1_baseline,
+     flags: ["--arch", "v1", "--nll-beta", "0.0", "--cds-dropout", "0.0", "--no-protein-batch"]}
+
+  - {id: aggregate, kind: aggregate, phase: post}

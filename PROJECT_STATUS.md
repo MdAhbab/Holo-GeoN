@@ -1,6 +1,32 @@
 # PROJECT_STATUS.md
 
-State of the Holo-GeoN benchmark as of **2026-11-04**, on `main` (`bbd620e` plus uncommitted work).
+## 0. Update — 2026-11-20 (`version-2` active branch — Blocks A/B/C Code, Figures, Block D Full-Stack v2 & Epistasis ETL Ready)
+
+* **Workspace scaffolded** into `project/` (Git repository only + gitignored `DATASETS/`), `paper/`, and `extras/` (non-Git notes, Zenodo staging, Kaggle account outputs).
+* **Git branches:** `main` == `origin/main` at `f083217`. Active branch **`version-2`** (`origin/version-2` at `3da9bc3`, plus local verified commits `bc8fd66` figures/CIs and `6ae4c82` Block D backend v2, NO push yet). Legacy v1 (`arch: "v1"`, 20.6M params) remains selectable alongside Holo-GeoN v2 (`arch: "v2"`, 2.04M params) for paired ablations. **No trained v2 weights or v2 accuracy results exist yet.**
+* **Block A — Holo-GeoN v2 Core & Efficiency (DONE & VERIFIED):**
+  * Single-pass `EsmForMaskedLM` encoder (`src/encoder.py`), compressed `HoloBackboneV2` (**2,038,417 params** vs. v1 **20,607,788 params** = **10.11x smaller**), `EvolutionarySubstitutionHead`, `ContactGatedEpistasisHead`, `beta-NLL` (`beta = 0.5`), `ProteinBatchMutationDataset` + `_ParentGraphCache`, `cds_dropout=0.5`, SE(3)-invariant 3D `src/geometry.py`, full cluster-bootstrap CIs in `scripts/score_predictions.py`, and PIT curves in `scripts/calibration.py`.
+* **Block B — Cross-Platform CLI & 5 Parallel Kaggle CPU Audits (DONE, 0 GPU HOURS USED):**
+  * Non-Linux-friendly CLI (`holo.py` / `holo.bat` / `holo.ps1` / `pyproject.toml`) + private `holo-geon-v2-gpu-seed` dataset live & byte-identical on all 4 Kaggle accounts.
+  * **Landmark Audit Finding #1 (MegaScale Structural Fold Collapse — `cpu1` + `cpu5`, 69,378 exact TM-align pairs):** On standard `id30`, **37/37 (100%)** structured test domains share a fold (`TM_max >= 0.5`, median `0.82`) with train (`27/37` `TM_max >= 0.7`). Even on `id25`, **40/40 (100%)** reach `TM_max >= 0.5` (median `0.72`). At `TM_max >= 0.50`, **97.05% (362/373)** collapse into one connected component, so no split disjoint at `TM_max >= 0.5` exists. Uniting `TM_min >= 0.60` links with `id30` sequence clusters yields **76 fold clusters** (`TM_min` alone = 78) -> **`splits_megascale_fold_tm60.parquet`** (**fold-clustered, NOT fold-disjoint**: `max_cross_tm_min = 0.5956`, median `TM_max = 0.62`, 37/39 test domains still `TM_max >= 0.5`).
+  * **Landmark Audit Finding #2 (Hidden External Homology Leakage — `cpu2` + `cpu4`):** Even after removing all 604,920 MegaScale rows from FireProtDB 2.0, **68/176 proteins (55.3% of rows)** still have `>= 25%` identity to MegaScale -> **`fireprotdb_hf25.parquet`** (1,894 rows, 108 proteins) + **`splits_megascale_id25.parquet`** (zero 8-mer overlap). On Human Domainome 1.0 (522 domains, 536,164 variants), **195/522 (37.4%)** have `>= 25%` identity -> 100%-WT-verified **`domainome_apca_hf25.parquet`** (332,854 rows, 327 domains).
+  * **Precomputed Benchmark Assets (`cpu3` + `cpu4`):** 166/176 SHA-256-pinned AFDB FireProtDB PDBs, S669 (`669/669` WT-PDB verified, 94 proteins), 412/412 frame-verified real-CDS ViennaRNA/CAI features, and 538 aligned SE(3)-invariant backbone tensors (`invariant_backbone_geometry.npz`).
+* **Block C Scaffolding, Figures, Epistasis ETL, PDB Recovery & Zenodo `Holo-StabBench v1.0` (READY FOR GPU RUNS):**
+  * 5 competitor adapters (`scripts/competitors/`), `scripts/train_epistasis.py`, streaming `scripts/build_epistasis_table.py`, `scripts/error_decomp.py`, reproducible figure pipeline (`scripts/make_figures.py`; F2 & T1a/T1b built on real release), and upgraded `scripts/zenodo_pack.py --local-processed-dir` (covers ClinVar+MANE 190k real-CDS pairs/splits + `true_contacts/` + MegaScale doubles alongside rc1 artifacts).
+  * **PDB `| / : -> _` Stem Normalization (`src/geometry.py`):** Added `normalize_pdb_stem` / `resolve_pdb_path` across `attach_coords.py`, `build_contact_maps.py`, `build_epistasis_table.py`, and `scripts/competitors/{thermompnn,spurs,rasp}.py`, recovering the 37 MegaScale constructs (`EA|...`, `GG|...`, `XX|...`) previously missed on Windows/Linux due to `|` vs `:` vs `_` naming (~410/412 coverage vs 373/412).
+  * **Active Free Kaggle CPU ETL Wave 2 (`cpu6`/`cpu7`/`cpu8`/`cpu9`, 0 GPU hours):**
+    * `cpu6` (`mdahbabhamidkhan/holo-geon-cpu6-mgnify-hf25`): Zenodo `19411306` Rocklin Lab MGnify Stability (2.23 GB) -> streaming clean + MMseqs2 `<25%` + exact/substring anti-leakage filter -> `mgnify_stability_clean_hf25.parquet` (strictly firewalled Regime-2 pretraining only).
+    * `cpu7` (`mhmehedi26/holo-geon-cpu7-s1724-rocklin`): Zenodo `19411306` `benchmarks.zip` + `figures.zip` -> `s1724_thermomutdb_holdout.parquet`, `s1724_thermomutdb_hf25.parquet` (`<25%` to MegaScale), and Rocklin 2026 Fig3/Fig4 reference predictions.
+    * `cpu8` (`wali0754/holo-geon-cpu8-epistasis-7844779`): Zenodo `7844779` complete 39-col `Processed_K50_dG_datasets.zip` + `Data_tables_for_figs.zip` -> `megascale_double_mutants_{id25,fold_tm60,id30}.parquet` with recovered `|/: -> _` PDB `dist_cb` distances + Fig4 cross-check.
+    * `cpu9` (`mdahbab/holo-geon-cpu9-geom-contacts-v2`): Rebuilds `invariant_backbone_geometry.npz` and `true_contacts_megascale.tar.gz` with `|/: -> _` PDB normalization (~410/412 MegaScale + 165 FireProtDB) + TM-align audit of the recovered constructs across `id30`/`id25`/`fold_tm60`.
+  * Hardened Wave 0 T4 probe (`3da9bc3`, `schema_version: 2`) staged at `../extras/kaggle_accounts/_gpu_kernels/wave0_t4_probe/` — waiting on `2026-11-21 00:00 UTC` Kaggle GPU quota refresh.
+  * Confirmed primary split = **`id25`** paired with the 3-tier honesty ladder (`id30 -> id25 -> fold_tm60`) + external holdouts (`FireProtDB-HF25`, `S669`, `Domainome-HF25`, `S1724-HF25`).
+* **Block D — Full-Stack Web App v2 (Backend + Frontend Source Done, `tsc --noEmit` 0 errors):**
+  * Backend (`app/backend/`, `app/API_V2.md`) and React+TS frontend (`app/frontend/src/`: `EpistasisTab.tsx`, optional CDS side-by-side & `structure_free`/`invariant_3d` mode toggle in `DdgTab.tsx`, SSE streaming heatmap/progress in `ScanTab.tsx`, 3Dmol AlphaFold pLDDT bands in `CompareTab.tsx`, `epistasis` in `ExportTab.tsx`/`HistoryTab.tsx`). Build & live demo deferred to Kaggle CPU / G4.
+
+---
+
+State of the Holo-GeoN benchmark as of **2026-11-04**, on `main` (`bbd620e` plus uncommitted work — now committed as `f083217`).
 Companions: `BENCHMARK_PLAN.md` (the benchmark), `GEOMETRIC_PLAN.md` (the coordinate question),
 `RUN_STATE.md` (the previous machine's completed run), `OVERFITTING_FIX.md`.
 

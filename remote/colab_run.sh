@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# remote/colab_run.sh - run on the Colab G4 VM (from `colab console -s S`), after Drive is mounted.
+# remote/colab_run.sh - run on the Colab A100 VM (from `colab console -s S`), after Drive is mounted.
 #
 # Drive layout it expects (copy once from your PC; the folders are yours to create):
 #   $DRIVE/code/Holo-GeoN/            this repository
@@ -15,7 +15,7 @@
 set -euo pipefail
 
 DRIVE="${DRIVE:-/content/drive/MyDrive/holo_geon}"
-MANIFEST="${MANIFEST:-configs/experiments/colab_g4_benchmark.yaml}"
+MANIFEST="${MANIFEST:-configs/experiments/colab_a100_benchmark.yaml}"
 NAME="$(basename "$MANIFEST" .yaml)"
 MAX_HOURS="${MAX_HOURS:-1.5}"
 REPO=/content/Holo-GeoN
