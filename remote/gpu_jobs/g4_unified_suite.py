@@ -509,14 +509,16 @@ class G4Suite:
                 dt_1p = (time.perf_counter() - t0) / reps * 1000.0
             vram_1p = round(torch.cuda.max_memory_allocated() / 1e9, 3)
 
-            # Legacy two-pass (separate backbone forward + predict_contacts forward)
+            # Legacy two-pass (separate backbone forward + separate attention/contact pass, exact v1 cost)
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
             with torch.no_grad():
                 def _two_pass():
                     out1 = enc.esm(**toks)
                     _ = out1.last_hidden_state
-                    _ = enc.esm.predict_contacts(toks["input_ids"], toks["attention_mask"])
+                    out2 = enc.esm(**toks, output_attentions=True)
+                    attns = torch.stack([a.float() for a in out2.attentions], dim=1)
+                    _ = enc.esm.contact_head(toks["input_ids"], attns)
 
                 for _ in range(2):
                     _two_pass()
@@ -1642,13 +1644,17 @@ def main() -> int:
     args = ap.parse_args()
     suite = G4Suite(Path(args.drive_root), Path(args.work_root), run_name=args.run_name)
 
+    had_fatal = False
     for st in args.stages:
         try:
             getattr(suite, f"stage_{st}")()
         except Exception:
             suite.record_error(st, traceback.format_exc())
-            raise
-    return 0
+            if st in ("dry_run", "block1_precompute_650m"):
+                raise
+            had_fatal = True
+            log(f"Stage {st} failed; continuing to remaining stages so completed work & dataset ZIP are saved.")
+    return 1 if had_fatal else 0
 
 
 if __name__ == "__main__":
