@@ -1250,46 +1250,168 @@ class G4Suite:
         if rc_c != 0:
             self.record_error("block3_demo/calibration", tail_c)
 
-        # Live CLI benchmark (doctor + Ubiquitin 76-aa full 20xL DMS scan + epistasis)
+        # Live CLI benchmarks + Real Biological Case Studies (Ubiquitin, GB1, Human p53 DBD)
+        import pandas as pd
+        import numpy as np
+
         ubq = "MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG"
-        fa = self.local_out / pack / "ubiquitin.fasta"
-        fa.write_text(f">Ubiquitin_76aa\n{ubq}\n", encoding="utf-8")
+        gb1 = "MQYKLILNGKTLKGETTTEAVDAATAEKVFKQYANDNGVDGEWTYDDATKTFTVTE"
+        # Human TP53 (UniProt P04637) DNA-binding domain residues 94-292 (199 aa);
+        # offset +93 maps 1-based DBD pos to canonical full-length TP53 numbering!
+        p53_dbd = (
+            "SSSVPSQKTYQGSYGFRLGFLHSGTAKSVTCTYSPALNKMFCQLAKTCPVQLWVDSTPPP"
+            "GTRVRAMAIYKQSQHMTEVVRRCPHHERCSDSDGLAPPQHLIRVEGNLRVEYLDDRNTFR"
+            "HSVVVPYEPPEVGSDCTTIHYNYMCNSSCMGGMNRRPILTIITLEDSSGNLLGRNSFEVR"
+            "VCACPGRDRRTEEENLRKK"
+        )
+        # Verify canonical oncogenic hotspot WT residues in p53 DBD (full-length pos - 93)
+        p53_hotspots_full = [("R175H", 175), ("Y220C", 220), ("G245S", 245), ("R248Q", 248), ("R249S", 249), ("R273H", 273), ("R282W", 282)]
+        p53_dbd_muts = []
+        for full_code, full_pos in p53_hotspots_full:
+            dbd_pos = full_pos - 93
+            assert p53_dbd[dbd_pos - 1] == full_code[0], f"p53 mismatch at {full_code}: got {p53_dbd[dbd_pos - 1]}"
+            p53_dbd_muts.append(f"{full_code[0]}{dbd_pos}{full_code[-1]}")
+
+        case_dir = self.local_out / pack / "case_studies"
+        case_dir.mkdir(parents=True, exist_ok=True)
+        fa_ubq = case_dir / "ubiquitin_76aa.fasta"
+        fa_gb1 = case_dir / "gb1_56aa.fasta"
+        fa_p53 = case_dir / "tp53_dbd_199aa.fasta"
+        fa_ubq.write_text(f">Ubiquitin_P0CG48_76aa\n{ubq}\n", encoding="utf-8")
+        fa_gb1.write_text(f">GB1_ProteinG_56aa\n{gb1}\n", encoding="utf-8")
+        fa_p53.write_text(f">Human_TP53_DBD_P04637_94_292\n{p53_dbd}\n", encoding="utf-8")
 
         cli_telemetry = {}
         rc1, dt1, out1 = run_cmd([sys.executable, "holo.py", "doctor"], timeout=120)
         cli_telemetry["doctor"] = {"rc": rc1, "s": dt1, "output": out1[-1500:]}
 
-        rc_p, dt_p, out_p = run_cmd([
-            sys.executable, "holo.py", "predict",
-            "--fasta", str(fa),
-            "--muts", "V5A,L8P,I44A,K48R",
-            "--weights", str(bundle / "hologe_v2_lean_best.pt"),
-            "--out", str(self.local_out / pack / "ubq_predict.json"),
-        ], timeout=300)
-        cli_telemetry["predict_ubq_4muts"] = {"rc": rc_p, "s": dt_p, "output": out_p[-1500:]}
+        for label, fa_p, muts_str, out_name in [
+            ("predict_ubq_4muts", fa_ubq, "V5A,L8P,I44A,K48R", "ubq_predict.json"),
+            ("predict_p53_hotspots", fa_p53, ",".join(p53_dbd_muts), "p53_hotspots_predict.json"),
+            ("predict_gb1_singles", fa_gb1, "L5A,V39A,D40A,G41A,V54A", "gb1_predict.json"),
+        ]:
+            rc_p, dt_p, out_p = run_cmd([
+                sys.executable, "holo.py", "predict",
+                "--fasta", str(fa_p), "--muts", muts_str,
+                "--weights", str(bundle / "hologe_v2_lean_best.pt"),
+                "--out", str(case_dir / out_name),
+            ], timeout=300)
+            cli_telemetry[label] = {"rc": rc_p, "s": dt_p, "output": out_p[-1500:]}
 
-        rc2, dt2, out2 = run_cmd([
-            sys.executable, "holo.py", "scan",
-            "--fasta", str(fa),
-            "--weights", str(bundle / "hologe_v2_lean_best.pt"),
-            "--out", str(self.local_out / pack / "ubq_scan.csv"),
-            "--html", str(self.local_out / pack / "ubq_scan.html"),
-        ], timeout=300)
-        cli_telemetry["scan_ubq_76aa"] = {"rc": rc2, "s": dt2, "output": out2[-1500:]}
+        for label, fa_p, stem in [
+            ("scan_ubq_76aa", fa_ubq, "ubq_scan"),
+            ("scan_gb1_56aa", fa_gb1, "gb1_scan"),
+            ("scan_p53_dbd_199aa", fa_p53, "p53_dbd_scan"),
+        ]:
+            rc2, dt2, out2 = run_cmd([
+                sys.executable, "holo.py", "scan",
+                "--fasta", str(fa_p),
+                "--weights", str(bundle / "hologe_v2_lean_best.pt"),
+                "--out", str(case_dir / f"{stem}.csv"),
+                "--html", str(case_dir / f"{stem}.html"),
+            ], timeout=360)
+            cli_telemetry[label] = {"rc": rc2, "s": dt2, "output": out2[-1500:]}
 
-        rc3, dt3, out3 = run_cmd([
-            sys.executable, "holo.py", "epistasis",
-            "--fasta", str(fa),
-            "--pairs", "V5A+I13A,L8P+I44A,K48R+K63R",
-            "--weights", str(bundle / "hologe_v2_epistasis_best.pt"),
-            "--out", str(self.local_out / pack / "ubq_epistasis.csv"),
-        ], timeout=300)
-        cli_telemetry["epistasis_ubq"] = {"rc": rc3, "s": dt3, "output": out3[-1500:]}
+        for label, fa_p, pairs_str, out_csv in [
+            ("epistasis_ubq", fa_ubq, "V5A+I13A,L8P+I44A,K48R+K63R", "ubq_epistasis.csv"),
+            ("epistasis_gb1", fa_gb1, "V39A+D40A,V39A+G41A,D40A+G41A,G41A+V54A,V39A+V54A,L5A+V54A", "gb1_epistasis.csv"),
+        ]:
+            rc3, dt3, out3 = run_cmd([
+                sys.executable, "holo.py", "epistasis",
+                "--fasta", str(fa_p), "--pairs", pairs_str,
+                "--weights", str(bundle / "hologe_v2_epistasis_best.pt"),
+                "--out", str(case_dir / out_csv),
+            ], timeout=300)
+            cli_telemetry[label] = {"rc": rc3, "s": dt3, "output": out3[-1500:]}
 
-        # Live FastAPI Web GUI backend end-to-end verification (real GPU predictions!)
+        # Render publication-ready 300-DPI visual simulation figures directly from live GPU outputs
+        vis_dir = self.local_out / pack / "visual_outputs"
+        vis_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            def _plot_dms_heatmap(csv_path: Path, title: str, out_stem: Path, pos_offset: int = 0,
+                                  highlight_positions: list[tuple[int, str]] | None = None):
+                if not csv_path.is_file():
+                    return
+                df = pd.read_csv(csv_path)
+                pos_col = "position" if "position" in df.columns else "site"
+                aa_col = "mt_aa" if "mt_aa" in df.columns else ("mutant_aa" if "mutant_aa" in df.columns else "mut_aa")
+                val_col = "ddg_kcal_mol" if "ddg_kcal_mol" in df.columns else ("ddg" if "ddg" in df.columns else "pred_ddg")
+                if not all(c in df.columns for c in (pos_col, aa_col, val_col)):
+                    return
+                piv = df.pivot_table(index=aa_col, columns=pos_col, values=val_col, aggfunc="mean")
+                aa_order = [a for a in "ACDEFGHIKLMNPQRSTVWY" if a in piv.index]
+                piv = piv.loc[aa_order]
+                xs = piv.columns.to_numpy() + pos_offset
+                mean_ddg = piv.mean(axis=0).to_numpy()
+
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 5.2), gridspec_kw={"height_ratios": [1.1, 2.4]}, sharex=True)
+                ax1.fill_between(xs, mean_ddg, 0, where=(mean_ddg < 0), color="#d62728", alpha=0.35)
+                ax1.fill_between(xs, mean_ddg, 0, where=(mean_ddg >= 0), color="#1f77b4", alpha=0.35)
+                ax1.plot(xs, mean_ddg, color="#222222", lw=1.2)
+                ax1.axhline(0.0, color="#666666", lw=0.7, ls="--")
+                ax1.set_ylabel("Mean ΔΔG\n(kcal/mol)", fontsize=9)
+                ax1.set_title(title, fontsize=11, fontweight="bold")
+                if highlight_positions:
+                    for hp, lbl in highlight_positions:
+                        idx = np.argmin(np.abs(xs - hp))
+                        ax1.scatter([xs[idx]], [mean_ddg[idx]], color="#b2182b", s=28, zorder=5)
+                        ax1.annotate(lbl, (xs[idx], mean_ddg[idx]), xytext=(0, -14), textcoords="offset points",
+                                     ha="center", fontsize=7.5, fontweight="bold", color="#8c1515")
+                im = ax2.imshow(piv.to_numpy(), aspect="auto", cmap="RdBu", vmin=-3.0, vmax=1.5,
+                                extent=[xs[0] - 0.5, xs[-1] + 0.5, len(aa_order) - 0.5, -0.5])
+                ax2.set_yticks(range(len(aa_order)))
+                ax2.set_yticklabels(aa_order, fontsize=7.5)
+                ax2.set_xlabel("Residue Position", fontsize=9.5)
+                ax2.set_ylabel("Mutant AA", fontsize=9)
+                cbar = fig.colorbar(im, ax=[ax1, ax2], pad=0.015, aspect=28)
+                cbar.set_label("Predicted ΔΔG (kcal/mol; >0 stabilizing)", fontsize=8.5)
+                fig.tight_layout()
+                fig.savefig(str(out_stem) + ".png", dpi=300, bbox_inches="tight")
+                fig.savefig(str(out_stem) + ".pdf", bbox_inches="tight")
+                plt.close(fig)
+
+            _plot_dms_heatmap(
+                case_dir / "p53_dbd_scan.csv",
+                "Holo-GeoN v2-Lean Live GPU Stability Landscape: Human TP53 DNA-Binding Domain (Residues 94–292)",
+                vis_dir / "case_study_p53_dbd_landscape",
+                pos_offset=93,
+                highlight_positions=[(175, "R175"), (220, "Y220"), (245, "G245"), (248, "R248"), (273, "R273"), (282, "R282")],
+            )
+            _plot_dms_heatmap(
+                case_dir / "ubq_scan.csv",
+                "Holo-GeoN v2-Lean Live GPU Stability Landscape: Human Ubiquitin (P0CG48, 76 aa)",
+                vis_dir / "case_study_ubiquitin_landscape",
+                pos_offset=0,
+            )
+            _plot_dms_heatmap(
+                case_dir / "gb1_scan.csv",
+                "Holo-GeoN v2-Lean Live GPU Stability Landscape: Protein G B1 Domain (GB1, 56 aa)",
+                vis_dir / "case_study_gb1_landscape",
+                pos_offset=0,
+            )
+            log("Rendered 300-DPI case-study DMS landscape PNG/PDF plots!")
+        except Exception as exc:
+            log(f"WARNING: visual case-study plot failed: {exc}")
+
+        # Live FastAPI Web GUI backend end-to-end verification + Headless Browser UI Screenshots
         api_results = {}
         try:
             import urllib.request
+            # Find a real Ubiquitin or MegaScale PDB for /api/compare & 3D mode verification
+            sample_pdb_text = None
+            for p_cand in (self.pdb_dir / "megascale").rglob("*.pdb"):
+                if "1UBQ" in p_cand.name.upper() or "1PGA" in p_cand.name.upper():
+                    sample_pdb_text = p_cand.read_text(encoding="utf-8", errors="ignore")
+                    break
+            if sample_pdb_text is None:
+                pdbs = sorted((self.pdb_dir / "megascale").rglob("*.pdb"))
+                if pdbs:
+                    sample_pdb_text = pdbs[0].read_text(encoding="utf-8", errors="ignore")
+
             env_srv = dict(os.environ)
             env_srv["PYTHONPATH"] = str(REPO_ROOT)
             env_srv["HOLOGEON_WEIGHTS"] = str(bundle / "hologe_v2_lean_best.pt")
@@ -1322,20 +1444,113 @@ class G4Suite:
                             body = json.loads(resp.read().decode())
                         return {"elapsed_ms": round((time.perf_counter() - t_r) * 1000.0, 2), "response": body}
 
-                    api_results["ddg_L8P"] = _post("/api/ddg", {"sequence": ubq, "mutation": "L8P"})
+                    api_results["ddg_ubq_L8P"] = _post("/api/ddg", {"sequence": ubq, "mutation": "L8P"})
+                    api_results["ddg_p53_R175H"] = _post("/api/ddg", {"sequence": p53_dbd, "mutation": "R82H"})
                     api_results["scan_ubq"] = _post("/api/scan", {"sequence": ubq})
-                    # Keep compact scan summary in JSON (full matrix can be large)
                     if "response" in api_results["scan_ubq"]:
                         sr = api_results["scan_ubq"]["response"]
                         api_results["scan_ubq"]["response"] = {
                             k: v for k, v in sr.items() if k not in ("matrix", "ddg_matrix", "columns")
                         }
+
+                    # Capture live high-DPI headless Chromium screenshots of the real Web GUI v2!
+                    try:
+                        subprocess.run(
+                            "uv pip install --system --quiet playwright && playwright install chromium",
+                            shell=True, check=False, timeout=240,
+                        )
+                        from playwright.sync_api import sync_playwright  # type: ignore
+
+                        with sync_playwright() as pw:
+                            browser = pw.chromium.launch(headless=True)
+                            page = browser.new_page(viewport={"width": 1440, "height": 960}, device_scale_factor=2)
+                            page.goto("http://127.0.0.1:8011/", wait_until="networkidle", timeout=60000)
+                            page.wait_for_timeout(1500)
+                            page.screenshot(path=str(vis_dir / "ui_01_home_ddg.png"), full_page=True)
+                            # Trigger a live ΔΔG prediction on Ubiquitin L8P via UI inputs if present
+                            textareas = page.locator("textarea")
+                            if textareas.count() > 0:
+                                textareas.first.fill(ubq)
+                            mut_inputs = page.locator("input[placeholder*='L8P'], input[placeholder*='mutation' i], input[type='text']")
+                            if mut_inputs.count() > 0:
+                                mut_inputs.first.fill("L8P")
+                            run_btn = page.locator("button:has-text('Predict'), button:has-text('Run')").first
+                            if run_btn.count() > 0:
+                                run_btn.click()
+                                page.wait_for_timeout(5000)
+                            page.screenshot(path=str(vis_dir / "ui_02_ddg_live_result.png"), full_page=True)
+
+                            # Stability Landscape tab
+                            scan_tab = page.locator("button:has-text('Stability Landscape')").first
+                            if scan_tab.count() > 0:
+                                scan_tab.click()
+                                page.wait_for_timeout(1000)
+                                ta = page.locator("textarea").first
+                                if ta.count() > 0:
+                                    ta.fill(ubq)
+                                btn = page.locator("button:has-text('Scan'), button:has-text('Run')").first
+                                if btn.count() > 0:
+                                    btn.click()
+                                    page.wait_for_timeout(8000)
+                                page.screenshot(path=str(vis_dir / "ui_03_scan_landscape_live.png"), full_page=True)
+
+                            # AlphaFold Compare tab (3Dmol structure + pLDDT + stability overlay)
+                            cmp_tab = page.locator("button:has-text('AlphaFold Compare')").first
+                            if cmp_tab.count() > 0:
+                                cmp_tab.click()
+                                page.wait_for_timeout(1500)
+                                page.screenshot(path=str(vis_dir / "ui_04_alphafold_compare.png"), full_page=True)
+
+                            browser.close()
+                        api_results["ui_screenshots"] = sorted(p.name for p in vis_dir.glob("ui_*.png"))
+                        log(f"Captured live Web GUI screenshots: {api_results['ui_screenshots']}")
+                    except Exception as ui_exc:
+                        api_results["ui_screenshot_warning"] = f"{type(ui_exc).__name__}: {ui_exc}"
+                        log(f"WARNING: Playwright UI screenshot skipped: {ui_exc}")
             finally:
                 srv.terminate()
                 try:
                     srv.wait(timeout=10)
                 except Exception:
                     srv.kill()
+
+            # Second quick FastAPI check with the trained Epistasis checkpoint so /api/epistasis is verified live!
+            env_epi = dict(os.environ)
+            env_epi["PYTHONPATH"] = str(REPO_ROOT)
+            env_epi["HOLOGEON_WEIGHTS"] = str(bundle / "hologe_v2_epistasis_best.pt")
+            srv2 = subprocess.Popen(
+                [sys.executable, "-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", "8012"],
+                cwd=str(REPO_ROOT / "app" / "backend"),
+                env=env_epi,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            )
+            try:
+                for _ in range(90):
+                    try:
+                        with urllib.request.urlopen("http://127.0.0.1:8012/api/health", timeout=3) as r:
+                            api_results["health_epistasis"] = json.loads(r.read().decode())
+                            break
+                    except Exception:
+                        time.sleep(1.0)
+                if "health_epistasis" in api_results:
+                    req = urllib.request.Request(
+                        "http://127.0.0.1:8012/api/epistasis",
+                        data=json.dumps({"wt_sequence": gb1, "pairs": ["V39A+D40A", "V39A+G41A", "D40A+G41A", "L5A+V54A"]}).encode(),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    t_r = time.perf_counter()
+                    with urllib.request.urlopen(req, timeout=180) as resp:
+                        api_results["epistasis_gb1_api"] = {
+                            "elapsed_ms": round((time.perf_counter() - t_r) * 1000.0, 2),
+                            "response": json.loads(resp.read().decode()),
+                        }
+            finally:
+                srv2.terminate()
+                try:
+                    srv2.wait(timeout=10)
+                except Exception:
+                    srv2.kill()
         except Exception as exc:
             api_results["error"] = f"{type(exc).__name__}: {exc}"
 
@@ -1345,8 +1560,65 @@ class G4Suite:
         (self.local_out / pack / "live_cli_telemetry.json").write_text(
             json.dumps(cli_telemetry, indent=2), encoding="utf-8"
         )
-        self.mark_done(pack, {"calibration_rc": rc_c, "cli_telemetry": cli_telemetry, "api_ok": "ddg_L8P" in api_results})
+        self.mark_done(pack, {"calibration_rc": rc_c, "cli_telemetry": cli_telemetry, "api_ok": "ddg_ubq_L8P" in api_results})
         log("block3_demo COMPLETE!")
+
+    # ------------------------------------------------------------------
+    # Stage 8: Block 4 — Separate Dataset Submission ZIP + SHA256SUMS on Drive
+    # ------------------------------------------------------------------
+    def stage_block4_dataset_zip(self) -> None:
+        pack = "block4_dataset_zip"
+        log("=== STAGE: block4_dataset_zip (Packaging separate SHA-256 dataset release ZIP on Drive) ===")
+        import hashlib
+
+        zip_local = self.work_root / "holo_geon_a100_dataset_release.zip"
+        sha_lines = []
+        included = []
+
+        # Collect from drive_out (source of truth across any restarts) + local_out
+        src_root = self.drive_out
+        with zipfile.ZipFile(zip_local, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            # Add all benchmark predictions, metadata, reports, calibrated release bundle, and simulation outputs
+            for f in sorted(src_root.rglob("*")):
+                if not f.is_file():
+                    continue
+                if f.name.endswith(".zip") or f.name == "last.pt":
+                    continue
+                rel = f.relative_to(src_root).as_posix()
+                # Skip bulky optimizer checkpoints if any; keep model_best.pt for release_bundle & parquets/jsons/csvs/pngs/pdfs/htmls
+                if f.suffix == ".pt" and "release_bundle" not in rel:
+                    continue
+                zf.write(f, arcname=f"Holo-GeoN-A100-Results/{rel}")
+                h = hashlib.sha256(f.read_bytes()).hexdigest()
+                sha_lines.append(f"{h}  Holo-GeoN-A100-Results/{rel}")
+                included.append({"rel": rel, "bytes": f.stat().st_size})
+
+            readme = (
+                "# Holo-GeoN v2 — Unified Same-GPU (A100 80 GB) Benchmark & Dataset Release\n\n"
+                f"Generated UTC: {utc_now()}\n"
+                f"Environment: {json.dumps(self.report.get('environment', {}), indent=2)}\n\n"
+                "## Contents\n"
+                "- `block1_speed/speed_vram_microbench.json`: CUDA-synchronized single-pass vs two-pass ESM-2 & 20xL DMS throughput/VRAM.\n"
+                "- `block1_parity/`: Identical-GPU 5-seed predictions (id25, fold_tm60, FireProtDB-HF25, S669, S1724-HF25, Domainome-HF25) for Holo-GeoN v2-Lean, v2-Lean+8A Contacts, ThermoMPNN (+official), SPURS (+official), RaSP, PROSTATA, and DDGemb.\n"
+                "- `block2_prostata_ft/`: True end-to-end 650M fine-tuned PROSTATA-FT predictions + contact P@L & Frobenius drift diagnostic.\n"
+                "- `block2_esm3b/`: ESM-2 3B scaling predictions (5 seeds x id25 & fold_tm60 + externals).\n"
+                "- `block3_demo/`: Calibrated release weights, live CLI/API outputs, Ubiquitin/GB1/TP53-DBD simulations, interactive HTML heatmaps, 300-DPI figures, and live Web GUI screenshots.\n"
+            )
+            zf.writestr("Holo-GeoN-A100-Results/README_DATASET.md", readme)
+            zf.writestr("Holo-GeoN-A100-Results/SHA256SUMS.txt", "\n".join(sha_lines) + "\n")
+
+        zip_sha = hashlib.sha256(zip_local.read_bytes()).hexdigest()
+        zip_mb = round(zip_local.stat().st_size / 1e6, 2)
+        dst_zip = self.drive_out / zip_local.name
+        shutil.copy2(zip_local, dst_zip)
+        meta = {
+            "zip_path_drive": str(dst_zip),
+            "zip_size_mb": zip_mb,
+            "zip_sha256": zip_sha,
+            "n_files_packaged": len(included),
+        }
+        self.mark_done(pack, meta)
+        log(f"Dataset submission ZIP written to Drive: {dst_zip} ({zip_mb} MB, {len(included)} files, sha256={zip_sha[:16]})")
 
 
 def main() -> int:
@@ -1364,6 +1636,7 @@ def main() -> int:
             "block2_prostata_ft",
             "block2_esm3b",
             "block3_demo",
+            "block4_dataset_zip",
         ],
     )
     args = ap.parse_args()
