@@ -48,7 +48,7 @@ With a CDS the headline `ddg` is the with-CDS value; `without_cds` equals the pl
 is trained with CDS dropout, so both paths are in-distribution: show them side by side.
 
 `/api/scan` response adds `mode`, `uses_coordinates`, `symmetry`, `cds`, and
-`timing: {encode_ms, scan_ms, total_mutations, muts_per_sec}` (for the live G4 demo).
+`timing: {encode_ms, scan_ms, total_mutations, muts_per_sec}` (for the live A100 demo).
 
 ## `POST /api/epistasis` (new)
 
@@ -97,4 +97,4 @@ the structure-free model reads no coordinates.
 5. 3Dmol: colour by `plddt` (AlphaFold bands), mark `low_confidence_positions`, show `plddt_note`.
 6. Keep the existing banners: model-not-ready, uncalibrated uncertainty, untrained heads.
 
-Verify the frontend on a Kaggle CPU session or the G4 box (`npm run build` is too heavy for the local PC).
+Verify the frontend on a Kaggle CPU session or the A100 VM (`npm run build` is too heavy for the local PC).

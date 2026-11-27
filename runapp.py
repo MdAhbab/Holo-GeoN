@@ -121,7 +121,7 @@ def main() -> int:
     ap.add_argument("--host", default="127.0.0.1", help="bind host (use 0.0.0.0 on remote VMs)")
     ap.add_argument("--weights", default="", help="path to a trained checkpoint")
     ap.add_argument("--use-current-env", action="store_true",
-                    help="run uvicorn in the current Python environment (recommended on GPU/G4 VMs)")
+                    help="run uvicorn in the current Python environment (recommended on GPU/A100 VMs)")
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--rebuild-frontend", action="store_true")
     ap.add_argument("--dev", action="store_true", help="also run the Vite dev server")

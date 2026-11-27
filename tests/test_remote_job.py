@@ -104,7 +104,7 @@ def test_resume_restores_finished_items() -> None:
     section("remote_job - a restarted VM restores finished packs and skips them")
     from scripts.remote_job import Store, _write_json, expand_items
 
-    items = expand_items(_manifest("colab_g4_benchmark.yaml"))
+    items = expand_items(_manifest("colab_a100_benchmark.yaml"))
     train = next(i for i in items if i["kind"] == "train")
     with tempfile.TemporaryDirectory() as persist, tempfile.TemporaryDirectory() as run1, \
             tempfile.TemporaryDirectory() as run2:
@@ -135,7 +135,7 @@ def test_plan_reprojects_and_cuts_in_order() -> None:
 
     from scripts.remote_job import est_hours, expand_items, print_plan
 
-    m = _manifest("colab_g4_benchmark.yaml")
+    m = _manifest("colab_a100_benchmark.yaml")
     items = expand_items(m)
     sz = m["sizing"]
     train = next(i for i in items if i["kind"] == "train")

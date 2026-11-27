@@ -1,0 +1,48 @@
+# configs/experiments/a100_v2_headline.yaml
+# Unified same-GPU headline benchmark on Colab NVIDIA A100-SXM4-40GB.
+#
+# Budget: 200 CU (~24.5 h at 8.16 CU/h), keeping a 20 CU safety reserve.
+
+name: a100_v2_headline
+platform: colab_a100
+config: configs/benchmark_v2.yaml
+splits_file: data/splits_megascale_id25.parquet
+external_file: data/fireprotdb_hf25.parquet
+external_files:
+  - data/fireprotdb_hf25.parquet
+  - data/fireprotdb_holdout.parquet
+  - data/s669_holdout.parquet
+  - data/s1724_thermomutdb_hf25.parquet
+cache: /content/holo/cache/esm2_650M_v2
+out_root: /content/holo/runs/a100_v2_headline
+num_workers: 4
+
+cost:
+  gpu: A100
+  cu_per_hour: 8.16       # measured on NVIDIA A100-SXM4-40GB
+  budget_cu: 200
+  reserve_cu: 20          # hard safety floor + demo reserve
+
+sizing:
+  steps_per_epoch: 619    # MEASURED Protein-Batch (P=8 parents x M=64 muts on id25)
+  epochs: 20
+  sec_per_step: 0.025     # NVIDIA A100-SXM4-40GB steady-state estimate
+  eval_overhead: 0.0      # steady epoch rate already includes val/ckpt
+  strict_factor: 1.3
+  vm_overhead_h: 0.30
+  precompute_h: 0.04      # single-pass FP16 EsmForMaskedLM (~100 s on A100)
+  export_h: 0.01
+  external_h: 0.01
+  baselines_h: 0.35
+
+cut_order:
+  - "competitor_retrain_ddgemb"
+  - "*_s46"
+  - "*_s45"
+  - baselines
+
+items:
+  - {id: precompute, kind: precompute}
+  - {kind: train, arm: full, seeds: [42, 43, 44, 45, 46], epochs: 20, export: true}
+  - {id: baselines, kind: baselines, phase: post, flags: ["--zero-shot-limit", "2000"], est_hours: 0.35}
+  - {id: aggregate, kind: aggregate, phase: post}

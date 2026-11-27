@@ -342,7 +342,7 @@ def test_v2_manifests_and_zenodo_pack() -> None:
         ("kaggle_v2_ablations.yaml", 11, 5),
         ("kaggle_v2_geometry.yaml", 5, 5),
         ("kaggle_v2_clean_abl_geom.yaml", 14, 5),
-        ("g4_v2_headline.yaml", 1, 1),
+        ("a100_v2_headline.yaml", 1, 1),
     ):
         m = yaml.safe_load((ROOT / "configs" / "experiments" / fname).read_text(encoding="utf-8"))
         items = expand_items(m)

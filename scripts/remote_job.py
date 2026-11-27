@@ -23,7 +23,7 @@ this file adds only what a remote VM needs around them
   * a cost plan printed before launch and re-projected from measured steady
     state, with a pre-agreed order in which arms are cut if over budget.
 
-    python -m scripts.remote_job --manifest configs/experiments/colab_g4_benchmark.yaml --plan
+    python -m scripts.remote_job --manifest configs/experiments/colab_a100_benchmark.yaml --plan
     python -m scripts.remote_job --manifest ... --persist /content/drive/MyDrive/holo_geon/run1
     python -m scripts.remote_job --manifest ... --shard 0/2      # Kaggle: one of two sessions
 

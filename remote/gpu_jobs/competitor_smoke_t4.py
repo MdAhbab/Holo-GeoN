@@ -11,7 +11,7 @@ Kaggle T4 competitor adapter smoke-test & validation runner for all 5 baselines:
 Runs on ``splits_megascale_id25.parquet`` + ``fireprotdb_hf25.parquet`` using our
 already-mounted private ``holo-geon-v2-gpu-seed`` v2 dataset (412/412 MegaScale
 PDBs + 166 FireProtDB AFDB PDBs) so every competitor adapter is verified end-to-end
-on free Kaggle T4 BEFORE spending a single paid Colab G4 compute unit.
+on free Kaggle T4 BEFORE spending a single paid Colab A100 compute unit.
 
 Always catches per-competitor exceptions and exits 0 so the Kaggle kernel version
 ends COMPLETE with full diagnostics in ``competitor_smoke_report.json``.

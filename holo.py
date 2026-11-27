@@ -3,10 +3,10 @@
 holo.py — User-friendly cross-platform CLI for Holo-GeoN
 ========================================================
 
-Designed for biologists, Windows users, and live GPU/G4 real-time runs without
+Designed for biologists, Windows users, and live GPU/A100 real-time runs without
 requiring Linux shell syntax, PYTHONPATH exports, or bash scripts.
 
-Quick examples (PowerShell, Command Prompt, macOS, Linux, or Colab G4):
+Quick examples (PowerShell, Command Prompt, macOS, Linux, or Colab A100):
 
     python holo.py                                # Interactive guided menu
     python holo.py doctor                         # Verify GPU, packages & weights
@@ -472,7 +472,7 @@ def cmd_doctor(args) -> int:
             vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
             print(f"GPU          : {name} (sm_{cap[0]}{cap[1]}, {vram:.1f} GB VRAM, CUDA {torch.version.cuda})")
         else:
-            print("GPU          : None detected (CPU mode — fine for light tests; use Kaggle T4 or Colab G4 for training & fast DMS)")
+            print("GPU          : None detected (CPU mode — fine for light tests; use Kaggle T4 or Colab A100 for training & fast DMS)")
     except Exception as exc:
         print(f"GPU          : could not probe ({exc})")
 
