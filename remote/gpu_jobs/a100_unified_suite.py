@@ -1328,10 +1328,12 @@ class A100Suite:
                     "facebook/esm2_t33_650M_UR50D", attn_implementation="eager"
                 ).to(device)
                 esm = mlm.esm
-                esm.gradient_checkpointing_enable()
-                # Freeze only contact_head & lm_head so we can measure drift cleanly on untouched heads!
-                for p in mlm.lm_head.parameters():
-                    p.requires_grad = False
+                # CRITICAL: use_reentrant=False prevents silent zero-grad dropout, and we MUST NOT
+                # freeze mlm.lm_head.parameters() because lm_head.decoder.weight is weight-tied to
+                # esm.embeddings.word_embeddings.weight (freezing lm_head freezes word_embeddings!).
+                esm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                for p in esm.parameters():
+                    p.requires_grad = True
                 for p in esm.contact_head.parameters():
                     p.requires_grad = False
                 head = ProstataFiveHead(1280).to(device)
@@ -1345,13 +1347,18 @@ class A100Suite:
                         if v.is_floating_point()
                     }
 
+                esm_train_params = [
+                    p for n, p in esm.named_parameters()
+                    if p.requires_grad and "contact_head" not in n
+                ]
                 opt = torch.optim.AdamW([
-                    {"params": [p for p in esm.parameters() if p.requires_grad], "lr": 1e-5, "weight_decay": 0.01},
+                    {"params": esm_train_params, "lr": 1e-5, "weight_decay": 0.01},
                     {"params": list(head.parameters()), "lr": 3e-4, "weight_decay": 0.01},
                 ])
                 epochs = 10
                 sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
                 loss_fn = nn.MSELoss()
+                grad_verified = False
 
                 best_r = -1e9
                 best_ep = 0
@@ -1387,11 +1394,21 @@ class A100Suite:
                             pred = head(h[sites_t], gvec, wt_t, mt_t).reshape(-1)
                             loss = loss_fn(pred.float(), y_t) / accum
                         loss.backward()
+                        if not grad_verified:
+                            n_layer_grads = sum(
+                                1 for n, p in esm.named_parameters()
+                                if "layer." in n and p.grad is not None and float(p.grad.abs().sum().item()) > 0.0
+                            )
+                            assert n_layer_grads > 100, (
+                                f"FATAL: PROSTATA-FT E2E backbone got nonzero grads on only {n_layer_grads} layer tensors!"
+                            )
+                            log(f"  [{pack}] Verified true E2E gradients flowing through {n_layer_grads} ESM-2 layer tensors!")
+                            grad_verified = True
                         ep_loss += float(loss.item()) * accum
                         n_steps += 1
                         if (step_i + 1) % accum == 0 or (step_i + 1) == len(order):
                             torch.nn.utils.clip_grad_norm_(
-                                [p for p in esm.parameters() if p.requires_grad] + list(head.parameters()), 1.0
+                                esm_train_params + list(head.parameters()), 1.0
                             )
                             opt.step()
                             opt.zero_grad(set_to_none=True)
