@@ -6,6 +6,10 @@ export interface CalibrationInfo {
   max_coverage_gap?: number | null
   observed_coverage: Record<string, number> | null
   well_calibrated?: boolean | null
+  // Thresholds `well_calibrated` was computed against (scripts/calibration.py).
+  tolerances?: { ece: number; coverage_gap: number } | null
+  // Split the coverage was measured on (the variance scale is fitted on `val`).
+  split?: string | null
   measured_on: string
   // Which sigma these numbers describe. The interface may serve `sigma * scale`,
   // and reporting the raw sigma's coverage against a scaled band is R2-09.
@@ -94,6 +98,11 @@ export interface StructureAlignmentInfo {
   fraction_below_70: number
   usable_residue_fraction: number
   low_confidence_positions: number[]
+  // Which residues of the sequence carry coordinates (a structure may miss a terminal tail).
+  sequence_coverage?: { first: number; last: number; covered: number; length: number; fraction: number }
+  residues_without_coordinates?: number[]
+  masked_positions?: number[]
+  mutation_site_masked?: boolean
   note: string
 }
 
@@ -316,6 +325,8 @@ export interface CompareResponse {
   plddt_note?: string
   pae: number[][]
   pae_downsampled: boolean
+  // Residues per displayed PAE cell (cell k = residue 1 + k * pae_stride).
+  pae_stride?: number
   min_ddg_per_position: number[]
 }
 

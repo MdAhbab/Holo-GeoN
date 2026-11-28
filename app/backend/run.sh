@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run.sh — Start the Holo-GNN backend server (macOS / Linux)
+# run.sh — Start the Holo-GeoN backend server (macOS / Linux)
 #
 # Creates an isolated virtual environment on first run (so it works on modern,
 # PEP-668 "externally managed" Python installs), installs dependencies, then
@@ -23,5 +23,5 @@ pip install --quiet --upgrade pip
 pip install --quiet -r requirements.txt
 
 PORT="${PORT:-8000}"
-echo "[run.sh] Starting Holo-GNN backend on http://127.0.0.1:${PORT}"
+echo "[run.sh] Starting Holo-GeoN backend on http://127.0.0.1:${PORT}"
 python -m uvicorn app:app --host 127.0.0.1 --port "${PORT}"

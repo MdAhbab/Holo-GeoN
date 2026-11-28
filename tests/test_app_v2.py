@@ -347,6 +347,24 @@ def test_backend_v2_capabilities() -> None:
             check(status == 200 and set(["structure_free", "invariant_3d"]) <= set(comp)
                   and abs(comp["delta_ddg_3d_minus_structure_free"] - (comp["invariant_3d"]["ddg"] - comp["structure_free"]["ddg"])) < 2e-4,
                   "compare_modes returns both modes and the delta")
+            # A structure missing a terminal tail (the MegaScale 1UBQ model has 72 of ubiquitin's
+            # 76 residues) used to be refused with HTTP 400 "structure_shorter_than_sequence".
+            tail_cut = _pdb(short[:26], coords[:26])
+            status, part = _request("/api/ddg", {"wt_sequence": short, "mutation": "L8P", "mode": "structure_free",
+                                                 "structure_pdb": tail_cut, "compare_modes": True})
+            pst = part.get("comparison", {}).get("structure", {})
+            check(status == 200 and pst.get("sequence_coverage", {}).get("covered") == 26
+                  and pst.get("residues_without_coordinates") == [27, 28, 29, 30]
+                  and pst.get("mutation_site_masked") is False,
+                  f"a structure covering residues 1-26 of 30 is aligned, its tail masked (got {status}: {part.get('detail')})")
+            status, part3 = _request("/api/ddg", {"wt_sequence": short, "mutation": "A28G", "mode": "invariant_3d",
+                                                  "structure_pdb": tail_cut})
+            check(status == 200 and part3.get("structure", {}).get("mutation_site_masked") is True,
+                  "a mutation outside the covered span is reported as having no coordinates")
+            status, body = _request("/api/ddg", {"wt_sequence": short, "mutation": "L8P", "mode": "invariant_3d",
+                                                 "structure_pdb": _pdb(short[:20], coords[:20])})
+            check(status == 400 and "covers only" in body.get("detail", ""),
+                  f"a structure covering under 80% of the sequence is refused (got {status})")
             status, body = _request("/api/ddg", {"wt_sequence": short, "mutation": "L8P", "mode": "invariant_3d",
                                                  "structure_pdb": _pdb("A" * 30, coords)})
             check(status == 400 and "aligned" in body.get("detail", ""), "a structure of another protein is refused, not used")

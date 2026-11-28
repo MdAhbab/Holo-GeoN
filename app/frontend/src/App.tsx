@@ -18,6 +18,7 @@ import IdrTabBase from './tabs/IdrTab'
 import CompareTabBase from './tabs/CompareTab'
 import ExportTabBase from './tabs/ExportTab'
 import HistoryTabBase from './tabs/HistoryTab'
+import EpistemicStrip from './components/EpistemicStrip'
 
 import './styles.css'
 
@@ -98,11 +99,9 @@ export default function App() {
     <>
       <header className="app-header">
         <div className="app-header-main">
-          <div>
+          <div className="brand">
             <h1>Holo-GeoN</h1>
-            <p>
-              Protein Stability, Epistasis &amp; Coding-Sequence Aware Graph Neural Network — Structure-Free Default (WT/Mutant Swap Equivariant, Not SE(3)/E(3)-Equivariant)
-            </p>
+            <p>Protein stability, epistasis &amp; coding-sequence-aware graph neural network</p>
           </div>
           {caps && (
             <div className="header-cap-pills" aria-label="Server capabilities">
@@ -122,7 +121,7 @@ export default function App() {
                 className={`cap-pill ${caps.invariant_3d.available ? 'cap-on' : 'cap-off'}`}
                 title={caps.invariant_3d.reason ?? `3D SE(3)-invariant weights: ${caps.invariant_3d.weights_path ?? 'loaded'}`}
               >
-                3D SE(3)-Invariant: {caps.invariant_3d.available ? 'Ready' : 'Unavailable'}
+                3D (SE(3)-invariant): {caps.invariant_3d.available ? 'Ready' : 'Unavailable'}
               </span>
             </div>
           )}
@@ -143,29 +142,9 @@ export default function App() {
         </div>
       )}
 
-      {health?.ready && !health.uncertainty_calibrated && (
-        <div className="warn-banner" role="status">
-          <span aria-hidden="true" style={{ fontSize: '1.1rem' }}>⚠</span>
-          <span>
-            <strong>Uncertainty not calibrated.</strong> Confidence intervals come
-            from the model's predicted sigma, but no calibration run has measured
-            whether its coverage is correct. Run{' '}
-            <code>python run.py calibration</code> before treating an interval as
-            a 95% interval.
-          </span>
-        </div>
-      )}
-
-      {health?.ready && health.untrained_heads.length > 0 && (
-        <div className="warn-banner" role="status">
-          <span aria-hidden="true" style={{ fontSize: '1.1rem' }}>⚠</span>
-          <span>
-            <strong>Untrained heads:</strong> {health.untrained_heads.join(', ')}.
-            No data was supplied for these tasks, so they were never trained and
-            their endpoints are disabled.
-          </span>
-        </div>
-      )}
+      {/* Calibration status, untrained heads and the default symmetry, as one status line
+          (was two full-width warning banners on every tab). */}
+      <EpistemicStrip health={health} />
 
       <nav className="tab-bar" role="tablist" aria-label="Main navigation">
         {TABS.map((tab) => (

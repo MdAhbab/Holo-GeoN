@@ -1,16 +1,37 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useMemo } from 'react'
 // @ts-ignore
 import Plot from 'react-plotly.js'
 import { streamScan, downloadExport } from '../api'
 import { setScan } from '../store'
-import type {
-  PredictionMode,
-  ScanResponse,
-  ScanStreamStart,
-  TabProps,
-} from '../types'
+import type { PredictionMode, ScanResponse, ScanStreamStart, TabProps } from '../types'
+import { useMeasuredWidth } from '../hooks'
+import {
+  BASE_LAYOUT,
+  COLORS,
+  DDG_DIVERGING,
+  MONO_FAMILY,
+  PLOT_CONFIG,
+  axisTitle,
+  baseAxis,
+  colorbarTitle,
+  niceStride,
+  robustAbsLimit,
+} from '../plotTheme'
 
 const UBIQUITIN = 'MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG'
+
+/** Pixel geometry of the landscape figure. Margins are fixed so the cell grid is predictable. */
+const HM = {
+  marginL: 58,
+  marginR: 104,   // colorbar + its title
+  marginT: 10,
+  marginB: 64,    // rotated residue labels + axis title
+  rowPx: 19,      // per substituted amino acid
+  trackPx: 74,    // mean-ΔΔG track above the heatmap
+  gapPx: 10,
+  minColPx: 7,    // below this the figure scrolls horizontally instead of squeezing
+  minLabelPx: 13, // rotated 10.5 px labels need this much room each
+}
 
 function cleanSeqText(raw: string): string {
   return raw
@@ -32,6 +53,7 @@ export default function ScanTab({ health = null }: Partial<TabProps>) {
   const [sequence, setSequence] = useState(UBIQUITIN)
   const [start, setStart] = useState(1)
   const [end, setEnd] = useState(Math.min(UBIQUITIN.length, 60))
+  const [numberingStart, setNumberingStart] = useState(1)
   const [cds, setCds] = useState('')
   const [mode, setMode] = useState<PredictionMode>('structure_free')
   const [structurePdb, setStructurePdb] = useState('')
@@ -45,9 +67,11 @@ export default function ScanTab({ health = null }: Partial<TabProps>) {
   const [progress, setProgress] = useState<ScanProgress | null>(null)
   const [liveColumns, setLiveColumns] = useState<(number[] | null)[]>([])
   const [submittedSeq, setSubmittedSeq] = useState(UBIQUITIN)
+  const [submittedOffset, setSubmittedOffset] = useState(0)
   const [exporting, setExporting] = useState<string | null>(null)
 
   const abortCtrlRef = useRef<AbortController | null>(null)
+  const [plotBoxRef, plotBoxWidth] = useMeasuredWidth<HTMLDivElement>()
 
   useEffect(() => {
     return () => {
@@ -63,6 +87,7 @@ export default function ScanTab({ health = null }: Partial<TabProps>) {
   const effectiveMode: PredictionMode = mode === 'invariant_3d' && mode3dAvailable ? 'invariant_3d' : 'structure_free'
   const needsStructure = effectiveMode === 'invariant_3d'
   const cleanLen = cleanSeqText(sequence).length
+  const firstNo = Number.isFinite(numberingStart) && numberingStart >= 1 ? Math.floor(numberingStart) : 1
 
   function onSeqChange(val: string) {
     setSequence(val)
@@ -94,6 +119,7 @@ export default function ScanTab({ health = null }: Partial<TabProps>) {
 
     const seqClean = cleanSeqText(sequence)
     setSubmittedSeq(seqClean)
+    setSubmittedOffset(firstNo - 1)
     setError(null)
     setCancelled(false)
     setResult(null)
@@ -122,12 +148,7 @@ export default function ScanTab({ health = null }: Partial<TabProps>) {
             setLiveColumns(new Array<number[] | null>(info.total).fill(null))
           },
           onChunk(chunk) {
-            setProgress({
-              done: chunk.done,
-              total: chunk.total,
-              elapsed_s: chunk.elapsed_s,
-              eta_s: chunk.eta_s,
-            })
+            setProgress({ done: chunk.done, total: chunk.total, elapsed_s: chunk.elapsed_s, eta_s: chunk.eta_s })
             setLiveColumns((prev) => {
               const next = prev.slice()
               for (let i = 0; i < chunk.positions.length; i++) {
@@ -144,7 +165,9 @@ export default function ScanTab({ health = null }: Partial<TabProps>) {
             setResult(withSeq)
             setScan(withSeq)
             setProgress((prev) =>
-              prev ? { ...prev, done: prev.total } : { done: res.positions.length, total: res.positions.length, elapsed_s: res.timing.scan_ms / 1000, eta_s: 0 }
+              prev
+                ? { ...prev, done: prev.total }
+                : { done: res.positions.length, total: res.positions.length, elapsed_s: res.timing.scan_ms / 1000, eta_s: 0 }
             )
           },
         },
@@ -171,9 +194,7 @@ export default function ScanTab({ health = null }: Partial<TabProps>) {
     if (!result) return
     setExporting(format)
     try {
-      const payload = format === 'pdb'
-        ? { ...result, sequence: result.sequence ?? cleanSeqText(sequence) }
-        : result
+      const payload = format === 'pdb' ? { ...result, sequence: result.sequence ?? cleanSeqText(sequence) } : result
       await downloadExport(format, payload, `scan_${start}-${end}.${format}`)
     } catch (err: unknown) {
       setError((err as Error)?.message ?? 'Export failed')
@@ -182,99 +203,210 @@ export default function ScanTab({ health = null }: Partial<TabProps>) {
     }
   }
 
-  // Derive live or final heatmap matrix
-  let xLabels: string[] = []
-  let yLabels: string[] = []
-  let zMatrix: (number | null)[][] = []
-  let nCols = 0
+  // ---- matrix (final, or partially filled while streaming) ----
+  const grid = useMemo(() => {
+    let positions: number[] = []
+    let wt: string[] = []
+    let aa: string[] = []
+    let z: (number | null)[][] = []
+    if (result) {
+      positions = result.positions
+      wt = result.positions.map((_, i) => result.wt_residues[i] ?? '?')
+      aa = result.aa_order
+      z = result.matrix
+    } else if (streamStart && liveColumns.some((c) => c !== null)) {
+      const first = streamStart.positions[0]
+      positions = Array.from({ length: streamStart.total }, (_, i) => first + i)
+      wt = positions.map((p) => submittedSeq[p - 1] ?? '?')
+      aa = streamStart.aa_order
+      z = aa.map((_, r) => positions.map((__, c) => (liveColumns[c] ? liveColumns[c]![r] : null)))
+    }
+    const labels = positions.map((p, i) => `${wt[i]}${p + submittedOffset}`)
+    const means = positions.map((_, c) => {
+      const vals = z.map((row) => row[c]).filter((v): v is number => typeof v === 'number')
+      return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null
+    })
+    return { positions, wt, aa, z, labels, means }
+  }, [result, streamStart, liveColumns, submittedSeq, submittedOffset])
 
-  if (result) {
-    xLabels = result.positions.map((pos, i) => `${result.wt_residues[i] ?? '?'}${pos}`)
-    yLabels = result.aa_order
-    zMatrix = result.matrix
-    nCols = result.positions.length
-  } else if (streamStart && liveColumns.some((c) => c !== null)) {
-    const first = streamStart.positions[0]
-    const total = streamStart.total
-    const positions = Array.from({ length: total }, (_, i) => first + i)
-    xLabels = positions.map((pos) => `${submittedSeq[pos - 1] ?? '?'}${pos}`)
-    yLabels = streamStart.aa_order
-    zMatrix = yLabels.map((_, rIdx) =>
-      positions.map((__, cIdx) => {
-        const col = liveColumns[cIdx]
-        return col ? col[rIdx] : null
-      })
-    )
-    nCols = positions.length
-  }
+  const nCols = grid.positions.length
+  const hasHeatmap = nCols > 0 && grid.aa.length > 0
 
-  const hasHeatmap = nCols > 0 && yLabels.length > 0
+  // ---- geometry: fit the card; scroll only when columns would drop below minColPx ----
+  const boxW = Math.max(plotBoxWidth, 480)
+  const fitArea = boxW - HM.marginL - HM.marginR
+  const colPx = nCols > 0 ? Math.max(HM.minColPx, fitArea / nCols) : 0
+  const plotWidth = nCols > 0 ? Math.max(boxW, Math.ceil(nCols * colPx + HM.marginL + HM.marginR)) : boxW
+  const scrolls = plotWidth > boxW + 1
+  const stride = niceStride(colPx, HM.minLabelPx)
+  const tickIdx = grid.positions
+    .map((p, i) => ({ p: p + submittedOffset, i }))
+    .filter(({ p, i }) => stride === 1 || p % stride === 0 || i === 0)
+    .map(({ i }) => i)
+  const heatH = grid.aa.length * HM.rowPx
+  const plotH = HM.marginT + HM.trackPx + HM.gapPx + heatH + HM.marginB
+  const innerH = HM.trackPx + HM.gapPx + heatH
+  const heatTop = heatH / innerH
+
+  const zLim = useMemo(() => robustAbsLimit(grid.z.flat(), 0.98, 1), [grid.z])
+  const meanLim = useMemo(() => {
+    const m = grid.means.filter((v): v is number => v !== null).map(Math.abs)
+    return Math.max(0.5, ...(m.length ? m : [0.5])) * 1.08
+  }, [grid.means])
+  const meanTickStep = Math.max(1, Math.floor(meanLim))
+  const meanTicks = [-meanTickStep, 0, meanTickStep]
+
+  const wtX: string[] = []
+  const wtY: string[] = []
+  grid.labels.forEach((lab, i) => {
+    if (grid.aa.includes(grid.wt[i])) {
+      wtX.push(lab)
+      wtY.push(grid.wt[i])
+    }
+  })
 
   const plotData = hasHeatmap
     ? [
         {
-          type: 'heatmap',
-          x: xLabels,
-          y: yLabels,
-          z: zMatrix,
-          colorscale: 'RdBu',
-          zmid: 0,
-          colorbar: {
-            title: 'ΔΔG (kcal/mol)',
-            titleside: 'right',
-            len: 0.9,
+          type: 'bar',
+          x: grid.labels,
+          y: grid.means.map((v) => (v === null ? 0 : v)),
+          xaxis: 'x',
+          yaxis: 'y2',
+          marker: {
+            color: grid.means.map((v) => (v === null ? 'rgba(0,0,0,0)' : v < 0 ? '#d6604d' : '#4393c3')),
+            line: { width: 0 },
           },
-          hovertemplate:
-            '<b>%{y}%{x}</b><br>ΔΔG: %{z:.3f} kcal/mol<extra></extra>',
-          reversescale: true,
+          hovertemplate: '<b>%{x}</b><br>mean ΔΔG over 20 substitutions: %{y:.2f} kcal/mol<extra></extra>',
+          showlegend: false,
+        },
+        {
+          type: 'heatmap',
+          x: grid.labels,
+          y: grid.aa,
+          z: grid.z,
+          xaxis: 'x',
+          yaxis: 'y',
+          colorscale: DDG_DIVERGING,
+          zmin: -zLim,
+          zmax: zLim,
+          zmid: 0,
+          xgap: colPx >= 9 ? 1 : 0,
+          ygap: 1,
+          hoverongaps: false,
+          colorbar: {
+            title: colorbarTitle('ΔΔG (kcal/mol)'),
+            thickness: 12,
+            len: heatTop,
+            lenmode: 'fraction',
+            y: 0,
+            yanchor: 'bottom',
+            x: 1,
+            xpad: 12,
+            xanchor: 'left',
+            outlinewidth: 0,
+            ticks: 'outside',
+            ticklen: 3,
+            tickfont: { size: 10.5, color: COLORS.inkMuted },
+          },
+          hovertemplate: '<b>%{x} → %{y}</b><br>ΔΔG %{z:.3f} kcal/mol<extra></extra>',
+        },
+        {
+          type: 'scatter',
+          mode: 'markers',
+          x: wtX,
+          y: wtY,
+          xaxis: 'x',
+          yaxis: 'y',
+          marker: { size: Math.max(3, Math.min(6, colPx * 0.32)), color: '#1f2937', symbol: 'circle' },
+          hovertemplate: '<b>%{x}</b>: wild-type residue %{y}<extra></extra>',
+          showlegend: false,
         },
       ]
     : []
 
-  const nRows = 20
-  const plotHeight = Math.max(300, nRows * 18 + 80)
-  const plotWidth = Math.max(400, nCols * 24 + 120)
-
   const plotLayout = {
-    height: plotHeight,
-    margin: { l: 45, r: 110, t: 30, b: 90 },
-    xaxis: {
-      title: 'Position',
-      tickangle: -45,
-      automargin: true,
-      gridcolor: '#f1f5f9',
-    },
-    yaxis: {
-      title: 'Substituted AA',
-      automargin: true,
-    },
-    paper_bgcolor: 'transparent',
-    plot_bgcolor: 'transparent',
-    font: { family: 'Inter, system-ui, sans-serif', size: 11 },
+    ...BASE_LAYOUT,
+    width: plotWidth,
+    height: plotH,
+    margin: { l: HM.marginL, r: HM.marginR, t: HM.marginT, b: HM.marginB },
+    xaxis: baseAxis({
+      type: 'category',
+      anchor: 'y',
+      // explicit range: the wild-type marker trace would otherwise pad the category axis
+      autorange: false,
+      range: [-0.5, nCols - 0.5],
+      tickmode: 'array',
+      tickvals: tickIdx.map((i) => grid.labels[i]),
+      ticktext: tickIdx.map((i) => grid.labels[i]),
+      tickangle: -90,
+      tickfont: { family: MONO_FAMILY, size: 10.5, color: COLORS.inkMuted },
+      showgrid: false,
+      showline: false,
+      automargin: false,
+      title: axisTitle(
+        submittedOffset ? `Residue (wild type + native number, first residue ${submittedOffset + 1})` : 'Residue (wild type + position)',
+        { standoff: 6 }),
+    }),
+    yaxis: baseAxis({
+      domain: [0, heatTop],
+      type: 'category',
+      categoryorder: 'array',
+      categoryarray: grid.aa,
+      autorange: false,
+      range: [grid.aa.length - 0.5, -0.5], // first amino acid on top, no marker padding
+      tickfont: { family: MONO_FAMILY, size: 11, color: COLORS.ink },
+      showgrid: false,
+      showline: false,
+      ticks: '',
+      automargin: false,
+      title: axisTitle('Substituted residue', { standoff: 4 }),
+    }),
+    yaxis2: baseAxis({
+      domain: [heatTop + HM.gapPx / innerH, 1],
+      anchor: 'x',
+      range: [-meanLim, meanLim],
+      zeroline: true,
+      zerolinecolor: COLORS.zero,
+      showline: false,
+      tickmode: 'array',
+      tickvals: meanTicks,
+      tickformat: '.0f',
+      automargin: false,
+      title: axisTitle('Mean', { size: 11, standoff: 4 }),
+    }),
+    bargap: 0.12,
+    showlegend: false,
   }
 
   const activeMeta = result ?? streamStart
   const pct = progress ? Math.min(100, Math.round((progress.done / Math.max(progress.total, 1)) * 100)) : 0
+  const firstLabel = grid.labels[0]
+  const lastLabel = grid.labels[grid.labels.length - 1]
 
   return (
     <div>
       <div className="card">
         <div className="card-title">Stability Landscape — Saturation Scan</div>
         <form onSubmit={handleSubmit}>
-          <div style={{ marginBottom: 14 }}>
-            <label htmlFor="scan-seq">Protein Sequence</label>
+          <div className="form-field">
+            <div className="label-row">
+              <label htmlFor="scan-seq">Protein Sequence</label>
+              <span className="field-meta">{cleanLen} residues</span>
+            </div>
             <textarea
               id="scan-seq"
               rows={3}
               value={sequence}
               onChange={(e) => onSeqChange(e.target.value)}
               placeholder="Paste single-letter amino acid sequence..."
+              className="seq-input"
             />
           </div>
 
-          <div className="input-row" style={{ marginBottom: 14 }}>
+          <div className="input-row form-field">
             <div className="field-sm">
-              <label htmlFor="scan-start">Start (1-based)</label>
+              <label htmlFor="scan-start" title="Start and end index the sequence as pasted (1-based)">Start</label>
               <input
                 id="scan-start"
                 type="number"
@@ -285,7 +417,7 @@ export default function ScanTab({ health = null }: Partial<TabProps>) {
               />
             </div>
             <div className="field-sm">
-              <label htmlFor="scan-end">End (inclusive)</label>
+              <label htmlFor="scan-end" title="Inclusive, 1-based index into the sequence as pasted">End</label>
               <input
                 id="scan-end"
                 type="number"
@@ -295,6 +427,21 @@ export default function ScanTab({ health = null }: Partial<TabProps>) {
                 onChange={(e) => setEnd(Number(e.target.value))}
               />
             </div>
+            <div className="field-sm">
+              <label
+                htmlFor="scan-numbering"
+                title="Relabels the axis only, e.g. 94 for a TP53 DBD construct (residues 94–292). Start/End still index the pasted sequence."
+              >
+                First residue no.<span className="info-tip" aria-hidden="true">i</span>
+              </label>
+              <input
+                id="scan-numbering"
+                type="number"
+                min={1}
+                value={numberingStart}
+                onChange={(e) => setNumberingStart(Number(e.target.value))}
+              />
+            </div>
             <div className="field" style={{ flex: '2 1 260px' }}>
               <label>Inference Mode</label>
               <div className="mode-toggle" role="group" aria-label="Scan inference mode">
@@ -302,6 +449,7 @@ export default function ScanTab({ health = null }: Partial<TabProps>) {
                   type="button"
                   className={`mode-btn${effectiveMode === 'structure_free' ? ' active' : ''}`}
                   onClick={() => setMode('structure_free')}
+                  title={health?.capabilities?.modes?.structure_free ?? 'Reads no coordinates; WT/mutant swap-equivariant only (not SE(3)/E(3)-equivariant).'}
                 >
                   Structure-free (default)
                 </button>
@@ -310,19 +458,13 @@ export default function ScanTab({ health = null }: Partial<TabProps>) {
                   className={`mode-btn${effectiveMode === 'invariant_3d' ? ' active' : ''}`}
                   onClick={() => mode3dAvailable && setMode('invariant_3d')}
                   disabled={!mode3dAvailable}
+                  title={!mode3dAvailable ? mode3dCap?.reason ?? undefined : undefined}
                 >
                   SE(3)-invariant 3D
                 </button>
               </div>
-              <div style={{ fontSize: '0.76rem', color: 'var(--text-muted)', marginTop: 4 }}>
-                {health?.capabilities?.modes?.[effectiveMode] ??
-                  (effectiveMode === 'structure_free'
-                    ? 'Structure-free predicted-contact graph; wild-type/mutant swap equivariant only (NOT SE(3)- or E(3)-equivariant).'
-                    : 'SE(3)-invariant 3D backbone features from supplied structure.')}
-              </div>
             </div>
           </div>
-
           {!mode3dAvailable && (
             <div className="capability-notice capability-disabled" style={{ marginBottom: 12 }}>
               <strong>SE(3)-invariant 3D mode unavailable:</strong>{' '}
@@ -331,16 +473,8 @@ export default function ScanTab({ health = null }: Partial<TabProps>) {
           )}
 
           {needsStructure && (
-            <div
-              style={{
-                marginBottom: 14,
-                padding: '12px 14px',
-                borderRadius: 'var(--radius)',
-                border: '1px solid var(--teal-mid)',
-                background: 'var(--teal-light)',
-              }}
-            >
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
+            <div className="structure-box form-field">
+              <div className="label-row" style={{ marginBottom: 8 }}>
                 <label htmlFor="scan-pdb" style={{ marginBottom: 0 }}>
                   Structure PDB (required for 3D mode — B-factor read as pLDDT)
                 </label>
@@ -355,8 +489,7 @@ export default function ScanTab({ health = null }: Partial<TabProps>) {
                   {structurePdb && (
                     <button
                       type="button"
-                      className="btn btn-secondary"
-                      style={{ padding: '4px 10px', fontSize: '0.78rem' }}
+                      className="btn btn-secondary btn-sm"
                       onClick={() => {
                         setStructurePdb('')
                         setPdbFilename(null)
@@ -369,93 +502,74 @@ export default function ScanTab({ health = null }: Partial<TabProps>) {
               </div>
               <textarea
                 id="scan-pdb"
-                rows={4}
+                rows={3}
                 value={structurePdb}
                 onChange={(e) => {
                   setStructurePdb(e.target.value)
                   if (!e.target.value) setPdbFilename(null)
                 }}
                 placeholder="Paste PDB text (ATOM records) or load a .pdb file above..."
-                style={{ fontFamily: 'monospace', background: '#fff' }}
+                className="seq-input"
+                style={{ background: '#fff' }}
               />
-              <div style={{ fontSize: '0.76rem', color: 'var(--teal-dark)', marginTop: 4 }}>
+              <div className="field-hint">
                 {pdbFilename
                   ? `Loaded ${pdbFilename} (${structurePdb.length.toLocaleString()} chars)`
                   : structurePdb.trim()
                     ? `${structurePdb.length.toLocaleString()} chars of PDB text supplied`
-                    : 'Supply a PDB file or paste ATOM records for this exact protein.'}
+                    : 'Supply a structure of this exact protein.'}
               </div>
             </div>
           )}
 
-          <div style={{ marginBottom: 14 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <label htmlFor="scan-cds">Optional Coding Sequence (CDS — DNA/RNA, FASTA ok, one stop codon ok)</label>
-              {cds && cdsAvailable && (
-                <button
-                  type="button"
-                  className="btn btn-secondary"
-                  style={{ padding: '2px 8px', fontSize: '0.75rem', marginBottom: 4 }}
-                  onClick={() => setCds('')}
-                >
-                  Clear CDS
-                </button>
+          <details className="form-disclosure" open={Boolean(cds)}>
+            <summary>
+              Optional coding sequence (CDS) <span className="summary-meta">mRNA folding &amp; codon-usage channels</span>
+            </summary>
+            <div style={{ marginTop: 8 }}>
+              <div className="label-row">
+                <label htmlFor="scan-cds">Coding Sequence (DNA/RNA, FASTA ok, one stop codon ok)</label>
+                {cds && cdsAvailable && (
+                  <button type="button" className="btn-link" onClick={() => setCds('')}>
+                    Clear CDS
+                  </button>
+                )}
+              </div>
+              <textarea
+                id="scan-cds"
+                rows={2}
+                value={cds}
+                disabled={!cdsAvailable}
+                onChange={(e) => setCds(e.target.value)}
+                placeholder={cdsAvailable ? 'Optional: coding sequence encoding this exact protein...' : 'CDS input disabled (unavailable on this server)'}
+                className="seq-input"
+              />
+              {!cdsAvailable && (
+                <div className="capability-notice capability-disabled" style={{ marginTop: 6 }}>
+                  <strong>CDS features unavailable:</strong> {cdsCap?.reason ?? 'Waiting for server capability status…'}
+                </div>
               )}
             </div>
-            <textarea
-              id="scan-cds"
-              rows={2}
-              value={cds}
-              disabled={!cdsAvailable}
-              onChange={(e) => setCds(e.target.value)}
-              placeholder={
-                cdsAvailable
-                  ? 'Optional: paste coding sequence encoding this exact protein...'
-                  : 'CDS input disabled (unavailable on this server)'
-              }
-              style={{ fontFamily: 'monospace', opacity: cdsAvailable ? 1 : 0.6 }}
-            />
-            {!cdsAvailable && (
-              <div className="capability-notice capability-disabled" style={{ marginTop: 6 }}>
-                <strong>CDS features unavailable:</strong>{' '}
-                {cdsCap?.reason ?? 'Waiting for server capability status…'}
-              </div>
-            )}
-          </div>
+          </details>
 
-          <div className="btn-group" style={{ marginTop: 0 }}>
-            <button
-              type="submit"
-              className="btn btn-primary"
-              disabled={loading || !cleanLen || (needsStructure && !structurePdb.trim())}
-            >
+          <div className="btn-group">
+            <button type="submit" className="btn btn-primary" disabled={loading || !cleanLen || (needsStructure && !structurePdb.trim())}>
               {loading && <span className="spinner" />}
               {loading ? 'Streaming Scan…' : 'Run Scan'}
             </button>
             {loading && (
-              <button
-                type="button"
-                className="btn btn-danger"
-                onClick={handleCancel}
-              >
+              <button type="button" className="btn btn-danger" onClick={handleCancel}>
                 Cancel Scan
               </button>
             )}
-          </div>
-          <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: 6 }}>
-            Scanning {Math.max(0, end - start + 1)} positions × 20 amino acids over SSE stream.
-            ESM-2 runs once per protein; columns fill in live by batch.
+            <span className="btn-aside">{Math.max(0, end - start + 1)} positions × 20 substitutions</span>
           </div>
         </form>
 
         {error && <div className="error-msg">{error}</div>}
         {cancelled && (
-          <div className="warn-banner" style={{ borderRadius: 'var(--radius)', marginTop: 12 }}>
-            <span>⚠</span>
-            <span>
-              Scan cancelled by user
-              {progress ? ` (${progress.done} / ${progress.total} sites received)` : ''}.
-            </span>
+          <div className="capability-notice capability-disabled" style={{ marginTop: 12 }}>
+            Scan cancelled{progress ? ` (${progress.done} / ${progress.total} sites received)` : ''}.
           </div>
         )}
       </div>
@@ -463,10 +577,13 @@ export default function ScanTab({ health = null }: Partial<TabProps>) {
       {(loading || progress || activeMeta) && (
         <div className="card">
           <div className="card-header-row">
-            <div className="card-title" style={{ marginBottom: 0, borderBottom: 'none', paddingBottom: 0 }}>
-              {result
-                ? 'ΔΔG Heatmap (ΔΔG > 0 = stabilizing ▲, < 0 = destabilizing ▼)'
-                : 'Live Scan Progress & Incremental Heatmap'}
+            <div className="card-title card-title-flat">
+              {result ? 'ΔΔG Landscape' : 'Live Scan Progress & Incremental Heatmap'}
+              {hasHeatmap && (
+                <span className="title-meta">
+                  {' '}· {firstLabel}–{lastLabel} · {nCols} positions × {grid.aa.length} substitutions
+                </span>
+              )}
             </div>
             {activeMeta && (
               <span className="symmetry-badge">
@@ -476,61 +593,41 @@ export default function ScanTab({ health = null }: Partial<TabProps>) {
           </div>
 
           {activeMeta && (
-            <div className="symmetry-statement">
-              <strong>Coordinates:</strong>{' '}
-              {activeMeta.uses_coordinates ? 'Uses aligned 3D backbone coordinates' : 'Reads no coordinates'} ·{' '}
-              <strong>Symmetry:</strong> {activeMeta.symmetry}
-            </div>
-          )}
-
-          {activeMeta && (
-            <div className="stat-chips" style={{ marginBottom: 10 }}>
-              <div className="stat-chip">
-                CDS:{' '}
-                <strong>
-                  {activeMeta.cds?.supplied
-                    ? `verified (${activeMeta.cds.n_codons ?? '?'} codons${activeMeta.cds.stop_codon_stripped ? ', stop stripped' : ''})`
-                    : 'not supplied (CDS-dropout path)'}
-                </strong>
-              </div>
-              {activeMeta.structure && (
-                <>
-                  <div className="stat-chip">
-                    Mean pLDDT: <strong>{activeMeta.structure.mean_plddt.toFixed(2)}</strong>
-                  </div>
-                  <div className="stat-chip">
-                    Low-conf (&lt;70): <strong>{activeMeta.structure.low_confidence_positions.length} sites</strong>
-                  </div>
-                </>
-              )}
+            <div className="meta-line" title={activeMeta.symmetry}>
               {result?.timing && (
                 <>
-                  <div className="stat-chip">
-                    Encode: <strong>{result.timing.encode_ms.toFixed(1)} ms</strong>
-                  </div>
-                  <div className="stat-chip">
-                    Scan: <strong>{result.timing.scan_ms.toFixed(1)} ms</strong>
-                  </div>
-                  <div className="stat-chip">
-                    Mutations: <strong>{result.timing.total_mutations.toLocaleString()}</strong>
-                  </div>
-                  <div className="stat-chip">
-                    Throughput: <strong>{result.timing.muts_per_sec.toFixed(1)} mut/s</strong>
-                  </div>
+                  <span><strong>{result.timing.total_mutations.toLocaleString()}</strong> mutations</span>
+                  <span>scan <strong>{(result.timing.scan_ms / 1000).toFixed(2)} s</strong></span>
+                  <span><strong>{Math.round(result.timing.muts_per_sec).toLocaleString()}</strong> mut/s</span>
+                </>
+              )}
+              {activeMeta.cds?.supplied && (
+                <span>CDS <strong>verified ({activeMeta.cds.n_codons ?? '?'} codons)</strong></span>
+              )}
+              {activeMeta.structure && (
+                <>
+                  <span>mean pLDDT <strong>{activeMeta.structure.mean_plddt.toFixed(1)}</strong></span>
+                  {activeMeta.structure.low_confidence_positions.length > 0 && (
+                    <span className="meta-warn">pLDDT &lt; 70 <strong>{activeMeta.structure.low_confidence_positions.length} sites</strong></span>
+                  )}
+                  {(activeMeta.structure.residues_without_coordinates?.length ?? 0) > 0 && (
+                    <span className="meta-warn">
+                      <strong>{activeMeta.structure.residues_without_coordinates?.length} sites</strong> without coordinates (masked)
+                    </span>
+                  )}
                 </>
               )}
             </div>
           )}
 
-          {progress && (
+          {progress && (loading || !result) && (
             <div className="progress-wrap" style={{ marginBottom: 14 }} aria-live="off">
               <div className="progress-header">
                 <span>
                   Scanning residues: <strong>{progress.done}</strong> / <strong>{progress.total}</strong> sites ({pct}%)
                 </span>
                 <span className="progress-meta">
-                  Elapsed: <strong>{progress.elapsed_s.toFixed(2)}s</strong> · ETA:{' '}
-                  <strong>{progress.eta_s.toFixed(2)}s</strong>
+                  Elapsed <strong>{progress.elapsed_s.toFixed(2)}s</strong> · ETA <strong>{progress.eta_s.toFixed(2)}s</strong>
                 </span>
               </div>
               <div
@@ -546,38 +643,42 @@ export default function ScanTab({ health = null }: Partial<TabProps>) {
             </div>
           )}
 
-          {hasHeatmap ? (
-            <div style={{ overflowX: 'auto' }} className="plot-wrap">
+          <div ref={plotBoxRef} className={`heatmap-box${scrolls ? ' heatmap-scroll' : ''}`}>
+            {hasHeatmap ? (
               <Plot
                 data={plotData}
-                layout={{ ...plotLayout, width: plotWidth }}
-                config={{ displayModeBar: true, responsive: false }}
-                style={{ minWidth: `${plotWidth}px` }}
+                layout={plotLayout}
+                config={{ ...PLOT_CONFIG, responsive: false }}
+                style={{ width: `${plotWidth}px` }}
               />
+            ) : (
+              loading && (
+                <div className="loading-msg" style={{ padding: '20px 0' }}>
+                  <span className="spinner" />Encoding sequence and waiting for first site batch…
+                </div>
+              )
+            )}
+          </div>
+
+          {hasHeatmap && (
+            <div className="figure-caption">
+              <span className="legend-ramp" aria-hidden="true" />
+              <span>
+                <strong style={{ color: COLORS.destabilizing }}>destabilizing (ΔΔG &lt; 0)</strong> ·{' '}
+                <strong style={{ color: COLORS.stabilizing }}>stabilizing (ΔΔG &gt; 0)</strong> · colour clipped at ±
+                {zLim.toFixed(1)} kcal/mol (98th pct.) · top: mean of 20 substitutions · dots: wild type
+                {stride > 1 ? ` · every ${stride}th residue labelled` : ''}
+              </span>
             </div>
-          ) : (
-            loading && (
-              <div className="loading-msg" style={{ padding: '20px 0' }}>
-                <span className="spinner" />Encoding sequence and waiting for first site batch…
-              </div>
-            )
           )}
 
           {result && (
             <div className="btn-group">
-              <button
-                className="btn btn-secondary"
-                onClick={() => handleExport('csv')}
-                disabled={exporting === 'csv'}
-              >
+              <button className="btn btn-secondary" onClick={() => handleExport('csv')} disabled={exporting === 'csv'}>
                 {exporting === 'csv' && <span className="spinner" />}
                 Export CSV
               </button>
-              <button
-                className="btn btn-secondary"
-                onClick={() => handleExport('pdb')}
-                disabled={exporting === 'pdb'}
-              >
+              <button className="btn btn-secondary" onClick={() => handleExport('pdb')} disabled={exporting === 'pdb'}>
                 {exporting === 'pdb' && <span className="spinner" />}
                 Export PDB (B-factor)
               </button>

@@ -5,34 +5,67 @@ import * as $3Dmol from '3dmol'
 import { postCompare } from '../api'
 import { setCompare } from '../store'
 import type { CompareResponse, PlddtBands, TabProps } from '../types'
+import {
+  BASE_LAYOUT,
+  COLORS,
+  PAE_SCALE,
+  PLOT_CONFIG,
+  axisTitle,
+  baseAxis,
+  colorbarTitle,
+} from '../plotTheme'
 
-/** Map AlphaFold pLDDT (B-factor column) to standard AlphaFold confidence colors. */
+/** AlphaFold's own pLDDT confidence colours (kept identical to AlphaFold DB for recognisability). */
+const PLDDT_COLORS = {
+  veryHigh: '#0053d6',
+  confident: '#65cbf3',
+  low: '#ffdb13',
+  veryLow: '#ff7d45',
+}
+
+/** Studio-light canvas: harmonises with the card surface instead of a black hole in the page. */
+const VIEWER_BG = '#f3f5f8'
+
 function plddt2color(bfactor: number): string {
-  if (bfactor > 90) return '#0053d6'
-  if (bfactor >= 70) return '#65cbf3'
-  if (bfactor > 50) return '#ffdb13'
-  return '#ff7d45'
+  if (bfactor > 90) return PLDDT_COLORS.veryHigh
+  if (bfactor >= 70) return PLDDT_COLORS.confident
+  if (bfactor > 50) return PLDDT_COLORS.low
+  return PLDDT_COLORS.veryLow
 }
 
-/** Map per-position min ΔΔG (<0 destabilizing red, 0 neutral light gray, >0 stabilizing blue). */
+/**
+ * Diverging ribbon colour for per-position min ΔΔG (ColorBrewer RdBu). The midpoint is a
+ * light neutral grey rather than white, so near-zero residues stay visible on the light canvas.
+ */
+const DDG_RIBBON_STOPS: Array<[number, [number, number, number]]> = [
+  [-3.5, [103, 0, 31]],
+  [-2.5, [178, 24, 43]],
+  [-1.5, [214, 96, 77]],
+  [-0.6, [244, 165, 130]],
+  [0.0, [214, 219, 226]],
+  [0.6, [146, 197, 222]],
+  [1.5, [67, 147, 195]],
+  [3.5, [33, 102, 172]],
+]
+const DDG_CLAMP = 3.5
+
 function ddg2color(ddg: number): string {
-  const clamp = Math.max(-3.5, Math.min(3.5, ddg))
-  if (clamp < 0) {
-    const t = Math.abs(clamp) / 3.5
-    const r = Math.round(248 + (220 - 248) * t)
-    const g = Math.round(250 + (38 - 250) * t)
-    const b = Math.round(252 + (38 - 252) * t)
-    return `rgb(${r},${g},${b})`
+  const v = Math.max(-DDG_CLAMP, Math.min(DDG_CLAMP, ddg))
+  for (let i = 0; i < DDG_RIBBON_STOPS.length - 1; i++) {
+    const [x0, c0] = DDG_RIBBON_STOPS[i]
+    const [x1, c1] = DDG_RIBBON_STOPS[i + 1]
+    if (v >= x0 && v <= x1) {
+      const t = x1 === x0 ? 0 : (v - x0) / (x1 - x0)
+      const c = c0.map((a, k) => Math.round(a + (c1[k] - a) * t))
+      return `rgb(${c[0]},${c[1]},${c[2]})`
+    }
   }
-  if (clamp > 0) {
-    const t = clamp / 3.5
-    const r = Math.round(248 + (37 - 248) * t)
-    const g = Math.round(250 + (99 - 250) * t)
-    const b = Math.round(252 + (235 - 252) * t)
-    return `rgb(${r},${g},${b})`
-  }
-  return '#f8fafc'
+  return 'rgb(214,219,226)'
 }
+
+const DDG_GRADIENT_CSS = `linear-gradient(90deg, ${DDG_RIBBON_STOPS.map(
+  ([x, c]) => `rgb(${c.join(',')}) ${(((x + DDG_CLAMP) / (2 * DDG_CLAMP)) * 100).toFixed(1)}%`,
+).join(', ')})`
 
 function computeBandsFallback(plddt: number[]): PlddtBands {
   let very_high_gt_90 = 0
@@ -104,17 +137,12 @@ export default function CompareTab({ health: _health = null }: Partial<TabProps>
           : 0))
     : 0
 
-  const plddtBands: PlddtBands | null = result
-    ? (result.plddt_bands ?? computeBandsFallback(result.plddt))
-    : null
+  const plddtBands: PlddtBands | null = result ? (result.plddt_bands ?? computeBandsFallback(result.plddt)) : null
 
   const lowConfPositions: number[] = useMemo(
     () =>
       result
-        ? (result.low_confidence_positions ??
-            result.plddt
-              .map((v, i) => (v < 70 ? i + 1 : -1))
-              .filter((p) => p > 0))
+        ? (result.low_confidence_positions ?? result.plddt.map((v, i) => (v < 70 ? i + 1 : -1)).filter((p) => p > 0))
         : [],
     [result]
   )
@@ -122,8 +150,7 @@ export default function CompareTab({ health: _health = null }: Partial<TabProps>
   const lowConfInScan: boolean[] = useMemo(
     () =>
       result
-        ? (result.low_confidence_in_scan ??
-            result.min_ddg_per_position.map((_, i) => (result.plddt[i] ?? 100) < 70))
+        ? (result.low_confidence_in_scan ?? result.min_ddg_per_position.map((_, i) => (result.plddt[i] ?? 100) < 70))
         : [],
     [result]
   )
@@ -147,38 +174,34 @@ export default function CompareTab({ health: _health = null }: Partial<TabProps>
       setResult(res)
       setCompare(res)
     } catch (err: unknown) {
-      const axiosErr = err as {
-        response?: { status?: number; data?: { detail?: string } }
-        message?: string
-      }
+      const axiosErr = err as { response?: { status?: number; data?: { detail?: string } }; message?: string }
       if (axiosErr.response?.status === 502) {
         setError(
           'Could not reach AlphaFold / UniProt servers (502 Bad Gateway). ' +
-          'Check your internet connection or verify the UniProt accession is valid.'
+            'Check your internet connection or verify the UniProt accession is valid.'
         )
       } else {
-        setError(
-          axiosErr.response?.data?.detail ??
-          axiosErr.message ??
-          'Request failed'
-        )
+        setError(axiosErr.response?.data?.detail ?? axiosErr.message ?? 'Request failed')
       }
     } finally {
       setLoading(false)
     }
   }
 
-  // Initialize / reuse the 3Dmol viewer whenever the mounted container or PDB changes,
-  // and update colors/markers cleanly on coloring toggle without resetting camera zoom.
+  // Initialise / reuse the 3Dmol viewer whenever the mounted container or PDB changes, and
+  // update colours/markers on toggle without resetting the camera.
   useEffect(() => {
     if (!result?.structure_pdb || !viewerRef.current) return
 
     let viewer = viewerInstance.current
     if (!viewer || viewerElementRef.current !== viewerRef.current) {
-      viewer = $3Dmol.createViewer(viewerRef.current, {
-        backgroundColor: '#111111',
-        antialias: true,
-      })
+      viewer = $3Dmol.createViewer(viewerRef.current, { backgroundColor: VIEWER_BG, antialias: true })
+      try {
+        // thin ink outline keeps pale ribbons (pLDDT yellow, near-zero ΔΔG) legible on a light canvas
+        viewer.setViewStyle({ style: 'outline', color: '#3b4554', width: 0.035 })
+      } catch {
+        /* outline is cosmetic; older 3Dmol builds may not support it */
+      }
       viewerInstance.current = viewer
       viewerElementRef.current = viewerRef.current
       loadedPdbRef.current = null
@@ -188,6 +211,7 @@ export default function CompareTab({ health: _health = null }: Partial<TabProps>
       viewer.clear()
       viewer.addModel(result.structure_pdb, 'pdb')
       viewer.zoomTo()
+      viewer.zoom(0.9) // headroom so the caption and legend overlays never cover the model
       loadedPdbRef.current = result.structure_pdb
     }
 
@@ -196,9 +220,7 @@ export default function CompareTab({ health: _health = null }: Partial<TabProps>
         ? (atom: $3Dmol.AtomSpec) => plddt2color(atom.b ?? 0)
         : (atom: $3Dmol.AtomSpec) => {
             const idx = (atom.resi ?? 0) - 1
-            if (idx < 0 || idx >= result.min_ddg_per_position.length) {
-              return '#94a3b8'
-            }
+            if (idx < 0 || idx >= result.min_ddg_per_position.length) return '#a7b0bd'
             return ddg2color(result.min_ddg_per_position[idx])
           }
 
@@ -207,86 +229,95 @@ export default function CompareTab({ health: _health = null }: Partial<TabProps>
     if (markLowConf && lowConfPositions.length > 0) {
       viewer.addStyle(
         { resi: lowConfPositions, atom: 'CA' },
-        { sphere: { radius: 0.55, color: '#ff7d45', opacity: 0.85 } }
+        { sphere: { radius: 0.5, color: PLDDT_COLORS.veryLow, opacity: 0.9 } }
       )
     }
 
     viewer.render()
   }, [result, colorMode, markLowConf, lowConfPositions])
 
+  // ---- PAE: axes in residue numbers, not in (possibly downsampled) cell indices ----
+  const paeStride = result?.pae_stride ?? 1
+  const paeAxis = result ? result.pae.map((_, k) => 1 + k * paeStride) : []
+  const paeMax = result ? Math.max(30, ...result.pae.map((row) => Math.max(...row))) : 30
+
   const paeData = result
     ? [
         {
           type: 'heatmap',
+          x: paeAxis,
+          y: paeAxis,
           z: result.pae,
-          colorscale: 'Viridis',
-          reversescale: true,
+          colorscale: PAE_SCALE,
+          zmin: 0,
+          zmax: Math.ceil(paeMax),
           colorbar: {
-            title: 'PAE (Å)',
-            titleside: 'right',
+            title: colorbarTitle('Expected position error (Å)'),
+            thickness: 12,
+            len: 1,
+            outlinewidth: 0,
+            ticks: 'outside',
+            ticklen: 3,
+            tickfont: { size: 10.5, color: COLORS.inkMuted },
           },
-          hovertemplate:
-            'Residue i: %{x}<br>Residue j: %{y}<br>PAE: %{z:.2f} Å<extra></extra>',
+          hovertemplate: 'Scored residue %{x}<br>Aligned residue %{y}<br>PAE %{z:.1f} Å<extra></extra>',
         },
       ]
     : []
 
   const paeLayout = {
-    height: 280,
-    margin: { l: 50, r: 90, t: 30, b: 50 },
-    xaxis: { title: 'Residue j', gridcolor: '#f1f5f9' },
-    yaxis: { title: 'Residue i', autorange: 'reversed', gridcolor: '#f1f5f9' },
-    paper_bgcolor: 'transparent',
-    plot_bgcolor: 'transparent',
-    font: { family: 'Inter, system-ui, sans-serif', size: 11 },
+    ...BASE_LAYOUT,
+    height: 420,
+    margin: { l: 58, r: 20, t: 10, b: 50 },
+    xaxis: baseAxis({
+      title: axisTitle('Scored residue'),
+      showgrid: false,
+      constrain: 'domain',
+      range: result ? [0.5, (paeAxis[paeAxis.length - 1] ?? 1) + paeStride - 0.5] : undefined,
+    }),
+    yaxis: baseAxis({
+      title: axisTitle('Aligned residue'),
+      range: result ? [(paeAxis[paeAxis.length - 1] ?? 1) + paeStride - 0.5, 0.5] : undefined,
+      autorange: result ? false : 'reversed',
+      showgrid: false,
+      scaleanchor: 'x',
+      constrain: 'domain',
+    }),
   }
 
-  const lowScanX: number[] = []
-  const lowScanY: number[] = []
-  if (result) {
-    for (let i = 0; i < result.min_ddg_per_position.length; i++) {
-      if (lowConfInScan[i]) {
-        lowScanX.push(i + 1)
-        lowScanY.push(result.min_ddg_per_position[i])
-      }
-    }
-  }
-
+  // ---- min ΔΔG vs pLDDT overlay ----
+  const nScan = result?.min_ddg_per_position.length ?? 0
   const overlayData = result
     ? [
         {
           type: 'scatter',
-          x: Array.from({ length: result.min_ddg_per_position.length }, (_, i) => i + 1),
+          x: Array.from({ length: nScan }, (_, i) => i + 1),
           y: result.min_ddg_per_position,
           mode: 'lines',
-          line: { color: '#dc2626', width: 2 },
-          name: 'Holo-GNN min ΔΔG',
+          line: { color: COLORS.destabilizing, width: 1.4 },
+          name: 'Holo-GeoN min ΔΔG per residue (left)',
           yaxis: 'y',
-          hovertemplate: 'Pos %{x}<br>Min ΔΔG: %{y:.3f}<extra></extra>',
+          hovertemplate: 'Residue %{x}<br>Min ΔΔG %{y:.2f} kcal/mol<extra></extra>',
         },
-        ...(lowScanX.length > 0
-          ? [
-              {
-                type: 'scatter',
-                x: lowScanX,
-                y: lowScanY,
-                mode: 'markers',
-                marker: { color: '#ff7d45', size: 6, symbol: 'diamond-open', line: { width: 1.5, color: '#b45309' } },
-                name: 'Low-conf AlphaFold (pLDDT < 70)',
-                yaxis: 'y',
-                hovertemplate: 'Pos %{x} (pLDDT &lt; 70)<br>Min ΔΔG: %{y:.3f}<extra></extra>',
-              },
-            ]
-          : []),
         {
           type: 'scatter',
           x: Array.from({ length: result.plddt.length }, (_, i) => i + 1),
           y: result.plddt,
           mode: 'lines',
-          line: { color: '#2563eb', width: 2, dash: 'dot' },
-          name: 'AlphaFold pLDDT',
+          line: { color: COLORS.plddt, width: 1.6, dash: 'dot' },
+          name: 'AlphaFold pLDDT (right)',
           yaxis: 'y2',
-          hovertemplate: 'Pos %{x}<br>pLDDT: %{y:.1f}<extra></extra>',
+          hovertemplate: 'Residue %{x}<br>pLDDT %{y:.1f}<extra></extra>',
+        },
+        {
+          // legend key for the shaded spans (shapes have no legend entry of their own)
+          type: 'scatter',
+          x: [null],
+          y: [null],
+          mode: 'markers',
+          marker: { symbol: 'square', size: 12, color: COLORS.lowConfidence, line: { color: COLORS.lowConfidenceLine, width: 1 } },
+          name: 'pLDDT < 70',
+          hoverinfo: 'skip',
         },
       ]
     : []
@@ -299,29 +330,35 @@ export default function CompareTab({ health: _health = null }: Partial<TabProps>
     x1: e + 0.5,
     y0: 0,
     y1: 1,
-    fillcolor: 'rgba(255, 219, 19, 0.22)',
+    fillcolor: COLORS.lowConfidence,
     line: { width: 0 },
     layer: 'below',
   }))
 
   const overlayLayout = {
-    height: 270,
-    margin: { l: 55, r: 70, t: 30, b: 60 },
-    xaxis: { title: 'Residue position', gridcolor: '#f1f5f9' },
-    yaxis: {
-      title: 'Min ΔΔG (kcal/mol)',
-      titlefont: { color: '#dc2626' },
-      tickfont: { color: '#dc2626' },
-      gridcolor: '#f1f5f9',
-    },
-    yaxis2: {
-      title: 'pLDDT',
-      titlefont: { color: '#2563eb' },
-      tickfont: { color: '#2563eb' },
+    ...BASE_LAYOUT,
+    height: 320,
+    margin: { l: 64, r: 64, t: 44, b: 50 },
+    xaxis: baseAxis({
+      title: axisTitle('Residue position'),
+      range: [0.5, Math.max(nScan, result?.plddt.length ?? 1) + 0.5],
+      showgrid: false,
+    }),
+    yaxis: baseAxis({
+      title: axisTitle('Min ΔΔG (kcal/mol)', { color: COLORS.destabilizing }),
+      tickfont: { size: 11, color: COLORS.destabilizing },
+      zeroline: true,
+      zerolinecolor: COLORS.zero,
+    }),
+    yaxis2: baseAxis({
+      title: axisTitle('pLDDT', { color: COLORS.plddt }),
+      tickfont: { size: 11, color: COLORS.plddt },
       overlaying: 'y',
       side: 'right',
       range: [0, 100],
-    },
+      showgrid: false,
+      tickvals: [0, 50, 70, 90, 100],
+    }),
     shapes: [
       ...spanShapes,
       {
@@ -332,13 +369,18 @@ export default function CompareTab({ health: _health = null }: Partial<TabProps>
         x1: 1,
         y0: 70,
         y1: 70,
-        line: { color: '#f59e0b', width: 1, dash: 'dash' },
+        line: { color: COLORS.lowConfidenceLine, width: 1, dash: 'dash' },
       },
     ],
-    legend: { orientation: 'h', y: -0.32 },
-    paper_bgcolor: 'transparent',
-    plot_bgcolor: 'transparent',
-    font: { family: 'Inter, system-ui, sans-serif', size: 11 },
+    legend: {
+      orientation: 'h',
+      x: 0,
+      y: 1.02,
+      xanchor: 'left',
+      yanchor: 'bottom',
+      font: { size: 11.5, color: COLORS.ink },
+      bgcolor: 'rgba(0,0,0,0)',
+    },
   }
 
   const totalPlddtCount = result ? Math.max(result.plddt.length, 1) : 1
@@ -359,311 +401,165 @@ export default function CompareTab({ health: _health = null }: Partial<TabProps>
                 placeholder="e.g. P69905"
               />
             </div>
-            <button
-              type="submit"
-              className="btn btn-primary"
-              disabled={loading || !uniprotId.trim()}
-            >
+            <button type="submit" className="btn btn-primary" disabled={loading || !uniprotId.trim()}>
               {loading && <span className="spinner" />}
               {loading ? 'Fetching…' : 'Compare'}
             </button>
           </div>
-          <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: 6 }}>
-            Fetches AlphaFold structure + PAE from EBI, then runs structure-free Holo-GeoN scan on the sequence.
-          </div>
+          <div className="field-hint">AlphaFold DB model + PAE from EBI; structure-free Holo-GeoN scan of the first 400 residues.</div>
         </form>
         {error && <div className="error-msg">{error}</div>}
       </div>
 
       {result && (
         <>
-          <div className="plddt-note" role="note">
-            <strong>Model / Structure Provenance:</strong> {plddtNote}
-          </div>
-
-          {result.pae_downsampled && (
-            <div
-              style={{
-                background: '#eff6ff',
-                border: '1px solid #bfdbfe',
-                borderRadius: 'var(--radius)',
-                padding: '8px 14px',
-                fontSize: '0.82rem',
-                color: '#1e40af',
-                marginBottom: 14,
-              }}
-            >
-              Note: PAE matrix was downsampled for display performance.
-            </div>
-          )}
-
           <div className="card">
-            <div className="card-title">AlphaFold pLDDT Confidence Summary — {result.uniprot_id}</div>
+            <div className="card-header-row">
+              <div className="card-title card-title-flat">AlphaFold pLDDT Confidence — {result.uniprot_id}</div>
+              <span className="symmetry-badge">Scan: Structure-Free · Reads No Coordinates</span>
+            </div>
             <div className="stat-chips">
-              <div className="stat-chip">
-                Mean pLDDT: <strong>{plddtMean.toFixed(2)}</strong>
-              </div>
-              <div className="stat-chip">
-                Sequence length: <strong>{result.sequence.length} aa</strong>
-              </div>
-              <div className="stat-chip">
-                Low confidence (&lt;70): <strong>{lowConfPositions.length} residues</strong>
-              </div>
-              {plddtBands && (
-                <>
-                  <div className="stat-chip">
-                    <span className="legend-dot plddt-very-high" style={{ background: '#0053d6', marginRight: 6 }} />
-                    &gt;90 Very high: <strong>{plddtBands.very_high_gt_90}</strong>
-                  </div>
-                  <div className="stat-chip">
-                    <span className="legend-dot plddt-confident" style={{ background: '#65cbf3', marginRight: 6 }} />
-                    70–90 Confident: <strong>{plddtBands.confident_70_90}</strong>
-                  </div>
-                  <div className="stat-chip">
-                    <span className="legend-dot plddt-low" style={{ background: '#ffdb13', marginRight: 6 }} />
-                    50–70 Low: <strong>{plddtBands.low_50_70}</strong>
-                  </div>
-                  <div className="stat-chip">
-                    <span className="legend-dot plddt-very-low" style={{ background: '#ff7d45', marginRight: 6 }} />
-                    ≤50 Very low: <strong>{plddtBands.very_low_le_50}</strong>
-                  </div>
-                </>
-              )}
+              <div className="stat-chip">Mean pLDDT <strong>{plddtMean.toFixed(1)}</strong></div>
+              <div className="stat-chip">Length <strong>{result.sequence.length} aa</strong></div>
+              <div className="stat-chip">pLDDT &lt; 70 <strong>{lowConfPositions.length} residues</strong></div>
             </div>
 
             {plddtBands && (
-              <div
-                aria-label="AlphaFold pLDDT confidence band breakdown"
-                style={{
-                  display: 'flex',
-                  height: 10,
-                  borderRadius: 999,
-                  overflow: 'hidden',
-                  background: '#e2e8f0',
-                  marginTop: 8,
-                  marginBottom: 10,
-                }}
-              >
-                <div
-                  className="plddt-very-high"
-                  style={{
-                    width: `${(plddtBands.very_high_gt_90 / totalPlddtCount) * 100}%`,
-                    background: '#0053d6',
-                  }}
-                  title={`Very high (>90): ${plddtBands.very_high_gt_90}`}
-                />
-                <div
-                  className="plddt-confident"
-                  style={{
-                    width: `${(plddtBands.confident_70_90 / totalPlddtCount) * 100}%`,
-                    background: '#65cbf3',
-                  }}
-                  title={`Confident (70–90): ${plddtBands.confident_70_90}`}
-                />
-                <div
-                  className="plddt-low"
-                  style={{
-                    width: `${(plddtBands.low_50_70 / totalPlddtCount) * 100}%`,
-                    background: '#ffdb13',
-                  }}
-                  title={`Low (50–70): ${plddtBands.low_50_70}`}
-                />
-                <div
-                  className="plddt-very-low"
-                  style={{
-                    width: `${(plddtBands.very_low_le_50 / totalPlddtCount) * 100}%`,
-                    background: '#ff7d45',
-                  }}
-                  title={`Very low (≤50): ${plddtBands.very_low_le_50}`}
-                />
+              <div className="band-bar" aria-label="AlphaFold pLDDT confidence band breakdown">
+                <div className="plddt-very-high" style={{ width: `${(plddtBands.very_high_gt_90 / totalPlddtCount) * 100}%`, background: PLDDT_COLORS.veryHigh }} title={`Very high (>90): ${plddtBands.very_high_gt_90}`} />
+                <div className="plddt-confident" style={{ width: `${(plddtBands.confident_70_90 / totalPlddtCount) * 100}%`, background: PLDDT_COLORS.confident }} title={`Confident (70–90): ${plddtBands.confident_70_90}`} />
+                <div className="plddt-low" style={{ width: `${(plddtBands.low_50_70 / totalPlddtCount) * 100}%`, background: PLDDT_COLORS.low }} title={`Low (50–70): ${plddtBands.low_50_70}`} />
+                <div className="plddt-very-low" style={{ width: `${(plddtBands.very_low_le_50 / totalPlddtCount) * 100}%`, background: PLDDT_COLORS.veryLow }} title={`Very low (≤50): ${plddtBands.very_low_le_50}`} />
+              </div>
+            )}
+            {plddtBands && (
+              <div className="band-legend" aria-hidden="true">
+                <span><span className="legend-dot" style={{ background: PLDDT_COLORS.veryHigh }} />&gt;90 <strong>{plddtBands.very_high_gt_90}</strong></span>
+                <span><span className="legend-dot" style={{ background: PLDDT_COLORS.confident }} />70–90 <strong>{plddtBands.confident_70_90}</strong></span>
+                <span><span className="legend-dot" style={{ background: PLDDT_COLORS.low }} />50–70 <strong>{plddtBands.low_50_70}</strong></span>
+                <span><span className="legend-dot" style={{ background: PLDDT_COLORS.veryLow }} />≤50 <strong>{plddtBands.very_low_le_50}</strong></span>
               </div>
             )}
 
-            <div style={{ fontSize: '0.83rem', color: 'var(--text)' }}>
-              <strong>Low-confidence positions (1-based, pLDDT &lt; 70):</strong>{' '}
-              <span style={{ fontFamily: 'monospace' }}>
-                {formatPositionRanges(lowConfPositions)}
-              </span>
+            <div className="low-conf-row">
+              <span className="low-conf-label">Low-confidence positions (pLDDT &lt; 70):</span>{' '}
+              <span className="mono">{formatPositionRanges(lowConfPositions)}</span>
               {lowConfPositions.length > 0 && (
-                <button
-                  type="button"
-                  className="btn btn-secondary"
-                  style={{ padding: '2px 8px', fontSize: '0.74rem', marginLeft: 8 }}
-                  onClick={() => setShowAllLowPos((v) => !v)}
-                >
+                <button type="button" className="btn-link" onClick={() => setShowAllLowPos((v) => !v)}>
                   {showAllLowPos ? 'Hide list' : `Show all ${lowConfPositions.length} indices`}
                 </button>
               )}
               {showAllLowPos && lowConfPositions.length > 0 && (
-                <div
-                  style={{
-                    marginTop: 6,
-                    padding: '8px 10px',
-                    background: '#f8fafc',
-                    border: '1px solid var(--border)',
-                    borderRadius: 'var(--radius)',
-                    fontFamily: 'monospace',
-                    fontSize: '0.78rem',
-                    maxHeight: 90,
-                    overflowY: 'auto',
-                  }}
-                >
-                  {lowConfPositions.join(', ')}
-                </div>
+                <div className="index-list">{lowConfPositions.join(', ')}</div>
               )}
+            </div>
+
+            <div className="context-note" role="note" title={plddtNote}>
+              <span className="context-glyph" aria-hidden="true">ⓘ</span>
+              <span>
+                pLDDT describes the AlphaFold model, not the prediction (the scan reads no coordinates); below 70, read
+                ΔΔG with caution.
+                {result.pae_downsampled && <> PAE drawn every {paeStride} residues.</>}
+              </span>
             </div>
           </div>
 
           <div className="compare-layout">
             {/* Left: 3Dmol viewer */}
-            <div>
-              <div className="card" style={{ marginBottom: 0 }}>
-                <div
-                  className="card-title"
-                  style={{
-                    display: 'flex',
-                    justifyContent: 'space-between',
-                    alignItems: 'center',
-                    flexWrap: 'wrap',
-                    gap: 8,
-                  }}
-                >
-                  <span>
-                    AlphaFold Structure —{' '}
-                    {colorMode === 'plddt' ? 'colored by pLDDT' : 'colored by min ΔΔG stability'}
-                  </span>
-                  <div className="mode-toggle" role="group" aria-label="3D structure coloring mode">
-                    <button
-                      type="button"
-                      className={`mode-btn${colorMode === 'plddt' ? ' active' : ''}`}
-                      onClick={() => setColorMode('plddt')}
-                    >
-                      AlphaFold pLDDT
-                    </button>
-                    <button
-                      type="button"
-                      className={`mode-btn${colorMode === 'ddg' ? ' active' : ''}`}
-                      onClick={() => setColorMode('ddg')}
-                      disabled={result.min_ddg_per_position.length === 0}
-                    >
-                      ΔΔG stability
-                    </button>
-                  </div>
+            <div className="card compare-panel">
+              <div className="card-header-row">
+                <div className="card-title card-title-flat">
+                  AlphaFold Structure — {colorMode === 'plddt' ? 'colored by pLDDT' : 'colored by min ΔΔG stability'}
                 </div>
-
-                {lowConfPositions.length > 0 && (
-                  <div style={{ marginBottom: 8 }}>
-                    <label
-                      style={{
-                        display: 'inline-flex',
-                        alignItems: 'center',
-                        gap: 6,
-                        textTransform: 'none',
-                        letterSpacing: 'normal',
-                        fontSize: '0.82rem',
-                        color: 'var(--text)',
-                        cursor: 'pointer',
-                        marginBottom: 0,
-                      }}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={markLowConf}
-                        onChange={(e) => setMarkLowConf(e.target.checked)}
-                      />
-                      Mark low-confidence positions (pLDDT &lt; 70, {lowConfPositions.length} CA spheres)
-                    </label>
-                  </div>
-                )}
-
-                <div className="viewer-container" ref={viewerRef} />
-
-                {colorMode === 'plddt' ? (
-                  <div className="viewer-legend">
-                    <div className="legend-item">
-                      <span className="legend-dot plddt-very-high" style={{ background: '#0053d6' }} />
-                      pLDDT &gt; 90 (very high)
-                    </div>
-                    <div className="legend-item">
-                      <span className="legend-dot plddt-confident" style={{ background: '#65cbf3' }} />
-                      70–90 (confident)
-                    </div>
-                    <div className="legend-item">
-                      <span className="legend-dot plddt-low" style={{ background: '#ffdb13' }} />
-                      50–70 (low)
-                    </div>
-                    <div className="legend-item">
-                      <span className="legend-dot plddt-very-low" style={{ background: '#ff7d45' }} />
-                      ≤ 50 (very low)
-                    </div>
-                  </div>
-                ) : (
-                  <div className="viewer-legend">
-                    <div className="legend-item">
-                      <span className="legend-dot" style={{ background: '#dc2626' }} />
-                      Destabilizing (min ΔΔG &lt; −2)
-                    </div>
-                    <div className="legend-item">
-                      <span className="legend-dot" style={{ background: '#f8fafc', border: '1px solid #cbd5e1' }} />
-                      Neutral (≈ 0)
-                    </div>
-                    <div className="legend-item">
-                      <span className="legend-dot" style={{ background: '#2563eb' }} />
-                      Stabilizing (&gt; +1)
-                    </div>
-                    {result.sequence.length > result.min_ddg_per_position.length && (
-                      <div className="legend-item">
-                        <span className="legend-dot" style={{ background: '#94a3b8' }} />
-                        Unscanned (&gt;{result.min_ddg_per_position.length})
-                      </div>
-                    )}
-                    {markLowConf && lowConfPositions.length > 0 && (
-                      <div className="legend-item">
-                        <span className="legend-dot" style={{ background: '#ff7d45' }} />
-                        CA marker: pLDDT &lt; 70
-                      </div>
-                    )}
-                  </div>
-                )}
+                <div className="mode-toggle" role="group" aria-label="3D structure coloring mode">
+                  <button
+                    type="button"
+                    className={`mode-btn${colorMode === 'plddt' ? ' active' : ''}`}
+                    onClick={() => setColorMode('plddt')}
+                  >
+                    AlphaFold pLDDT
+                  </button>
+                  <button
+                    type="button"
+                    className={`mode-btn${colorMode === 'ddg' ? ' active' : ''}`}
+                    onClick={() => setColorMode('ddg')}
+                    disabled={result.min_ddg_per_position.length === 0}
+                  >
+                    ΔΔG stability
+                  </button>
+                </div>
               </div>
+
+              <div className="viewer-stage">
+                <div className="viewer-container" ref={viewerRef} />
+                <div className="viewer-caption" aria-hidden="true">
+                  {result.uniprot_id} · AlphaFold DB model
+                  {lowConfPositions.length > 0 && markLowConf ? ' · spheres: pLDDT < 70' : ''}
+                </div>
+                <div className="viewer-legend-overlay">
+                  {colorMode === 'plddt' ? (
+                    <div className="viewer-legend">
+                      <div className="legend-item"><span className="legend-dot" style={{ background: PLDDT_COLORS.veryHigh }} />&gt; 90 very high</div>
+                      <div className="legend-item"><span className="legend-dot" style={{ background: PLDDT_COLORS.confident }} />70–90 confident</div>
+                      <div className="legend-item"><span className="legend-dot" style={{ background: PLDDT_COLORS.low }} />50–70 low</div>
+                      <div className="legend-item"><span className="legend-dot" style={{ background: PLDDT_COLORS.veryLow }} />≤ 50 very low</div>
+                    </div>
+                  ) : (
+                    <div className="ramp-legend">
+                      <div className="ramp-title">Min ΔΔG per residue (kcal/mol)</div>
+                      <div className="ramp-bar" style={{ background: DDG_GRADIENT_CSS }} />
+                      <div className="ramp-ticks">
+                        <span>≤ −{DDG_CLAMP}</span>
+                        <span>0</span>
+                        <span>≥ +{DDG_CLAMP}</span>
+                      </div>
+                      <div className="ramp-ticks ramp-words">
+                        <span style={{ color: COLORS.destabilizing }}>destabilizing</span>
+                        <span style={{ color: COLORS.stabilizing }}>stabilizing</span>
+                      </div>
+                      {result.sequence.length > result.min_ddg_per_position.length && (
+                        <div className="ramp-note">
+                          <span className="legend-dot" style={{ background: '#a7b0bd' }} /> unscanned (&gt; {result.min_ddg_per_position.length})
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {lowConfPositions.length > 0 && (
+                <label className="check-label" style={{ marginTop: 10 }}>
+                  <input type="checkbox" checked={markLowConf} onChange={(e) => setMarkLowConf(e.target.checked)} />
+                  Mark low-confidence positions (pLDDT &lt; 70, {lowConfPositions.length} Cα spheres)
+                </label>
+              )}
             </div>
 
-            {/* Right: PAE + overlay */}
-            <div>
-              <div className="card">
-                <div className="card-title">AlphaFold PAE (Å)</div>
-                <div className="plot-wrap">
-                  <Plot
-                    data={paeData}
-                    layout={paeLayout}
-                    config={{ displayModeBar: false, responsive: true }}
-                    style={{ width: '100%' }}
-                    useResizeHandler
-                  />
-                </div>
+            {/* Right: PAE */}
+            <div className="card compare-panel">
+              <div className="card-header-row">
+                <div className="card-title card-title-flat">AlphaFold Predicted Aligned Error</div>
               </div>
-              <div className="card">
-                <div className="card-title">Holo-GNN min ΔΔG vs AlphaFold pLDDT</div>
-                <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: 6 }}>
-                  Red (left axis): most destabilizing predicted mutation per position.
-                  Blue dashed (right): AlphaFold pLDDT.
-                  Shaded amber regions &amp; markers indicate pLDDT &lt; 70 (<code>low_confidence_in_scan</code>).
-                </div>
-                {result.sequence.length > result.min_ddg_per_position.length && (
-                  <div style={{ fontSize: '0.76rem', color: 'var(--text-muted)', marginBottom: 4 }}>
-                    Scan curve covers positions 1–{result.min_ddg_per_position.length} of {result.sequence.length}.
-                  </div>
-                )}
-                <div className="plot-wrap">
-                  <Plot
-                    data={overlayData}
-                    layout={overlayLayout}
-                    config={{ displayModeBar: false, responsive: true }}
-                    style={{ width: '100%' }}
-                    useResizeHandler
-                  />
-                </div>
+              <div className="plot-wrap">
+                <Plot data={paeData} layout={paeLayout} config={PLOT_CONFIG} style={{ width: '100%' }} useResizeHandler />
               </div>
+            </div>
+          </div>
+
+          <div className="card">
+            <div className="card-header-row">
+              <div
+                className="card-title card-title-flat"
+                title="Min ΔΔG: the most destabilizing predicted substitution at each residue. Shaded: pLDDT < 70, where a folded-state ΔΔG is less meaningful."
+              >
+                Holo-GeoN min ΔΔG vs AlphaFold pLDDT
+              </div>
+              {result.sequence.length > nScan && (
+                <span className="title-meta">scan covers residues 1–{nScan} of {result.sequence.length}</span>
+              )}
+            </div>
+            <div className="plot-wrap">
+              <Plot data={overlayData} layout={overlayLayout} config={PLOT_CONFIG} style={{ width: '100%' }} useResizeHandler />
             </div>
           </div>
         </>

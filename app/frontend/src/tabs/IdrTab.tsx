@@ -4,6 +4,7 @@ import Plot from 'react-plotly.js'
 import { postIdr } from '../api'
 import { setIdr } from '../store'
 import type { IdrResponse } from '../types'
+import { BASE_LAYOUT, axisTitle, baseAxis } from '../plotTheme'
 
 const UBIQUITIN = 'MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG'
 
@@ -114,15 +115,13 @@ export default function IdrTab() {
     : []
 
   const gaussianLayout = {
-    height: 280,
-    margin: { l: 55, r: 20, t: 30, b: 50 },
-    xaxis: { title: 'Radius of Gyration Rg (Å)', gridcolor: '#f1f5f9' },
-    yaxis: { title: 'Probability Density', gridcolor: '#f1f5f9' },
-    paper_bgcolor: 'transparent',
-    plot_bgcolor: 'transparent',
+    ...BASE_LAYOUT,
+    height: 300,
+    margin: { l: 60, r: 20, t: 40, b: 50 },
+    xaxis: baseAxis({ title: axisTitle('Radius of gyration Rg (Å)') }),
+    yaxis: baseAxis({ title: axisTitle('Probability density') }),
     showlegend: true,
-    legend: { orientation: 'h', y: -0.25 },
-    font: { family: 'Inter, system-ui, sans-serif', size: 12 },
+    legend: { orientation: 'h', x: 0, y: 1.02, xanchor: 'left', yanchor: 'bottom' },
     annotations: gaussianAnnotations,
   }
 

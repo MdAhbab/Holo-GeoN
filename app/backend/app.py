@@ -319,7 +319,7 @@ def idr(req: IdrRequest):
 
 @app.post("/api/compare")
 def compare(req: CompareRequest):
-    """Fetch AlphaFold2 structure + PAE, run Holo-GNN scan, return combined payload."""
+    """Fetch AlphaFold2 structure + PAE, run the Holo-GeoN scan, return combined payload."""
     eng = get_engine()
     if not eng.ready:
         return _error(503, eng.health()["error"] or "model unavailable")
@@ -358,6 +358,9 @@ def compare(req: CompareRequest):
         # 4. Fetch PAE document
         pae_matrix: List[List[float]] = []
         pae_downsampled = False
+        # Residues per displayed PAE cell. Cell k covers residue 1 + k * pae_stride, so the
+        # interface can label the axes in residue numbers rather than in cell indices.
+        pae_stride = 1
         if pae_doc_url and not pae_doc_url.endswith(".png"):
             pae_resp = _requests.get(pae_doc_url, timeout=20)
             pae_resp.raise_for_status()
@@ -371,8 +374,10 @@ def compare(req: CompareRequest):
 
             n = len(raw_pae)
             if n > 200:
-                stride = max(1, n // 200)
-                raw_pae = [row[::stride] for row in raw_pae[::stride]]
+                # Ceiling division: `n // 200` is 1 for 200 < n < 400, which kept every cell
+                # while still reporting the matrix as downsampled.
+                pae_stride = -(-n // 200)
+                raw_pae = [row[::pae_stride] for row in raw_pae[::pae_stride]]
                 pae_downsampled = True
             pae_matrix = [[float(v) for v in row] for row in raw_pae]
 
@@ -403,6 +408,7 @@ def compare(req: CompareRequest):
             ],
             "pae": pae_matrix,
             "pae_downsampled": pae_downsampled,
+            "pae_stride": pae_stride,
             "min_ddg_per_position": min_ddg_per_position,
         }
         summary = f"AlphaFold compare · {uid} · {len(sequence)} residues"

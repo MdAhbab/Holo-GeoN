@@ -46,6 +46,7 @@ declare module '3dmol' {
     rotate(angle: number, axis: string | {x: number, y: number, z: number}): void
     translate(x: number, y: number): void
     setBackgroundColor(color: string, opacity?: number): void
+    setViewStyle(style: { style: 'outline'; color?: string; width?: number }): void
   }
 
   export function createViewer(

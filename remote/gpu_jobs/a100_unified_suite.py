@@ -1844,6 +1844,7 @@ class A100Suite:
                         af_uniprot_candidates=("P04637", "P69905"),
                         mut_p53_dbd="R82H",
                         gb1_pairs=gb1_pairs,
+                        ubq_pdb_text=ubq_pdb_text,
                     )
                     ui_merged["screenshots"].extend(ui_main.get("screenshots", []))
                     ui_merged["shot_details"].update(ui_main.get("shot_details", {}))

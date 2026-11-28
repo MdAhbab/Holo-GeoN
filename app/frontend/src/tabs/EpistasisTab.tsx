@@ -3,12 +3,23 @@ import { useState, useRef, useMemo } from 'react'
 import Plot from 'react-plotly.js'
 import { streamEpistasis, downloadExport } from '../api'
 import { setEpistasis } from '../store'
+import { useMeasuredWidth } from '../hooks'
 import type {
   TabProps,
   EpistasisResponse,
   EpistasisPairResult,
   EpistasisStreamStart,
 } from '../types'
+import {
+  BASE_LAYOUT,
+  COLORS,
+  DDG_DIVERGING,
+  PLOT_CONFIG,
+  axisTitle,
+  baseAxis,
+  colorbarTitle,
+  robustAbsLimit,
+} from '../plotTheme'
 
 const UBIQUITIN =
   'MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGKQLEDGRTLSDYNIQKESTLHLVLRLRGG'
@@ -81,6 +92,10 @@ export default function EpistasisTab({ health }: TabProps) {
   const [sortDir, setSortDir] = useState<SortDir>('asc')
 
   const abortRef = useRef<AbortController | null>(null)
+  // The parity plot (total vs additive) is drawn square, so y = x sits at 45 degrees.
+  const [parityRef, parityW] = useMeasuredWidth<HTMLDivElement>()
+  const PAR = { l: 62, r: 84, t: 40, b: 52 }
+  const parityH = Math.round(Math.min(560, Math.max(340, (parityW || 520) - PAR.l - PAR.r + PAR.t + PAR.b)))
 
   const epiCap = health?.capabilities?.epistasis
   const cdsCap = health?.capabilities?.cds
@@ -343,13 +358,14 @@ export default function EpistasisTab({ health }: TabProps) {
     const lo = minVal - pad
     const hi = maxVal + pad
 
+    const cLim = robustAbsLimit(activePairs.map((p) => p.epistasis_dddg), 1, 0.25)
     const data = [
       {
         type: 'scatter',
         mode: 'lines',
         x: [lo, hi],
         y: [lo, hi],
-        line: { color: '#94a3b8', width: 1.5, dash: 'dash' },
+        line: { color: '#9aa5b4', width: 1.25, dash: 'dash' },
         name: 'Additive null (ΔΔG_total = ΔΔG_add)',
         hoverinfo: 'skip',
       },
@@ -364,61 +380,62 @@ export default function EpistasisTab({ health }: TabProps) {
             `<br>ΔΔG_total: ${formatSigned(p.ddg_total, 4)} kcal/mol` +
             `<br>ΔΔG_additive: ${formatSigned(p.ddg_additive, 4)} kcal/mol` +
             `<br>ΔΔΔG (epistasis): ${formatSigned(p.epistasis_dddg, 4)} kcal/mol` +
-            `<br>Contact prob: ${p.contact_prob.toFixed(3)} (${p.is_contact ? 'contact' : 'distal'})`
+            `<br>P(contact): ${p.contact_prob.toFixed(3)} (${p.is_contact ? 'E_geo contact' : 'no E_geo edge'})`
         ),
         hovertemplate: '%{text}<extra></extra>',
+        cliponaxis: false,
         error_y: {
           type: 'data',
           symmetric: false,
           array: activePairs.map((p) => p.ci_high - p.ddg_total),
           arrayminus: activePairs.map((p) => p.ddg_total - p.ci_low),
-          color: 'rgba(100,116,139,0.38)',
-          thickness: 1.5,
-          width: 4,
+          color: 'rgba(91,100,116,0.45)',
+          thickness: 1.25,
+          width: 3,
         },
         marker: {
-          size: 11,
+          size: 12,
           color: activePairs.map((p) => p.epistasis_dddg),
-          colorscale: 'RdBu',
-          cmid: 0,
-          reversescale: true,
-          line: { width: 1, color: '#0f172a' },
+          colorscale: DDG_DIVERGING,
+          cmin: -cLim,
+          cmax: cLim,
+          line: { width: 1, color: '#1f2937' },
           colorbar: {
-            title: 'ΔΔΔG (kcal/mol)',
-            titleside: 'right',
-            thickness: 14,
-            len: 0.85,
+            title: colorbarTitle('ΔΔΔG (kcal/mol)'),
+            thickness: 11,
+            len: 0.92,
+            y: 0.46,
+            outlinewidth: 0,
+            ticks: 'outside',
+            ticklen: 3,
+            tickfont: { size: 10.5, color: COLORS.inkMuted },
           },
         },
-        name: 'Double mutants',
+        name: 'Double mutants (colour = ΔΔΔG)',
       },
     ]
 
     const layout = {
-      height: 320,
-      margin: { l: 60, r: 85, t: 28, b: 55 },
-      xaxis: {
-        title: 'Additive ΔΔG_a + ΔΔG_b (kcal/mol)',
+      ...BASE_LAYOUT,
+      height: parityH,
+      margin: PAR,
+      xaxis: baseAxis({
+        title: axisTitle('Additive ΔΔG_a + ΔΔG_b (kcal/mol)'),
         range: [lo, hi],
-        gridcolor: '#f1f5f9',
         zeroline: true,
-        zerolinecolor: '#cbd5e1',
-      },
-      yaxis: {
-        title: 'Predicted Total ΔΔG_ab (kcal/mol)',
+        zerolinecolor: '#cfd6df',
+      }),
+      yaxis: baseAxis({
+        title: axisTitle('Predicted total ΔΔG_ab (kcal/mol)'),
         range: [lo, hi],
-        gridcolor: '#f1f5f9',
         zeroline: true,
-        zerolinecolor: '#cbd5e1',
-      },
+        zerolinecolor: '#cfd6df',
+      }),
       showlegend: true,
-      legend: { orientation: 'h', y: 1.13, x: 0 },
-      paper_bgcolor: 'transparent',
-      plot_bgcolor: 'transparent',
-      font: { family: 'Inter, system-ui, sans-serif', size: 11 },
+      legend: { orientation: 'h', x: 0, y: 1.02, xanchor: 'left', yanchor: 'bottom', font: { size: 11, color: COLORS.ink } },
     }
     return { data, layout }
-  }, [activePairs])
+  }, [activePairs, parityH])
 
   // Plotly chart 2: Epistasis ΔΔΔG vs Predicted Contact Probability
   const epistasisVsContactPlot = useMemo(() => {
@@ -435,52 +452,49 @@ export default function EpistasisTab({ health }: TabProps) {
       type: 'scatter',
       mode: 'markers',
       name: label,
+      cliponaxis: false,
       x: subset.map((p) => p.contact_prob),
       y: subset.map((p) => p.epistasis_dddg),
       text: subset.map(
         (p) =>
           `<b>${p.pair}</b> (|j − i| = ${p.seq_separation})` +
           `<br>ΔΔΔG: ${formatSigned(p.epistasis_dddg, 4)} kcal/mol` +
-          `<br>Contact prob: ${p.contact_prob.toFixed(4)}` +
+          `<br>P(contact): ${p.contact_prob.toFixed(4)}` +
           `<br>1/hop_dist: ${p.pair_geo.inv_hop_dist.toFixed(3)}`
       ),
       hovertemplate: '%{text}<extra></extra>',
-      marker: {
-        size: 11,
-        color,
-        symbol,
-        line: { width: 1, color: '#0f172a' },
-      },
+      marker: { size: 12, color, symbol, line: { width: 1, color: '#1f2937' } },
     })
 
+    const ys = activePairs.map((p) => p.epistasis_dddg)
+    const yAbs = Math.max(0.25, ...ys.map(Math.abs)) * 1.18
+
     const data = [
-      makeTrace(contacts, 'Direct contact (E_geo)', '#008080', 'circle'),
-      makeTrace(distals, 'Non-contact / distal', '#64748b', 'diamond'),
+      makeTrace(contacts, 'Direct contact (E_geo edge)', '#00857a', 'circle'),
+      makeTrace(distals, 'Non-contact (no E_geo edge)', '#8a94a3', 'diamond'),
     ]
 
     const layout = {
-      height: 320,
-      margin: { l: 60, r: 28, t: 28, b: 55 },
-      xaxis: {
-        title: 'Predicted Contact Probability P(contact)',
-        range: [-0.04, 1.04],
-        gridcolor: '#f1f5f9',
-      },
-      yaxis: {
-        title: 'Epistasis Coupling ΔΔΔG (kcal/mol)',
-        gridcolor: '#f1f5f9',
+      ...BASE_LAYOUT,
+      height: parityH,
+      margin: { l: 62, r: 16, t: 40, b: 52 },
+      xaxis: baseAxis({
+        title: axisTitle('Predicted contact probability P(contact)'),
+        range: [-0.06, 1.06],
+        tickvals: [0, 0.25, 0.5, 0.75, 1],
+      }),
+      yaxis: baseAxis({
+        title: axisTitle('Epistasis coupling ΔΔΔG (kcal/mol)'),
+        range: [-yAbs, yAbs],
         zeroline: true,
-        zerolinecolor: '#94a3b8',
-        zerolinewidth: 1.5,
-      },
+        zerolinecolor: COLORS.zero,
+        zerolinewidth: 1.25,
+      }),
       showlegend: true,
-      legend: { orientation: 'h', y: 1.13, x: 0 },
-      paper_bgcolor: 'transparent',
-      plot_bgcolor: 'transparent',
-      font: { family: 'Inter, system-ui, sans-serif', size: 11 },
+      legend: { orientation: 'h', x: 0, y: 1.02, xanchor: 'left', yanchor: 'bottom', font: { size: 11, color: COLORS.ink } },
     }
     return { data, layout }
-  }, [activePairs])
+  }, [activePairs, parityH])
 
   const progressPct =
     progress && progress.total > 0
@@ -515,12 +529,12 @@ export default function EpistasisTab({ health }: TabProps) {
             Structure-Free · Swap-Equivariant · Not SE(3)-Equivariant
           </span>
         </div>
-        <p className="card-lead">
-          Predicts non-additive pairwise thermodynamic coupling{' '}
-          <code>ΔΔG_total = ΔΔG_additive + ΔΔΔG</code> using the contact-gated Potts head over the
-          predicted ESM-2 geometric contact graph <code>E_geo</code> (reads no 3D coordinates).
-          Pairs are canonicalized in ascending site order (<code>i &lt; j</code>) and are strictly
-          symmetric under site swap.
+        <p
+          className="card-lead"
+          title="Contact-gated Potts head over the predicted ESM-2 contact graph E_geo (reads no 3D coordinates). Pairs are reported in ascending site order and are exactly symmetric under site swap."
+        >
+          <code>ΔΔG_total = ΔΔG_additive + ΔΔΔG</code>, with the coupling ΔΔΔG gated by the predicted contact graph
+          (no coordinates).
         </p>
 
         <form onSubmit={handleSubmit}>
@@ -553,17 +567,14 @@ export default function EpistasisTab({ health }: TabProps) {
             </div>
             <textarea
               id="epi-pairs"
-              rows={4}
+              rows={Math.min(8, Math.max(4, parsedPairs.length + 1))}
               value={pairsText}
               onChange={(e) => setPairsText(e.target.value)}
               placeholder="V5A+L8P&#10;K6A+T7A&#10;I13A+L15V"
               aria-describedby="epi-pairs-hint"
             />
             <div id="epi-pairs-hint" className="field-hint-row">
-              <span>
-                Each pair must specify two distinct 1-based sites (e.g. <code>V5A+L8P</code> or{' '}
-                <code>L8P+V5A</code> — both yield the identical canonical prediction).
-              </span>
+              <span>Two distinct sites per pair; order does not matter.</span>
               <div className="inline-actions">
                 <button
                   type="button"
@@ -699,10 +710,75 @@ export default function EpistasisTab({ health }: TabProps) {
 
       {activePairs.length > 0 && (
         <>
-          {/* Provenance & Honesty Notices */}
+          {/* Results first; provenance one click away (never removed) */}
           <div className="card">
-            <div className="card-title">Model Symmetry, Head Provenance &amp; Uncertainty Scope</div>
+            <div className="card-title">Summary</div>
+            {/* KPI Summary Cards */}
+            {summaryStats && (
+              <div className="kpi-grid">
+                <div className="kpi-card">
+                  <div className="kpi-label">Pairs Scored</div>
+                  <div className="kpi-value">{summaryStats.nTotal}</div>
+                  <div className="kpi-sub">
+                    Sequence length L = {result?.length ?? streamStart?.length ?? seqLen} aa
+                  </div>
+                </div>
 
+                <div className="kpi-card">
+                  <div className="kpi-label">Predicted Direct Contacts</div>
+                  <div className="kpi-value">
+                    {summaryStats.nContacts} / {summaryStats.nTotal}
+                  </div>
+                  <div className="kpi-sub">
+                    Mean P(contact) = {summaryStats.meanContactProb.toFixed(3)}
+                  </div>
+                </div>
+
+                <div className="kpi-card">
+                  <div className="kpi-label">Strongest Coupling |ΔΔΔG|</div>
+                  <div className="kpi-value">
+                    {formatSigned(summaryStats.strongest.epistasis_dddg, 3)}{' '}
+                    <span style={{ fontSize: '0.9rem', fontWeight: 500 }}>kcal/mol</span>
+                  </div>
+                  <div className="kpi-sub">
+                    Pair <code>{summaryStats.strongest.pair}</code> (|j − i| ={' '}
+                    {summaryStats.strongest.seq_separation})
+                  </div>
+                </div>
+
+                <div className="kpi-card">
+                  <div className="kpi-label">Mean |ΔΔΔG| · contact vs non-contact</div>
+                  <div className="kpi-value" style={{ fontSize: '1.25rem' }}>
+                    {summaryStats.meanAbsContact !== null
+                      ? `${summaryStats.meanAbsContact.toFixed(3)}`
+                      : '—'}{' '}
+                    vs{' '}
+                    {summaryStats.meanAbsDistal !== null
+                      ? `${summaryStats.meanAbsDistal.toFixed(3)}`
+                      : '—'}
+                  </div>
+                  <div className="kpi-sub">kcal/mol, pairs with vs without an E_geo edge</div>
+                </div>
+              </div>
+            )}
+
+            <div
+              className="interval-note interval-caution"
+              role="note"
+              title={`${result?.uncertainty_note ?? 'Calibration was measured on single mutants only; the epistasis term has no uncertainty estimate.'}${result?.ci_source ? ` Source: ${result.ci_source}.` : ''}`}
+            >
+              <span className="interval-glyph" aria-hidden="true">◐</span>
+              <span>
+                Intervals cover <strong>ΔΔG_total</strong> only (σ of the additive single-mutant parts); ΔΔΔG has no
+                uncertainty estimate · <strong>not calibrated</strong>
+              </span>
+            </div>
+
+            <details className="form-disclosure provenance-disclosure">
+              <summary>
+                Provenance &amp; symmetry <span className="summary-meta">head, gate input, CDS, throughput</span>
+              </summary>
+              <div style={{ marginTop: 10 }}>
             <div className="provenance-bar">
               <div className="provenance-item">
                 <span className="provenance-label">Mode &amp; Coordinates</span>
@@ -752,65 +828,8 @@ export default function EpistasisTab({ health }: TabProps) {
                 'structure-free predicted-contact graph; reads no coordinates. Its only symmetry is wild-type/mutant swap equivariance: it is NOT SE(3)- or E(3)-equivariant.'}
             </div>
 
-            <div className="uncertainty-notice" role="note">
-              <strong>Uncalibrated Total-ΔΔG Interval Notice:</strong>{' '}
-              {result?.uncertainty_note ??
-                'Calibration was measured on single mutants only, and the epistasis term itself has no uncertainty estimate: the interval is for ddg_total and is not a calibrated claim about the epistasis term.'}{' '}
-              {result?.ci_source && (
-                <span className="result-sub" style={{ display: 'inline' }}>
-                  (Source: <code>{result.ci_source}</code>)
-                </span>
-              )}
-            </div>
-
-            {/* KPI Summary Cards */}
-            {summaryStats && (
-              <div className="kpi-grid">
-                <div className="kpi-card">
-                  <div className="kpi-label">Pairs Scored</div>
-                  <div className="kpi-value">{summaryStats.nTotal}</div>
-                  <div className="kpi-sub">
-                    Sequence length L = {result?.length ?? streamStart?.length ?? seqLen} aa
-                  </div>
-                </div>
-
-                <div className="kpi-card">
-                  <div className="kpi-label">Predicted Direct Contacts</div>
-                  <div className="kpi-value">
-                    {summaryStats.nContacts} / {summaryStats.nTotal}
-                  </div>
-                  <div className="kpi-sub">
-                    Mean P(contact) = {summaryStats.meanContactProb.toFixed(3)}
-                  </div>
-                </div>
-
-                <div className="kpi-card">
-                  <div className="kpi-label">Strongest Coupling |ΔΔΔG|</div>
-                  <div className="kpi-value">
-                    {formatSigned(summaryStats.strongest.epistasis_dddg, 3)}{' '}
-                    <span style={{ fontSize: '0.9rem', fontWeight: 500 }}>kcal/mol</span>
-                  </div>
-                  <div className="kpi-sub">
-                    Pair <code>{summaryStats.strongest.pair}</code> (|j − i| ={' '}
-                    {summaryStats.strongest.seq_separation})
-                  </div>
-                </div>
-
-                <div className="kpi-card">
-                  <div className="kpi-label">Mean |ΔΔΔG| (Contact vs Distal)</div>
-                  <div className="kpi-value" style={{ fontSize: '1.25rem' }}>
-                    {summaryStats.meanAbsContact !== null
-                      ? `${summaryStats.meanAbsContact.toFixed(3)}`
-                      : '—'}{' '}
-                    vs{' '}
-                    {summaryStats.meanAbsDistal !== null
-                      ? `${summaryStats.meanAbsDistal.toFixed(3)}`
-                      : '—'}
-                  </div>
-                  <div className="kpi-sub">kcal/mol (contact-gated vs non-contact)</div>
-                </div>
               </div>
-            )}
+            </details>
           </div>
 
           {/* Interactive Plotly Charts */}
@@ -819,11 +838,11 @@ export default function EpistasisTab({ health }: TabProps) {
               <div className="card-title">
                 Predicted Total ΔΔG vs. Additive Single-Mutant Sum
               </div>
-              <div className="plot-wrap">
+              <div className="plot-wrap" ref={parityRef}>
                 <Plot
                   data={totalVsAdditivePlot.data}
                   layout={totalVsAdditivePlot.layout}
-                  config={{ displayModeBar: false, responsive: true }}
+                  config={PLOT_CONFIG}
                   style={{ width: '100%' }}
                   useResizeHandler
                 />
@@ -838,7 +857,7 @@ export default function EpistasisTab({ health }: TabProps) {
                 <Plot
                   data={epistasisVsContactPlot.data}
                   layout={epistasisVsContactPlot.layout}
-                  config={{ displayModeBar: false, responsive: true }}
+                  config={PLOT_CONFIG}
                   style={{ width: '100%' }}
                   useResizeHandler
                 />
@@ -971,7 +990,7 @@ export default function EpistasisTab({ health }: TabProps) {
                             }`}
                             title={`1/hop_dist = ${row.pair_geo.inv_hop_dist.toFixed(3)}, log_seq_sep = ${row.pair_geo.log_seq_sep.toFixed(3)}`}
                           >
-                            {row.is_contact ? 'Contact' : 'Distal'}
+                            {row.is_contact ? 'Contact' : 'Non-contact'}
                           </span>
                         </td>
                         <td className="num-cell">{row.seq_separation}</td>

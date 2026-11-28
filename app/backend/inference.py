@@ -68,6 +68,10 @@ MAX_SEQ_LENGTH = int(os.environ.get("HOLOGEON_MAX_LENGTH", "5000"))
 MAX_SCAN_POSITIONS = int(os.environ.get("HOLOGEON_MAX_SCAN", "600"))
 MAX_EPISTASIS_PAIRS = int(os.environ.get("HOLOGEON_MAX_PAIRS", "200"))
 MAX_PDB_CHARS = int(os.environ.get("HOLOGEON_MAX_PDB_CHARS", str(8_000_000)))
+#: Smallest fraction of the sequence a supplied structure must cover when it is SHORTER than
+#: the sequence (a crystal structure or design construct missing a terminal tail). Residues it
+#: does not cover get no coordinates and are masked out of the coordinate stream.
+MIN_STRUCTURE_COVERAGE = float(os.environ.get("HOLOGEON_MIN_STRUCTURE_COVERAGE", "0.8"))
 # Sites per backbone forward pass during a scan. Each site is a `window`-node
 # graph, so this times the window is the padded node count of one batch - the
 # same quantity src/data.NodeBudgetBatchSampler caps during training (R2-02).
@@ -151,6 +155,7 @@ class HoloGeoNEngine:
         #: reporting another's coverage is R2-09.
         self._calibration_of: str = "no calibration file"
         self._sigma_scale: float = 1.0
+        self._calibration_split: Optional[str] = None
         self._untrained_heads: list[str] = []
         self._epistasis: dict = {"available": False, "reason": "model not loaded", "source": None}
         # SE(3)-invariant 3D checkpoint (optional, loaded on first need)
@@ -244,6 +249,7 @@ class HoloGeoNEngine:
                 variance_scale = payload.get("variance_scale") or {}
                 scale = variance_scale.get("scale")
                 self._sigma_scale = float(scale) if scale else 1.0
+                self._calibration_split = payload.get("split")
                 # Round-2 review, R2-09: the interface reported the calibration
                 # of the RAW sigma while serving `sigma * scale`. The reviewer
                 # constructed a case where the flag read True at ECE 0.0053
@@ -365,6 +371,9 @@ class HoloGeoNEngine:
                 "max_coverage_gap": cal.get("max_coverage_gap"),
                 "observed_coverage": cal.get("coverage_observed"),
                 "well_calibrated": cal.get("well_calibrated"),
+                # the thresholds the verdict above was computed against (ECE and max coverage gap)
+                "tolerances": cal.get("tolerances"),
+                "split": self._calibration_split,
                 "measured_on": str(CALIBRATION_PATH),
                 # Which sigma these numbers describe. When a variance scale is
                 # applied, they describe the SCALED sigma - the one the ddG
@@ -493,28 +502,72 @@ class HoloGeoNEngine:
             pdb_seq, coords, plddt, valid = parse_pdb_backbone(path)
         if not pdb_seq:
             raise ValueError("no protein backbone atoms (N, CA, C) were found in the supplied PDB text")
+        L = len(seq)
         offset, mismatches, err = align_to_sequence(pdb_seq, seq)
-        if offset is None:
+        if offset is not None:
+            # The structure covers the whole sequence (it may carry extra residues around it).
+            first, n_cov = 0, L
+            sl = slice(offset, offset + L)
+            c_full, p_full, v_full = coords[sl], plddt[sl], valid[sl]
+        elif err == "structure_shorter_than_sequence":
+            # The structure covers only part of the sequence: typically a crystal structure or a
+            # design construct missing a terminal tail (the MegaScale 1UBQ model has residues
+            # 1-72 of ubiquitin's 76). It is placed as ONE contiguous block inside the sequence,
+            # under the same mismatch budget, and every residue it does not cover is masked out of
+            # the coordinate stream through coord_valid - the channel that already masks residues
+            # below the pLDDT floor. No coordinates are invented for the uncovered residues.
+            first, mismatches, err_in = align_to_sequence(seq, pdb_seq)
+            if first is None:
+                raise ValueError(
+                    f"the structure could not be aligned to the sequence ({err_in}; structure has "
+                    f"{len(pdb_seq)} residues, sequence has {L}). The 3D mode needs the structure of "
+                    f"this protein."
+                )
+            n_cov = len(pdb_seq)
+            if n_cov / L < MIN_STRUCTURE_COVERAGE:
+                raise ValueError(
+                    f"the structure aligned to residues {first + 1}-{first + n_cov} but covers only "
+                    f"{n_cov} of {L} residues ({n_cov / L:.0%}); the 3D mode needs coordinates for at "
+                    f"least {MIN_STRUCTURE_COVERAGE:.0%} of the sequence"
+                )
+            c_full = np.zeros((L,) + tuple(coords.shape[1:]), dtype=np.float32)
+            p_full = np.zeros((L,), dtype=np.float32)
+            v_full = np.zeros((L,), dtype=np.float32)
+            c_full[first:first + n_cov] = coords
+            p_full[first:first + n_cov] = plddt
+            v_full[first:first + n_cov] = valid
+        else:
             raise ValueError(
                 f"the structure could not be aligned to the sequence ({err}; structure has {len(pdb_seq)} "
-                f"residues, sequence has {len(seq)}). The 3D mode needs the structure of this protein."
+                f"residues, sequence has {L}). The 3D mode needs the structure of this protein."
             )
-        sl = slice(offset, offset + len(seq))
         torch = self._torch
-        usable = (valid[sl] > 0.5) & (plddt[sl] >= PLDDT_VALID_FLOOR)
+        covered = np.zeros((L,), dtype=bool)
+        covered[first:first + n_cov] = True
+        usable = covered & (v_full > 0.5) & (p_full >= PLDDT_VALID_FLOOR)
         rec3 = dict(rec)
-        rec3["coords"] = torch.from_numpy(coords[sl]).float()
-        rec3["plddt"] = torch.from_numpy(plddt[sl]).float()
+        rec3["coords"] = torch.from_numpy(np.ascontiguousarray(c_full)).float()
+        rec3["plddt"] = torch.from_numpy(np.ascontiguousarray(p_full)).float()
         rec3["coord_valid"] = torch.from_numpy(usable.astype("float32"))
-        low = [i + 1 for i, v in enumerate(plddt[sl]) if v < LOW_PLDDT]
+        low = [i + 1 for i in range(L) if covered[i] and p_full[i] < LOW_PLDDT]
+        uncovered = [i + 1 for i in range(L) if not covered[i]]
         info = {
-            "source": "supplied PDB", "residues_in_pdb": int(len(pdb_seq)), "aligned_offset": int(offset),
-            "mismatches": int(mismatches), "mean_plddt": round(float(np.mean(plddt[sl])), 2),
-            "fraction_below_70": round(len(low) / max(len(seq), 1), 4),
+            "source": "supplied PDB", "residues_in_pdb": int(len(pdb_seq)),
+            "aligned_offset": int(offset) if offset is not None else 0,
+            "mismatches": int(mismatches),
+            "mean_plddt": round(float(np.mean(p_full[covered])), 2),
+            "fraction_below_70": round(len(low) / max(L, 1), 4),
             "usable_residue_fraction": round(float(usable.mean()), 4),
             "low_confidence_positions": low,
+            # which residues of the SEQUENCE carry coordinates (1-based, inclusive)
+            "sequence_coverage": {"first": int(first + 1), "last": int(first + n_cov), "covered": int(n_cov),
+                                  "length": int(L), "fraction": round(n_cov / max(L, 1), 4)},
+            "residues_without_coordinates": uncovered,
+            "masked_positions": [i + 1 for i in range(L) if not usable[i]],
             "note": ("the B-factor column is read as pLDDT (the 3D checkpoint was trained on AlphaFold "
-                     "models); residues below the pLDDT floor are masked out of the coordinate stream"),
+                     "models); residues below the pLDDT floor are masked out of the coordinate stream"
+                     + (", and so are the residues the structure does not cover, which get no coordinates"
+                        if uncovered else "")),
         }
         return rec3, info
 
@@ -589,6 +642,9 @@ class HoloGeoNEngine:
         def run(mode_: str, with_cds: bool) -> tuple[dict, dict]:
             rec = self._encode_once(seq, cds_dna if with_cds else None)
             model, cfg, rec_m, minfo = self._resolve_mode(mode_, structure_pdb, seq, rec)
+            if "structure" in minfo:
+                # whether the mutated residue itself had usable coordinates in the 3D pass
+                minfo["structure"]["mutation_site_masked"] = (site + 1) in minfo["structure"]["masked_positions"]
             return self._ddg_numbers(model, cfg, rec_m, site, wt_aa, mut_aa,
                                      calibrated=(mode_ == "structure_free")), minfo
 
